@@ -19,7 +19,7 @@ from pyrogram.types import Message
 from pyrogram.enums import ParseMode
 
 from BOT.helper.start import load_users
-from BOT.db.store import add_stripe_auth_site, get_stripe_auth_sites, get_primary_stripe_auth_site, clear_stripe_auth_sites
+from BOT.db.store import add_stripe_auth_site, get_stripe_auth_sites, get_primary_stripe_auth_site, clear_stripe_auth_sites, remove_stripe_auth_site
 from BOT.tools.proxy import get_rotating_proxy
 from BOT.Auth.StripeAuto.api import auto_stripe_auth
 from BOT.Auth.StripeAuto.response import determine_stripe_auto_status
@@ -132,7 +132,7 @@ async def sturl_handler(client: Client, message: Message):
             f"<pre>Invalid Site ❌</pre>\n━━━━━━━━━━━━━\n<b>URL:</b> <code>{url}</code>\n<b>Error:</b> <code>{err}</code>\n\n<b>Tip:</b> Use a WooCommerce site with Stripe/WC Payments add-payment-method.\n<b>Time:</b> <code>{elapsed}s</code>",
             parse_mode=ParseMode.HTML,
         )
-    add_stripe_auth_site(user_id, url, set_primary=True)
+    add_stripe_auth_site(user_id, url, set_primary=False)
     await status_msg.edit_text(
         f"<pre>Stripe Auth Site Added ✅</pre>\n━━━━━━━━━━━━━\n<b>Site:</b> <code>{url}</code>\n<b>Status:</b> Test auth passed\n<b>Command:</b> <code>/starr</code> (reply to CC)\n━━━━━━━━━━━━━\n<b>Time:</b> <code>{elapsed}s</code>",
         parse_mode=ParseMode.HTML,
@@ -210,7 +210,7 @@ async def murl_handler(client: Client, message: Message):
             pass
         valid, _ = await validate_stripe_auth_site(url, proxy, max_retries=1)
         if valid:
-            add_stripe_auth_site(user_id, url, set_primary=(added == 0))
+            add_stripe_auth_site(user_id, url, set_primary=False)
             added += 1
         else:
             failed.append(url[:35])
@@ -263,6 +263,76 @@ async def mystarrsite_handler(client: Client, message: Message):
         f"<b>• Check:</b> <code>/starr</code> (reply to CC)",
     ]
     await message.reply("\n".join(lines), reply_to_message_id=message.id, parse_mode=ParseMode.HTML)
+
+
+@Client.on_message(filters.command(["swurls", "stripeauthsites", "starrsites"]))
+async def swurls_handler(client: Client, message: Message):
+    """List all Stripe Auth sites (rotation list). /swurls"""
+    if not message.from_user:
+        return
+    user_id = str(message.from_user.id)
+    users = load_users()
+    if user_id not in users:
+        return await message.reply(
+            "<pre>Access Denied 🚫</pre>\n<b>Register first:</b> <code>/register</code>",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML,
+        )
+    sites = get_stripe_auth_sites(user_id)
+    if not sites:
+        return await message.reply(
+            "<pre>No Stripe Auth sites</pre>\n<b>Add:</b> <code>/sturl https://yoursite.com</code>\n<b>Mass:</b> <code>/murl</code> (reply to .txt)",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML,
+        )
+    lines = [
+        "<pre>Stripe Auth Sites (rotation)</pre>",
+        "━━━━━━━━━━━━━",
+        f"<b>• Total:</b> <code>{len(sites)}</code>",
+        "<b>• Sites:</b>",
+    ]
+    for i, s in enumerate(sites, 1):
+        url = s.get("url", "") if isinstance(s, dict) else str(s)
+        lines.append(f"  <code>{i}.</code> {url}")
+    lines.append("\n<b>Delete one:</b> <code>/dsturl &lt;url or index&gt;</code>")
+    lines.append("<b>Check cards:</b> <code>/starr</code> | <code>/mstarr</code>")
+    await message.reply("\n".join(lines), reply_to_message_id=message.id, parse_mode=ParseMode.HTML)
+
+
+@Client.on_message(filters.command(["dsturl", "delstarrurl", "removestarrsite"]))
+async def dsturl_handler(client: Client, message: Message):
+    """Delete one Stripe Auth site by URL or index. /dsturl <url or 1-based index>"""
+    if not message.from_user:
+        return
+    user_id = str(message.from_user.id)
+    users = load_users()
+    if user_id not in users:
+        return await message.reply(
+            "<pre>Access Denied 🚫</pre>\n<b>Register first:</b> <code>/register</code>",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML,
+        )
+    args = message.command[1:]
+    if not args:
+        return await message.reply(
+            "<pre>Delete Stripe Auth Site</pre>\n<b>Usage:</b> <code>/dsturl https://yoursite.com</code> or <code>/dsturl 1</code> (index from /swurls)",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML,
+        )
+    key = " ".join(args).strip()
+    removed = remove_stripe_auth_site(user_id, key)
+    if removed:
+        await message.reply(
+            f"<pre>Stripe Auth site removed ✅</pre>\n<b>Removed:</b> <code>{removed[:60]}{'...' if len(removed) > 60 else ''}</code>\n<b>List:</b> <code>/swurls</code>",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await message.reply(
+            "<pre>Site not found ❌</pre>\n<b>List sites:</b> <code>/swurls</code>\n<b>Usage:</b> <code>/dsturl &lt;url or index&gt;</code>",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @Client.on_message(filters.command(["clearstarr", "delstarrsite"]))

