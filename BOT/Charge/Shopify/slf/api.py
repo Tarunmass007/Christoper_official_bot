@@ -275,30 +275,60 @@ def _parse_low_product_api_response(text: str) -> Optional[dict]:
 
 async def _fetch_low_product_api(domain: str, session, proxy: Optional[str] = None) -> Optional[dict]:
     """
-    GET low-product API for domain (e.g. stickerdad.com). Bulletproof headers, timeout, no redirects.
+    GET low-product API for domain (e.g. stickerdad.com). Bulletproof headers, retries, domain variants.
     Returns parsed dict (variantid, price, ...) or None.
     """
     if not domain or not str(domain).strip():
         return None
     domain = str(domain).strip().lower()
     if "://" in domain:
-        from urllib.parse import urlparse as _up
-        domain = _up(domain).netloc or domain
-    api_url = f"{LOW_PRODUCT_API_BASE}/{domain}"
+        domain = urlparse(domain).netloc or domain
+    # Try domain as-is, then with/without www (API may expect either)
+    domains_to_try = [domain]
+    if domain.startswith("www."):
+        domains_to_try.append(domain[4:])
+    else:
+        domains_to_try.append("www." + domain)
+    for _domain in domains_to_try:
+        for attempt in range(2):
+            try:
+                api_url = f"{LOW_PRODUCT_API_BASE}/{_domain}"
+                resp = await session.get(
+                    api_url,
+                    headers=dict(LOW_PRODUCT_API_HEADERS),
+                    timeout=25,
+                    follow_redirects=True,
+                )
+                if not resp or getattr(resp, "status_code", 0) != 200:
+                    if attempt < 1:
+                        await asyncio.sleep(1.0)
+                    continue
+                text = (getattr(resp, "text", None) or "").strip()
+                result = _parse_low_product_api_response(text)
+                if result:
+                    return result
+            except Exception as e:
+                logger.debug(f"Low-product API fetch failed for {_domain} attempt {attempt}: {e}")
+                if attempt < 1:
+                    await asyncio.sleep(1.0)
+    # Fallback: try direct (no proxy) in case proxy blocks Railway API
     try:
-        resp = await session.get(
-            api_url,
-            headers=dict(LOW_PRODUCT_API_HEADERS),
-            timeout=25,
-            follow_redirects=True,
-        )
-        if not resp or getattr(resp, "status_code", 0) != 200:
-            return None
-        text = (getattr(resp, "text", None) or "").strip()
-        return _parse_low_product_api_response(text)
-    except Exception as e:
-        logger.debug(f"Low-product API fetch failed for {domain}: {e}")
-        return None
+        import httpx
+        for _domain in domains_to_try:
+            try:
+                api_url = f"{LOW_PRODUCT_API_BASE}/{_domain}"
+                async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+                    resp = await client.get(api_url, headers=dict(LOW_PRODUCT_API_HEADERS))
+                    if resp.status_code == 200 and resp.text:
+                        result = _parse_low_product_api_response(resp.text.strip())
+                        if result:
+                            logger.info(f"Low-product API via direct (no proxy) for {_domain}")
+                            return result
+            except Exception as e:
+                logger.debug(f"Low-product API direct fetch failed for {_domain}: {e}")
+    except ImportError:
+        pass
+    return None
 
 
 def _fetch_products_cloudscraper_sync(url: str, proxy: Optional[str] = None):
@@ -915,10 +945,63 @@ async def autoshopify(url, card, session, proxy=None):
 
             # print(f"{product_id}\n{price}\n{site_key}")
             checkout_url = None
-            # Fallback when Storefront API token missing: try product page for token, then add to cart via form
+            # Fallback when Storefront API token missing: try low-product API first (add.js + POST checkout), then product page, then form cart/add
             if not site_key or not str(site_key).strip():
-                # Establish session and optionally get site_key from product page (many themes put token only there)
+                # 1) Try low-product API fallback: add.js + POST checkout (no site_key needed)
                 try:
+                    low_fallback = await _fetch_low_product_api(domain, session, proxy)
+                    if low_fallback and low_fallback.get("variantid") is not None:
+                        vid = low_fallback["variantid"]
+                        add_js_h = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
+                            "Pragma": "no-cache",
+                            "Accept": "*/*",
+                            "Content-Type": "application/json",
+                            "Origin": url.rstrip("/"),
+                            "Referer": url.rstrip("/") + "/",
+                        }
+                        add_js_r = await session.post(
+                            f"{url.rstrip('/')}/cart/add.js",
+                            headers=add_js_h,
+                            json={"items": [{"id": vid, "quantity": 1}]},
+                            timeout=18,
+                        )
+                        if getattr(add_js_r, "status_code", 0) == 200:
+                            await asyncio.sleep(0.5)
+                            ch_post = await session.post(
+                                f"{url.rstrip('/')}/checkout",
+                                headers={
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
+                                    "Pragma": "no-cache",
+                                    "Accept": "*/*",
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                    "Origin": url.rstrip("/"),
+                                    "Referer": url.rstrip("/") + "/",
+                                },
+                                data="",
+                                timeout=18,
+                                follow_redirects=False,
+                            )
+                            post_sc = getattr(ch_post, "status_code", 0)
+                            if post_sc in (301, 302, 303, 307, 308):
+                                resp_h = getattr(ch_post, "headers", None) or {}
+                                loc = resp_h.get("location") or resp_h.get("Location") or ""
+                                if loc:
+                                    if not loc.startswith("http"):
+                                        loc = urljoin(url.rstrip("/") + "/", loc)
+                                    checkout_url = loc
+                                else:
+                                    checkout_url = url.rstrip("/") + "/checkout"
+                            else:
+                                checkout_url = url.rstrip("/") + "/checkout"
+                            if checkout_url:
+                                logger.info(f"Checkout via low-product API fallback (no site_key) for {url}")
+                except Exception as e:
+                    logger.debug(f"Low-product API fallback failed: {e}")
+
+                if not checkout_url:
+                    # 2) Establish session and optionally get site_key from product page (many themes put token only there)
+                    try:
                     prod_resp = await session.get(f'{url.rstrip("/")}/products.json', headers={'User-Agent': getua, 'Accept': 'application/json'}, follow_redirects=True, timeout=15)
                     prod_text = (getattr(prod_resp, 'text', None) or '') if prod_resp else ''
                     if getattr(prod_resp, 'status_code', 0) == 200 and prod_text.strip().startswith('{'):
