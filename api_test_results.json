@@ -1,0 +1,111 @@
+{
+  "total_tests": 11,
+  "passed": 4,
+  "failed": 7,
+  "warnings": 0,
+  "endpoints": [
+    {
+      "name": "SLF Shopify Gateway (/sh, /tsh, /msh)",
+      "url": "http://69.62.117.8:8000/check",
+      "method": "GET",
+      "status": "passed",
+      "response_time": 19.6,
+      "error": null,
+      "timestamp": "2026-01-23T15:23:25.877901",
+      "status_code": 403
+    },
+    {
+      "name": "AutoShopify Gateway (/autosh, /ash)",
+      "url": "http://136.175.187.188:8079/shc.php",
+      "method": "GET",
+      "status": "passed",
+      "response_time": 10.04,
+      "error": null,
+      "timestamp": "2026-01-23T15:23:26.012120",
+      "status_code": 403
+    },
+    {
+      "name": "Shopify Checkout Target (/sho)",
+      "url": "https://coatesforkids.org/products/donation",
+      "method": "GET",
+      "status": "failed",
+      "response_time": null,
+      "error": "403 Forbidden",
+      "timestamp": "2026-01-23T15:23:26.028543"
+    },
+    {
+      "name": "Stripe API Base (for /st, /au commands)",
+      "url": "https://api.stripe.com/v1/tokens",
+      "method": "GET",
+      "status": "failed",
+      "response_time": null,
+      "error": "403 Forbidden",
+      "timestamp": "2026-01-23T15:23:26.042431"
+    },
+    {
+      "name": "Pixorize Braintree API (/br)",
+      "url": "https://apitwo.pixorize.com/users/register-simple",
+      "method": "GET",
+      "status": "failed",
+      "response_time": null,
+      "error": "403 Forbidden",
+      "timestamp": "2026-01-23T15:23:26.060839"
+    },
+    {
+      "name": "reCAPTCHA Enterprise API (Braintree dependency)",
+      "url": "https://www.google.com/recaptcha/enterprise.js",
+      "method": "GET",
+      "status": "failed",
+      "response_time": null,
+      "error": "403 Forbidden",
+      "timestamp": "2026-01-23T15:23:26.081275"
+    },
+    {
+      "name": "Random User Generator (/fake)",
+      "url": "https://randomuser.me/api/?nat=us",
+      "method": "GET",
+      "status": "failed",
+      "response_time": null,
+      "error": "403 Forbidden",
+      "timestamp": "2026-01-23T15:23:26.096035"
+    },
+    {
+      "name": "IP Check API (proxy validation)",
+      "url": "https://api.ipify.org?format=json",
+      "method": "GET",
+      "status": "failed",
+      "response_time": null,
+      "error": "403 Forbidden",
+      "timestamp": "2026-01-23T15:23:26.110753"
+    },
+    {
+      "name": "SLF Gateway with Test Card",
+      "url": "http://69.62.117.8:8000/check?card=4532111111111111|12|2027|123&site=test",
+      "method": "GET",
+      "status": "passed",
+      "response_time": 9.13,
+      "error": null,
+      "timestamp": "2026-01-23T15:23:26.124049",
+      "status_code": 403
+    },
+    {
+      "name": "AutoShopify with Test Card",
+      "url": "http://136.175.187.188:8079/shc.php?cc=4532111111111111|12|2027|123",
+      "method": "GET",
+      "status": "passed",
+      "response_time": 9.29,
+      "error": null,
+      "timestamp": "2026-01-23T15:23:26.138289",
+      "status_code": 403
+    },
+    {
+      "name": "Random User with US nationality",
+      "url": "https://randomuser.me/api/?nat=us",
+      "method": "GET",
+      "status": "failed",
+      "response_time": null,
+      "error": "403 Forbidden",
+      "timestamp": "2026-01-23T15:23:26.152026"
+    }
+  ]
+}

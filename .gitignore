@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+.env
+DATA/users.json
+DATA/redeems.json
+FILES/config.json

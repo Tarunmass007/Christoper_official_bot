@@ -1,0 +1,2 @@
+SLF_CHECK_BASE_URL = "http://69.62.117.8:8000/check"
+AUTOSHOPIFY_BASE_URL = "http://136.175.187.188:8079/shc.php"
