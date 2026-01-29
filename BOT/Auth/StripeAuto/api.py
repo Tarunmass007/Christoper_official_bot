@@ -450,7 +450,12 @@ async def auto_stripe_auth(
                 result["message"] = "Card authenticated"
                 return result
             data = ajax_json.get("data", {})
-            err_msg = (data.get("error") or {}).get("message", ajax_text)
+            if not isinstance(data, dict):
+                data = {}
+            error_obj = data.get("error")
+            if not isinstance(error_obj, dict):
+                error_obj = {}
+            err_msg = error_obj.get("message", ajax_text)
             if isinstance(err_msg, dict):
                 err_msg = str(err_msg)
             result["message"] = (err_msg or ajax_text)[:200]
