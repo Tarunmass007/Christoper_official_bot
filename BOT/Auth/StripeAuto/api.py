@@ -382,6 +382,8 @@ async def auto_stripe_auth(
             return result
         if "error" in pm_json:
             err = pm_json["error"]
+            if not isinstance(err, dict):
+                err = {}
             code = err.get("code", "")
             msg = err.get("message", "Unknown")
             result["message"] = msg
@@ -434,6 +436,8 @@ async def auto_stripe_auth(
                 ajax_text = await resp.text()
             try:
                 parsed = json.loads(ajax_text)
+                if not isinstance(parsed, dict):
+                    continue
                 if parsed.get("success") is True:
                     break
                 if parsed.get("success") is False and "data" in parsed:
@@ -444,6 +448,10 @@ async def auto_stripe_auth(
 
         try:
             ajax_json = json.loads(ajax_text)
+            if not isinstance(ajax_json, dict):
+                result["response"] = "DECLINED"
+                result["message"] = (str(ajax_json) if ajax_text.strip() else "Invalid response")[:200]
+                return result
             if ajax_json.get("success") is True:
                 result["success"] = True
                 result["response"] = "APPROVED"
