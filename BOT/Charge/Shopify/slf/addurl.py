@@ -406,31 +406,36 @@ async def test_site_with_card(url: str, proxy: Optional[str] = None, max_retries
     Fast testing with 3 retries - saves immediately when receipt found.
 
     Valid site = ReceiptId present → save. Invalid = ReceiptId absent → do not save.
-    We do NOT filter by Response; CAPTCHA_* etc. with ReceiptId still count as valid.
+    When no receipt, returns the actual gate error (e.g. CHECKOUT_TOKENS_MISSING) not generic NO_RECEIPT.
     """
     proxy_url = None
     if proxy and str(proxy).strip():
         px = str(proxy).strip()
         proxy_url = px if px.startswith(("http://", "https://")) else f"http://{px}"
-    
-    # Try up to max_retries times - return immediately on receipt
+
+    last_res = {"Response": "NO_RECEIPT", "ReceiptId": None, "Price": "0.00"}
+
     for attempt in range(max_retries):
         try:
             async with TLSAsyncSession(timeout_seconds=60, proxy=proxy_url) as session:
                 res = await autoshopify_with_captcha_retry(
-                    url, TEST_CARD, session, max_captcha_retries=1, proxy=proxy_url
+                    url, TEST_CARD, session, max_captcha_retries=3, proxy=proxy_url
                 )
-                # If receipt found, return immediately - no need to retry
+                last_res = res
                 if res.get("ReceiptId"):
                     return True, res
         except Exception as e:
+            last_res = {"Response": f"ERROR: {str(e)[:80]}", "ReceiptId": None, "Price": "0.00"}
             if attempt == max_retries - 1:
-                return False, {"Response": f"ERROR: {str(e)[:50]}", "ReceiptId": None, "Price": "0.00"}
-            # Small delay between retries
-            await asyncio.sleep(0.1)
-    
-    # No receipt after all retries
-    return False, {"Response": "NO_RECEIPT", "ReceiptId": None, "Price": "0.00"}
+                return False, last_res
+            await asyncio.sleep(0.15 * (attempt + 1))
+            continue
+
+    # Return actual gate error from last attempt (e.g. CHECKOUT_TOKENS_MISSING, SITE_ACCESS_TOKEN_MISSING)
+    resp = (last_res.get("Response") or "").strip()
+    if not resp:
+        resp = "NO_RECEIPT"
+    return False, {"Response": resp, "ReceiptId": None, "Price": last_res.get("Price") or "0.00"}
 
 
 def get_user_current_site(user_id: str) -> Optional[Dict[str, str]]:

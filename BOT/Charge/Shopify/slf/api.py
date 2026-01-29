@@ -514,37 +514,61 @@ async def autoshopify(url, card, session, proxy=None):
                 site_key = m.group(1)
 
         # print(f"{product_id}\n{price}\n{site_key}")
+        checkout_url = None
+        # Fallback when Storefront API token missing: add to cart via form, then use /checkout
         if not site_key or not str(site_key).strip():
-            output.update({
-                "Response": "SITE_ACCESS_TOKEN_MISSING",
-                "Status": False,
-            })
-            _log_output_to_terminal(output)
-            return output
+            try:
+                add_headers = {
+                    'User-Agent': getua,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Origin': url,
+                    'Referer': url,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                }
+                add_resp = await session.post(
+                    f'{url}/cart/add',
+                    headers=add_headers,
+                    data={'id': product_id, 'quantity': 1},
+                    timeout=15,
+                    follow_redirects=True,
+                )
+                if add_resp and getattr(add_resp, 'status_code', 0) in (200, 302):
+                    checkout_url = url.rstrip('/') + '/checkout'
+                    await asyncio.sleep(0.5)
+            except Exception:
+                pass
+            if not checkout_url:
+                output.update({
+                    "Response": "SITE_ACCESS_TOKEN_MISSING",
+                    "Status": False,
+                })
+                _log_output_to_terminal(output)
+                return output
 
-        headers = {
-            'accept': 'application/json',
-            'accept-language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
-            'content-type': 'application/json',
-            'origin': url,
-            'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
-            'sec-ch-ua-mobile': f'{mobile}',
-            'sec-ch-ua-platform': f'"{clienthint}"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin',
-            'user-agent': f'{getua}',
-            'x-sdk-variant': 'portable-wallets',
-            'x-shopify-storefront-access-token': site_key,
-            'x-start-wallet-checkout': 'true',
-            'x-wallet-name': 'MoreOptions'
-        }
+        if site_key and str(site_key).strip():
+            headers = {
+                'accept': 'application/json',
+                'accept-language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
+                'content-type': 'application/json',
+                'origin': url,
+                'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
+                'sec-ch-ua-mobile': f'{mobile}',
+                'sec-ch-ua-platform': f'"{clienthint}"',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin',
+                'user-agent': f'{getua}',
+                'x-sdk-variant': 'portable-wallets',
+                'x-shopify-storefront-access-token': site_key,
+                'x-start-wallet-checkout': 'true',
+                'x-wallet-name': 'MoreOptions'
+            }
 
-        params = {
-            'operation_name': 'cartCreate',
-        }
+            params = {
+                'operation_name': 'cartCreate',
+            }
 
-        json_data = {
+            json_data = {
             'query': 'mutation cartCreate($input:CartInput!$country:CountryCode$language:LanguageCode$withCarrierRates:Boolean=false)@inContext(country:$country language:$language){result:cartCreate(input:$input){...@defer(if:$withCarrierRates){cart{...CartParts}errors:userErrors{...on CartUserError{message field code}}warnings:warnings{...on CartWarning{code}}}}}fragment CartParts on Cart{id checkoutUrl deliveryGroups(first:10 withCarrierRates:$withCarrierRates){edges{node{id groupType selectedDeliveryOption{code title handle deliveryPromise deliveryMethodType estimatedCost{amount currencyCode}}deliveryOptions{code title handle deliveryPromise deliveryMethodType estimatedCost{amount currencyCode}}}}}cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}totalTaxAmount{amount currencyCode}totalDutyAmount{amount currencyCode}}discountAllocations{discountedAmount{amount currencyCode}...on CartCodeDiscountAllocation{code}...on CartAutomaticDiscountAllocation{title}...on CartCustomDiscountAllocation{title}}discountCodes{code applicable}lines(first:10){edges{node{quantity cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}}discountAllocations{discountedAmount{amount currencyCode}...on CartCodeDiscountAllocation{code}...on CartAutomaticDiscountAllocation{title}...on CartCustomDiscountAllocation{title}}merchandise{...on ProductVariant{requiresShipping}}sellingPlanAllocation{priceAdjustments{price{amount currencyCode}}sellingPlan{billingPolicy{...on SellingPlanRecurringBillingPolicy{interval intervalCount}}priceAdjustments{orderCount}recurringDeliveries}}}}}}',
             'operationName': 'cartCreate',
             'variables': {
@@ -561,119 +585,83 @@ async def autoshopify(url, card, session, proxy=None):
                 'country': 'US',
                 'language': 'EN',
             },
-        }
+            }
 
-        # Try multiple Storefront API endpoints (different Shopify versions)
-        cart_endpoints = [
-            f'{url}/api/unstable/graphql.json',
-            f'{url}/api/2024-01/graphql.json',
-            f'{url}/api/2023-10/graphql.json',
-            f'{url}/api/2023-07/graphql.json',
-            f'{url}/api/2023-04/graphql.json',
-        ]
-        response = None
-        last_cart_error = None
-        for cart_url in cart_endpoints:
-            try:
-                response = await session.post(cart_url, params=params, headers=headers, json=json_data, timeout=18, follow_redirects=True)
-                if response and getattr(response, "status_code", 0) == 200:
-                    resp_text = (response.text or "").strip()
-                    if resp_text.startswith("{") and "checkoutUrl" in resp_text:
-                        break
-                if response and getattr(response, "status_code", 0) == 404:
+            # Try multiple Storefront API endpoints (different Shopify versions)
+            cart_endpoints = [
+                f'{url}/api/unstable/graphql.json',
+                f'{url}/api/2024-01/graphql.json',
+                f'{url}/api/2023-10/graphql.json',
+                f'{url}/api/2023-07/graphql.json',
+                f'{url}/api/2023-04/graphql.json',
+            ]
+            response = None
+            last_cart_error = None
+            for cart_url in cart_endpoints:
+                try:
+                    response = await session.post(cart_url, params=params, headers=headers, json=json_data, timeout=18, follow_redirects=True)
+                    if response and getattr(response, "status_code", 0) == 200:
+                        resp_text = (response.text or "").strip()
+                        if resp_text.startswith("{") and "checkoutUrl" in resp_text:
+                            break
+                    if response and getattr(response, "status_code", 0) == 404:
+                        continue
+                except Exception as e:
+                    last_cart_error = str(e)[:80]
                     continue
-            except Exception as e:
-                last_cart_error = str(e)[:80]
-                continue
-        if not response or getattr(response, "status_code", 0) != 200:
-            output.update({
-                "Response": f"CART_HTTP_ERROR: {(last_cart_error or 'all endpoints failed')[:50]}",
-                "Status": False,
-            })
-            _log_output_to_terminal(output)
-            return output
-        
-        # Parse cart creation response with error handling
-        try:
-            response_text = response.text if response.text else ""
-            
-            # Check for HTML/captcha
-            if response_text.strip().startswith("<"):
-                if any(x in response_text.lower() for x in ["captcha", "hcaptcha", "recaptcha"]):
-                    output.update({
-                        "Response": "HCAPTCHA_DETECTED",
-                        "Status": False,
-                    })
+            if not response or getattr(response, "status_code", 0) != 200:
+                output.update({
+                    "Response": f"CART_HTTP_ERROR: {(last_cart_error or 'all endpoints failed')[:50]}",
+                    "Status": False,
+                })
+                _log_output_to_terminal(output)
+                return output
+
+            # Parse cart creation response with error handling
+            try:
+                response_text = response.text if response.text else ""
+                if response_text.strip().startswith("<"):
+                    if any(x in response_text.lower() for x in ["captcha", "hcaptcha", "recaptcha"]):
+                        output.update({"Response": "HCAPTCHA_DETECTED", "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+                    output.update({"Response": "CART_HTML_ERROR", "Status": False})
                     _log_output_to_terminal(output)
                     return output
-                output.update({
-                    "Response": "CART_HTML_ERROR",
-                    "Status": False,
-                })
+                if not hasattr(response, 'json'):
+                    output.update({"Response": "CART_NO_JSON_METHOD", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+                try:
+                    response_data = response.json()
+                    if not response_data and (response.text or "").strip().startswith("{"):
+                        response_data = json.loads(response.text)
+                except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                    output.update({"Response": f"CART_JSON_ERROR: {str(e)[:50]}", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+                if not response_data or not isinstance(response_data, dict):
+                    output.update({"Response": "CART_INVALID_DATA", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+                if "errors" in response_data and response_data.get("errors"):
+                    error_msg = response_data["errors"][0].get("message", "GRAPHQL_ERROR")
+                    output.update({"Response": f"CART_ERROR: {error_msg[:50]}", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+                checkout_url = _get_checkout_url_from_cart_response(response_data)
+                if not checkout_url:
+                    output.update({"Response": "CART_NO_CHECKOUT_URL", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+            except json.JSONDecodeError:
+                output.update({"Response": "CART_INVALID_JSON", "Status": False})
                 _log_output_to_terminal(output)
                 return output
-            
-            if not hasattr(response, 'json'):
-                output.update({
-                    "Response": "CART_NO_JSON_METHOD",
-                    "Status": False,
-                })
+            except (KeyError, TypeError):
+                output.update({"Response": "CART_CREATION_FAILED", "Status": False})
                 _log_output_to_terminal(output)
                 return output
-            
-            try:
-                response_data = response.json()
-                if not response_data and (response.text or "").strip().startswith("{"):
-                    response_data = json.loads(response.text)
-            except (json.JSONDecodeError, TypeError, AttributeError) as e:
-                output.update({
-                    "Response": f"CART_JSON_ERROR: {str(e)[:50]}",
-                    "Status": False,
-                })
-                _log_output_to_terminal(output)
-                return output
-            
-            if not response_data or not isinstance(response_data, dict):
-                output.update({
-                    "Response": "CART_INVALID_DATA",
-                    "Status": False,
-                })
-                _log_output_to_terminal(output)
-                return output
-            
-            # Check for GraphQL errors
-            if "errors" in response_data and response_data.get("errors"):
-                error_msg = response_data["errors"][0].get("message", "GRAPHQL_ERROR")
-                output.update({
-                    "Response": f"CART_ERROR: {error_msg[:50]}",
-                    "Status": False,
-                })
-                _log_output_to_terminal(output)
-                return output
-            
-            checkout_url = _get_checkout_url_from_cart_response(response_data)
-            if not checkout_url:
-                output.update({
-                    "Response": "CART_NO_CHECKOUT_URL",
-                    "Status": False,
-                })
-                _log_output_to_terminal(output)
-                return output
-        except json.JSONDecodeError:
-            output.update({
-                "Response": "CART_INVALID_JSON",
-                "Status": False,
-            })
-            _log_output_to_terminal(output)
-            return output
-        except (KeyError, TypeError) as e:
-            output.update({
-                "Response": "CART_CREATION_FAILED",
-                "Status": False,
-            })
-            _log_output_to_terminal(output)
-            return output
-
 
         await asyncio.sleep(0.35)
         headers = {
