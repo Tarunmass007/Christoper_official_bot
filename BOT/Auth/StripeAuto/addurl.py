@@ -23,8 +23,8 @@ from BOT.tools.proxy import get_rotating_proxy
 from BOT.Auth.StripeAuto.api import auto_stripe_auth
 from BOT.Auth.StripeAuto.response import determine_stripe_auto_status
 
-# Test card for validation (Visa test)
-TEST_CARD = "4111111111111111|12|2026|123"
+# Test card for validation (live-mode compatible; used when adding site via /sturl or /murl)
+TEST_CARD = "5598880328708591|05|2029|362"
 
 
 def normalize_stripe_url(url: str) -> str:
