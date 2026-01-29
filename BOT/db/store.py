@@ -27,6 +27,7 @@ AU_GATE_FILE = os.path.join(DATA_DIR, "au_gate.json")
 PLAN_REQUESTS_FILE = os.path.join(DATA_DIR, "plan_requests.json")
 REDEEMS_FILE = os.path.join(DATA_DIR, "redeems.json")
 GROUPS_FILE = os.path.join(DATA_DIR, "groups.json")
+STRIPE_AUTH_SITES_FILE = os.path.join(DATA_DIR, "stripe_auth_sites.json")
 
 
 def _ensure_data():
@@ -98,6 +99,11 @@ def _redeems_coll():
 def _groups_coll():
     m = _mongo()
     return m.groups if m is not None else None
+
+
+def _stripe_auth_sites_coll():
+    m = _mongo()
+    return m.stripe_auth_sites if m is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +612,102 @@ def reset_site_fail_count(user_id: str, url: str) -> None:
         save_unified_sites(data)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Stripe Auto Auth sites (for /sturl, /murl, /starr, /mstarr)
+# ---------------------------------------------------------------------------
+
+def load_stripe_auth_sites() -> dict:
+    """Load stripe_auth_sites: { user_id: [ { url, gateway, is_primary }, ... ] }."""
+    if _use_mongo():
+        coll = _stripe_auth_sites_coll()
+        if not coll:
+            return {}
+        data = {}
+        for doc in coll.find({}):
+            uid = doc.get("_id")
+            if uid:
+                data[str(uid)] = doc.get("sites", [])
+        return data
+    _ensure_data()
+    if not os.path.exists(STRIPE_AUTH_SITES_FILE):
+        return {}
+    try:
+        with open(STRIPE_AUTH_SITES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_stripe_auth_sites(data: dict) -> None:
+    if _use_mongo():
+        coll = _stripe_auth_sites_coll()
+        if not coll:
+            return
+        for uid, sites in data.items():
+            coll.replace_one({"_id": str(uid)}, {"_id": str(uid), "sites": sites or []}, upsert=True)
+        return
+    _ensure_data()
+    with open(STRIPE_AUTH_SITES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+
+def get_stripe_auth_sites(user_id: str) -> list:
+    data = load_stripe_auth_sites()
+    return data.get(str(user_id), [])
+
+
+def get_primary_stripe_auth_site(user_id: str) -> Optional[dict]:
+    sites = get_stripe_auth_sites(user_id)
+    if not sites:
+        return None
+    for s in sites:
+        if s.get("is_primary"):
+            return s
+    return sites[0]
+
+
+def add_stripe_auth_site(user_id: str, url: str, set_primary: bool = True) -> bool:
+    try:
+        data = load_stripe_auth_sites()
+        uid = str(user_id)
+        if uid not in data:
+            data[uid] = []
+        u = url.lower().rstrip("/")
+        existing = {s.get("url", "").lower().rstrip("/") for s in data[uid]}
+        if u in existing:
+            if set_primary:
+                for s in data[uid]:
+                    s["is_primary"] = (s.get("url", "").lower().rstrip("/") == u)
+                save_stripe_auth_sites(data)
+            return True
+        is_first = len(data[uid]) == 0
+        entry = {"url": url.rstrip("/"), "gateway": "Stripe Auth", "active": True, "is_primary": set_primary or is_first}
+        if set_primary:
+            for s in data[uid]:
+                s["is_primary"] = False
+            data[uid].insert(0, entry)
+        else:
+            data[uid].append(entry)
+        save_stripe_auth_sites(data)
+        return True
+    except Exception:
+        return False
+
+
+def clear_stripe_auth_sites(user_id: str) -> int:
+    try:
+        data = load_stripe_auth_sites()
+        uid = str(user_id)
+        if uid not in data:
+            return 0
+        n = len(data[uid])
+        del data[uid]
+        save_stripe_auth_sites(data)
+        return n
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------

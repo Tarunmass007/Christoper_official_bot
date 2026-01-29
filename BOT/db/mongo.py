@@ -105,6 +105,7 @@ def ensure_indexes():
     get_db().users.create_index("_id")
     get_db().proxies.create_index("_id")
     get_db().user_sites.create_index("_id")
+    get_db().stripe_auth_sites.create_index("_id")
     get_db().au_gates.create_index("_id")
     get_db().redeems.create_index("_id")
     get_db().plan_requests.create_index("_id")
@@ -175,6 +176,24 @@ def migrate_json_to_mongo():
                 print("[MongoDB] Migrated user_sites from user_sites.json")
         except Exception as e:
             print(f"[MongoDB] User sites migration failed: {e}")
+
+    # Stripe Auth sites (Stripe Auto gate)
+    stripe_sites_path = os.path.join(DATA_DIR, "stripe_auth_sites.json")
+    if os.path.exists(stripe_sites_path) and db.stripe_auth_sites.count_documents({}) == 0:
+        try:
+            with open(stripe_sites_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                for uid, sites in data.items():
+                    if not isinstance(sites, list):
+                        continue
+                    try:
+                        db.stripe_auth_sites.insert_one({"_id": str(uid), "sites": sites})
+                    except Exception:
+                        pass
+                print("[MongoDB] Migrated stripe_auth_sites from stripe_auth_sites.json")
+        except Exception as e:
+            print(f"[MongoDB] Stripe auth sites migration failed: {e}")
 
     # AU gate
     au_gate_path = os.path.join(DATA_DIR, "au_gate.json")
