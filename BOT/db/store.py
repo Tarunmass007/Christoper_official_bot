@@ -654,8 +654,27 @@ def save_stripe_auth_sites(data: dict) -> None:
 
 
 def get_stripe_auth_sites(user_id: str) -> list:
+    """Return list of site dicts with 'url' for /starr and /mstarr. Normalized for consistent use."""
     data = load_stripe_auth_sites()
-    return data.get(str(user_id), [])
+    raw = data.get(str(user_id), [])
+    if not raw:
+        return []
+    out = []
+    for s in raw:
+        if isinstance(s, dict) and s.get("url"):
+            out.append({
+                "url": str(s["url"]).strip().rstrip("/"),
+                "gateway": s.get("gateway", "Stripe Auth"),
+                "active": s.get("active", True),
+                "is_primary": bool(s.get("is_primary")),
+            })
+        elif isinstance(s, dict):
+            continue
+        else:
+            url = str(s).strip().rstrip("/")
+            if url:
+                out.append({"url": url, "gateway": "Stripe Auth", "active": True, "is_primary": False})
+    return out
 
 
 def get_primary_stripe_auth_site(user_id: str) -> Optional[dict]:

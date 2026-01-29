@@ -41,11 +41,43 @@ def normalize_stripe_url(url: str) -> str:
 
 
 def extract_urls(text: str) -> List[str]:
-    urls = re.findall(r"https?://[^\s<>\"{}|\\^`\[\]]+", text)
-    if not urls:
-        domains = re.findall(r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}", text)
-        urls = [f"https://{d}" for d in domains if len(d) > 4]
-    return list(dict.fromkeys(urls))
+    """Extract all URLs from text (message or file content). No limit; accurate detection."""
+    if not text or not isinstance(text, str):
+        return []
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    seen: set = set()
+    out: List[str] = []
+
+    # 1) Full URL with scheme (strip trailing punctuation)
+    for m in re.finditer(r"https?://[^\s<>\"{}|\\^`\[\]\s]+", text, re.IGNORECASE):
+        u = m.group(0).rstrip(".,;:)>\"]'").strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+
+    # 2) www. or domain.tld without scheme (one per line or space-separated)
+    for m in re.finditer(
+        r"(?:www\.|[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?:/[^\s<>\"{}|\\^`\[\]\s]*)?",
+        text,
+    ):
+        u = m.group(0).rstrip(".,;:)>\"]'").strip()
+        if u and len(u) > 4 and not u.startswith("http"):
+            canonical = "https://" + u.lstrip("/")
+            if canonical not in seen:
+                seen.add(canonical)
+                out.append(canonical)
+
+    if out:
+        return list(dict.fromkeys(out))
+    # 3) Fallback: bare domains
+    for m in re.finditer(r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}", text):
+        d = m.group(0)
+        if len(d) > 4:
+            canonical = "https://" + d
+            if canonical not in seen:
+                seen.add(canonical)
+                out.append(canonical)
+    return list(dict.fromkeys(out))
 
 
 async def validate_stripe_auth_site(url: str, proxy: Optional[str] = None, max_retries: int = 2) -> tuple[bool, Dict]:
@@ -155,7 +187,7 @@ async def murl_handler(client: Client, message: Message):
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML,
         )
-    urls = [normalize_stripe_url(u) for u in args[:10]]
+    urls = [normalize_stripe_url(u) for u in args]
     status_msg = await message.reply(
         f"<pre>Validating {len(urls)} site(s)...</pre>\n<b>Status:</b> <i>Testing auth...</i>",
         reply_to_message_id=message.id,
@@ -165,12 +197,15 @@ async def murl_handler(client: Client, message: Message):
     proxy = get_rotating_proxy(int(user_id))
     added = 0
     failed = []
+    total_urls = len(urls)
     for i, url in enumerate(urls):
+        # Throttle progress updates: every 5 URLs or first/last to avoid rate limits
         try:
-            await status_msg.edit_text(
-                f"<pre>Validating...</pre>\n<b>Progress:</b> <code>{i + 1}/{len(urls)}</code>\n<b>Current:</b> <code>{url[:40]}...</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            if i == 0 or i == total_urls - 1 or (i + 1) % 5 == 0:
+                await status_msg.edit_text(
+                    f"<pre>Validating...</pre>\n<b>Progress:</b> <code>{i + 1}/{total_urls}</code>\n<b>Current:</b> <code>{url[:45]}...</code>" if len(url) > 45 else f"<pre>Validating...</pre>\n<b>Progress:</b> <code>{i + 1}/{total_urls}</code>\n<b>Current:</b> <code>{url}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
         except Exception:
             pass
         valid, _ = await validate_stripe_auth_site(url, proxy, max_retries=1)
