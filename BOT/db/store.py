@@ -622,7 +622,7 @@ def load_stripe_auth_sites() -> dict:
     """Load stripe_auth_sites: { user_id: [ { url, gateway, is_primary }, ... ] }."""
     if _use_mongo():
         coll = _stripe_auth_sites_coll()
-        if not coll:
+        if coll is None:
             return {}
         data = {}
         for doc in coll.find({}):
@@ -643,7 +643,7 @@ def load_stripe_auth_sites() -> dict:
 def save_stripe_auth_sites(data: dict) -> None:
     if _use_mongo():
         coll = _stripe_auth_sites_coll()
-        if not coll:
+        if coll is None:
             return
         for uid, sites in data.items():
             coll.replace_one({"_id": str(uid)}, {"_id": str(uid), "sites": sites or []}, upsert=True)

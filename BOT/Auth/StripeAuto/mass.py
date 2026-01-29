@@ -14,7 +14,7 @@ from pyrogram.enums import ParseMode
 from BOT.helper.start import load_users
 from BOT.helper.permissions import check_private_access, is_premium_user
 from BOT.gc.credit import deduct_credit_bulk, has_credits
-from BOT.db.store import get_primary_stripe_auth_site
+from BOT.db.store import get_stripe_auth_sites
 from BOT.tools.proxy import get_rotating_proxy
 from BOT.Auth.StripeAuto.api import auto_stripe_auth
 from BOT.Auth.StripeAuto.response import determine_stripe_auto_status
@@ -54,8 +54,8 @@ async def handle_mstarr_command(client: Client, message):
         if not await check_private_access(message):
             user_locks.pop(user_id, None)
             return
-        site_info = get_primary_stripe_auth_site(user_id)
-        if not site_info or not site_info.get("url"):
+        sites = get_stripe_auth_sites(user_id)
+        if not sites or not isinstance(sites, list):
             user_locks.pop(user_id, None)
             return await message.reply(
                 "<pre>No Stripe Auth Site ❌</pre>\n<b>Add first:</b> <code>/sturl https://yoursite.com</code>",
@@ -87,10 +87,10 @@ async def handle_mstarr_command(client: Client, message):
                 parse_mode=ParseMode.HTML,
             )
         proxy = get_rotating_proxy(int(user_id))
-        site_url = site_info["url"]
         total = len(all_cards)
+        site_label = f"{len(sites)} site(s)" if len(sites) > 1 else (sites[0].get("url", "")[:35] if isinstance(sites[0], dict) else str(sites[0])[:35])
         status_msg = await message.reply(
-            f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Site:</b> <code>{site_url[:35]}...</code>\n<b>Status:</b> <i>Processing...</i>",
+            f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Sites:</b> <code>{site_label}...</code>\n<b>Status:</b> <i>Processing...</i>",
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML,
         )
@@ -98,9 +98,12 @@ async def handle_mstarr_command(client: Client, message):
         results = []
         done = 0
         for i, card in enumerate(all_cards):
+            site_entry = sites[i % len(sites)]
+            site_url = site_entry.get("url", "") if isinstance(site_entry, dict) else str(site_entry)
             res = await auto_stripe_auth(site_url, card, session=None, proxy=proxy, timeout_seconds=45)
             status = determine_stripe_auto_status(res)
-            results.append((card, status, res.get("message", "")[:40]))
+            msg = res.get("message", "") if isinstance(res.get("message"), str) else str(res.get("message", ""))[:40]
+            results.append((card, status, msg[:40]))
             done += 1
             if done % 5 == 0 or done == total:
                 try:

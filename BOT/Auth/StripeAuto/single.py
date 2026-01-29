@@ -15,7 +15,7 @@ from pyrogram.enums import ParseMode
 from BOT.helper.start import load_users
 from BOT.helper.antispam import can_run_command
 from BOT.gc.credit import deduct_credit, has_credits
-from BOT.db.store import get_primary_stripe_auth_site
+from BOT.db.store import get_stripe_auth_sites
 from BOT.tools.proxy import get_rotating_proxy
 from BOT.Auth.StripeAuto.api import auto_stripe_auth
 from BOT.Auth.StripeAuto.response import determine_stripe_auto_status
@@ -27,6 +27,8 @@ except ImportError:
         return None
 
 user_locks = {}
+# Rotation index per user for multi-site round-robin
+user_site_index = {}
 
 def extract_card(text: str):
     m = re.search(r"(\d{12,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})", text)
@@ -133,14 +135,27 @@ async def handle_starr_command(client: Client, message: Message):
                 reply_to_message_id=message.id,
                 parse_mode=ParseMode.HTML,
             )
-        site_info = get_primary_stripe_auth_site(user_id)
-        if not site_info or not site_info.get("url"):
+        sites = get_stripe_auth_sites(user_id)
+        if not sites or not isinstance(sites, list):
             user_locks.pop(user_id, None)
             return await message.reply(
                 "<pre>No Stripe Auth Site ❌</pre>\n<b>Add a site first:</b> <code>/sturl https://yoursite.com</code>",
                 reply_to_message_id=message.id,
                 parse_mode=ParseMode.HTML,
             )
+        # Rotate through added sites (round-robin)
+        idx = user_site_index.get(user_id, 0) % len(sites)
+        site_info = sites[idx] if isinstance(sites[idx], dict) else {"url": str(sites[idx])}
+        user_site_index[user_id] = (idx + 1) % len(sites)
+        site_url = site_info.get("url") or (str(sites[idx]) if not isinstance(sites[idx], dict) else "")
+        if not site_url:
+            user_locks.pop(user_id, None)
+            return await message.reply(
+                "<pre>No Stripe Auth Site ❌</pre>\n<b>Add a site first:</b> <code>/sturl https://yoursite.com</code>",
+                reply_to_message_id=message.id,
+                parse_mode=ParseMode.HTML,
+            )
+        site_info = {"url": site_url}
         card_num, mm, yy, cvv = extracted
         if len(yy) == 2:
             yy = "20" + yy

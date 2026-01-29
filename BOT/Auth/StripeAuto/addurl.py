@@ -3,10 +3,11 @@ Stripe Auto Auth - Add URL (/sturl, /murl)
 ==========================================
 Add WooCommerce Stripe Auth sites. Validates with test run before saving.
 /sturl <url> - single URL
-/murl <url1> <url2> ... or reply to message with URLs
+/murl <url1> <url2> ... or reply to message with URLs or reply to .txt file with URLs
 Does NOT mingle with Shopify /addurl or existing Stripe Auth /au gate.
 """
 
+import os
 import re
 import time
 import asyncio
@@ -106,9 +107,37 @@ async def sturl_handler(client: Client, message: Message):
     )
 
 
+async def _get_murl_urls(client: Client, message: Message) -> List[str]:
+    """Get URLs for murl: from command args, reply text, or replied .txt file."""
+    args = list(message.command[1:])
+    if message.reply_to_message:
+        if message.reply_to_message.text:
+            args = extract_urls(message.reply_to_message.text)
+        elif message.reply_to_message.document:
+            doc = message.reply_to_message.document
+            fname = (doc.file_name or "").lower()
+            if fname.endswith(".txt"):
+                path = None
+                try:
+                    path = await client.download_media(message.reply_to_message)
+                    if path and os.path.isfile(path):
+                        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+                        args = extract_urls(content)
+                except Exception:
+                    pass
+                finally:
+                    if path and os.path.isfile(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+    return args
+
+
 @Client.on_message(filters.command(["murl"]))
 async def murl_handler(client: Client, message: Message):
-    """Add multiple Stripe Auth sites. /murl url1 url2 or reply to message with URLs."""
+    """Add multiple Stripe Auth sites. /murl url1 url2 or reply to message or .txt file with URLs."""
     if not message.from_user:
         return
     user_id = str(message.from_user.id)
@@ -119,12 +148,10 @@ async def murl_handler(client: Client, message: Message):
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML,
         )
-    args = message.command[1:]
-    if message.reply_to_message and message.reply_to_message.text:
-        args = extract_urls(message.reply_to_message.text)
+    args = await _get_murl_urls(client, message)
     if not args:
         return await message.reply(
-            "<pre>Stripe Auto - Mass Add</pre>\n<b>Usage:</b> <code>/murl url1 url2 url3</code> or reply to a message with URLs.",
+            "<pre>Stripe Auto - Mass Add</pre>\n<b>Usage:</b> <code>/murl url1 url2 url3</code> or reply to a message/.txt file with URLs.",
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML,
         )
