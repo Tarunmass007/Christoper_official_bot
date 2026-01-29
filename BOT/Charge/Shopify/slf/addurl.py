@@ -630,11 +630,21 @@ async def add_site_handler(client: Client, message: Message):
                 sites_with_receipt.append(result)
         if not sites_with_receipt:
             time_taken = round(time.time() - start_time, 2)
+            # Surface first gate error for debugging (e.g. CHECKOUT_TOKENS_MISSING, SITE_ACCESS_TOKEN_MISSING)
+            first_err = ""
+            if valid_sites:
+                try:
+                    _, err_res = await test_site_with_card(valid_sites[0]["url"], proxy_url, max_retries=1)
+                    first_err = (err_res.get("Response") or "").strip()
+                    if first_err:
+                        first_err = f"\n<b>Gate error:</b> <code>{first_err[:60]}</code>"
+                except Exception:
+                    pass
             return await status_msg.edit_text(
                 f"""<pre>No Sites Verified ❌</pre>
 ━━━━━━━━━━━━━
 <b>Gate test did not return receipt/bill.</b>
-(Site has products; test checkout failed.)
+(Site has products; test checkout failed.){first_err}
 
 <b>Tips:</b>
 • Set proxy: <code>/setpx</code>

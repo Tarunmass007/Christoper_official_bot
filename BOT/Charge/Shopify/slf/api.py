@@ -122,6 +122,26 @@ def _capture_multi(data: str, *pairs) -> Optional[str]:
             pass
     return None
 
+
+def _get_checkout_url_from_cart_response(response_data: dict) -> Optional[str]:
+    """Extract checkoutUrl from cart create GraphQL response. Handles multiple response shapes."""
+    if not response_data or not isinstance(response_data, dict):
+        return None
+    data = response_data.get("data") or {}
+    if not data:
+        return None
+    # Alias result:cartCreate -> result
+    for key in ("result", "cartCreate"):
+        node = data.get(key)
+        if not isinstance(node, dict):
+            continue
+        cart = node.get("cart")
+        if isinstance(cart, dict):
+            url = cart.get("checkoutUrl")
+            if url and isinstance(url, str) and url.startswith("http"):
+                return url
+    return None
+
 def _products_from_json_text(text: str):
     """Parse products from raw /products.json text. Returns (product_id, price) or raises ValueError."""
     if not text or not text.strip():
@@ -473,9 +493,34 @@ async def autoshopify(url, card, session, proxy=None):
             return output
         
         request_text_for_capture = (request.text or "") if request and hasattr(request, 'text') else ""
-        site_key = capture(request_text_for_capture, '"accessToken":"', '"')
+        site_key = (
+            _capture_multi(
+                request_text_for_capture,
+                ('"accessToken":"', '"'),
+                ("'accessToken':'", "'"),
+                ('accessToken":"', '"'),
+                ('storefrontAccessToken":"', '"'),
+                ('StorefrontApiAccessToken":"', '"'),
+            )
+            or capture(request_text_for_capture, '"accessToken":"', '"')
+        )
+        if not site_key:
+            m = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture)
+            if m:
+                site_key = m.group(1)
+        if not site_key:
+            m = re.search(r'storefrontAccessToken["\']?\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture, re.I)
+            if m:
+                site_key = m.group(1)
 
         # print(f"{product_id}\n{price}\n{site_key}")
+        if not site_key or not str(site_key).strip():
+            output.update({
+                "Response": "SITE_ACCESS_TOKEN_MISSING",
+                "Status": False,
+            })
+            _log_output_to_terminal(output)
+            return output
 
         headers = {
             'accept': 'application/json',
@@ -501,6 +546,7 @@ async def autoshopify(url, card, session, proxy=None):
 
         json_data = {
             'query': 'mutation cartCreate($input:CartInput!$country:CountryCode$language:LanguageCode$withCarrierRates:Boolean=false)@inContext(country:$country language:$language){result:cartCreate(input:$input){...@defer(if:$withCarrierRates){cart{...CartParts}errors:userErrors{...on CartUserError{message field code}}warnings:warnings{...on CartWarning{code}}}}}fragment CartParts on Cart{id checkoutUrl deliveryGroups(first:10 withCarrierRates:$withCarrierRates){edges{node{id groupType selectedDeliveryOption{code title handle deliveryPromise deliveryMethodType estimatedCost{amount currencyCode}}deliveryOptions{code title handle deliveryPromise deliveryMethodType estimatedCost{amount currencyCode}}}}}cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}totalTaxAmount{amount currencyCode}totalDutyAmount{amount currencyCode}}discountAllocations{discountedAmount{amount currencyCode}...on CartCodeDiscountAllocation{code}...on CartAutomaticDiscountAllocation{title}...on CartCustomDiscountAllocation{title}}discountCodes{code applicable}lines(first:10){edges{node{quantity cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}}discountAllocations{discountedAmount{amount currencyCode}...on CartCodeDiscountAllocation{code}...on CartAutomaticDiscountAllocation{title}...on CartCustomDiscountAllocation{title}}merchandise{...on ProductVariant{requiresShipping}}sellingPlanAllocation{priceAdjustments{price{amount currencyCode}}sellingPlan{billingPolicy{...on SellingPlanRecurringBillingPolicy{interval intervalCount}}priceAdjustments{orderCount}recurringDeliveries}}}}}}',
+            'operationName': 'cartCreate',
             'variables': {
                 'input': {
                     'lines': [
@@ -517,8 +563,35 @@ async def autoshopify(url, card, session, proxy=None):
             },
         }
 
-        # Removed tokenization - using bulletproof session
-        response = await session.post(f'{url}/api/unstable/graphql.json', params=params, headers=headers, json=json_data, timeout=18, follow_redirects=True)
+        # Try multiple Storefront API endpoints (different Shopify versions)
+        cart_endpoints = [
+            f'{url}/api/unstable/graphql.json',
+            f'{url}/api/2024-01/graphql.json',
+            f'{url}/api/2023-10/graphql.json',
+            f'{url}/api/2023-07/graphql.json',
+            f'{url}/api/2023-04/graphql.json',
+        ]
+        response = None
+        last_cart_error = None
+        for cart_url in cart_endpoints:
+            try:
+                response = await session.post(cart_url, params=params, headers=headers, json=json_data, timeout=18, follow_redirects=True)
+                if response and getattr(response, "status_code", 0) == 200:
+                    resp_text = (response.text or "").strip()
+                    if resp_text.startswith("{") and "checkoutUrl" in resp_text:
+                        break
+                if response and getattr(response, "status_code", 0) == 404:
+                    continue
+            except Exception as e:
+                last_cart_error = str(e)[:80]
+                continue
+        if not response or getattr(response, "status_code", 0) != 200:
+            output.update({
+                "Response": f"CART_HTTP_ERROR: {(last_cart_error or 'all endpoints failed')[:50]}",
+                "Status": False,
+            })
+            _log_output_to_terminal(output)
+            return output
         
         # Parse cart creation response with error handling
         try:
@@ -550,6 +623,8 @@ async def autoshopify(url, card, session, proxy=None):
             
             try:
                 response_data = response.json()
+                if not response_data and (response.text or "").strip().startswith("{"):
+                    response_data = json.loads(response.text)
             except (json.JSONDecodeError, TypeError, AttributeError) as e:
                 output.update({
                     "Response": f"CART_JSON_ERROR: {str(e)[:50]}",
@@ -576,7 +651,14 @@ async def autoshopify(url, card, session, proxy=None):
                 _log_output_to_terminal(output)
                 return output
             
-            checkout_url = response_data["data"]["result"]["cart"]["checkoutUrl"]
+            checkout_url = _get_checkout_url_from_cart_response(response_data)
+            if not checkout_url:
+                output.update({
+                    "Response": "CART_NO_CHECKOUT_URL",
+                    "Status": False,
+                })
+                _log_output_to_terminal(output)
+                return output
         except json.JSONDecodeError:
             output.update({
                 "Response": "CART_INVALID_JSON",
@@ -676,7 +758,12 @@ async def autoshopify(url, card, session, proxy=None):
                 checkout_text,
                 ('stableId&quot;:&quot;', '&quot'),
                 ('stableId":"', '"'),
+                ('"stableId":"', '"'),
             ) or capture(checkout_text, "stableId&quot;:&quot;", "&quot")
+            if not stable_id:
+                m = re.search(r'"stableId"\s*:\s*"([^"]+)"', checkout_text)
+                if m:
+                    stable_id = m.group(1)
         except Exception:
             stable_id = None
         try:
@@ -684,7 +771,12 @@ async def autoshopify(url, card, session, proxy=None):
                 checkout_text,
                 ('queueToken&quot;:&quot;', '&quot'),
                 ('queueToken":"', '"'),
+                ('"queueToken":"', '"'),
             ) or capture(checkout_text, "queueToken&quot;:&quot;", "&quot")
+            if not queue_token:
+                m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', checkout_text)
+                if m:
+                    queue_token = m.group(1)
         except Exception:
             queue_token = None
         try:
@@ -701,18 +793,33 @@ async def autoshopify(url, card, session, proxy=None):
         except Exception:
             countryCode = currencyCode
 
+        # Session and source tokens: multiple patterns for different Shopify checkout renders
         x_checkout_one_session_token = _capture_multi(
             checkout_text,
             ('serialized-session-token" content="&quot;', '&quot'),
             ('serialized-session-token" content="', '"'),
             ('serialized-session-token&quot; content=&quot;&quot;', '&quot;'),
+            ('name="serialized-session-token" content="', '"'),
+            ("name='serialized-session-token' content='", "'"),
+            ('serialized-session-token" content=\'', "'"),
         )
+        if not x_checkout_one_session_token and 'serializedSessionToken' in checkout_text:
+            m = re.search(r'"serializedSessionToken"\s*:\s*"([^"]+)"', checkout_text)
+            if m:
+                x_checkout_one_session_token = m.group(1)
         token = _capture_multi(
             checkout_text,
             ('serialized-source-token" content="&quot;', '&quot'),
             ('serialized-source-token" content="', '"'),
             ('serialized-source-token&quot; content=&quot;&quot;', '&quot;'),
+            ('name="serialized-source-token" content="', '"'),
+            ("name='serialized-source-token' content='", "'"),
+            ('serialized-source-token" content=\'', "'"),
         )
+        if not token and 'serializedSourceToken' in checkout_text:
+            m = re.search(r'"serializedSourceToken"\s*:\s*"([^"]+)"', checkout_text)
+            if m:
+                token = m.group(1)
 
         web_build = None
         try:

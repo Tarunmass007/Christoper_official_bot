@@ -402,7 +402,13 @@ class TLSResponse:
         if self._response:
             return self._response.text
         return self._text or ""
-    
+
+    @property
+    def content(self) -> bytes:
+        """Get response body as bytes (for compatibility with requests-style API)."""
+        t = self.text
+        return t.encode("utf-8", errors="replace") if t else b""
+
     def json(self) -> Any:
         """Parse and return JSON response."""
         if self._response:
