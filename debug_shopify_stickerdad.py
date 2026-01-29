@@ -2,6 +2,7 @@
 """
 Debug script for Shopify gate (stickerdad.com).
 Runs the full flow step-by-step and prints results for debugging addurl/API issues.
+Uses same flow as /addurl: cloudscraper-first for products, captcha retry for gate.
 Usage: python debug_shopify_stickerdad.py
 """
 import asyncio
@@ -19,6 +20,7 @@ async def main():
     from BOT.Charge.Shopify.tls_session import TLSAsyncSession
     from BOT.Charge.Shopify.slf.api import (
         autoshopify,
+        autoshopify_with_captcha_retry,
         _get_checkout_url_from_cart_response,
     )
     from BOT.Charge.Shopify.slf.addurl import (
@@ -60,10 +62,10 @@ async def main():
         return
     print(f"    OK: price={result.get('price')}, product_id={result.get('product_id')}")
 
-    # 5. Full gate test (autoshopify)
-    print("\n[4] Full gate test (autoshopify with test card) ...")
+    # 5. Full gate test (autoshopify_with_captcha_retry = same as /addurl)
+    print("\n[4] Full gate test (autoshopify_with_captcha_retry with test card) ...")
     async with TLSAsyncSession(timeout_seconds=60) as session:
-        out = await autoshopify(URL, TEST_CARD, session, proxy=None)
+        out = await autoshopify_with_captcha_retry(URL, TEST_CARD, session, max_captcha_retries=3, proxy=None)
     resp = out.get("Response", "")
     rid = out.get("ReceiptId")
     print(f"    Response: {resp[:80]}")

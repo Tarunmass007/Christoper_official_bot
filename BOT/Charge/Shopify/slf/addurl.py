@@ -226,10 +226,24 @@ async def fetch_products_json(
     base_url: str,
     proxy: Optional[str] = None,
 ) -> List[Dict]:
-    """Fetch products from Shopify /products.json. TLS first, then cloudscraper fallback. Robust JSON parse."""
-    products_url = f"{base_url.rstrip('/')}/products.json?limit=100"
+    """Fetch products from Shopify /products.json. Cloudscraper first (captcha bypass), then session fallback."""
     products: List[Dict] = []
 
+    # Bulletproof: try cloudscraper first so we don't trigger captcha on the session
+    if HAS_CLOUDSCRAPER:
+        try:
+            products = await asyncio.to_thread(
+                _fetch_products_cloudscraper_sync,
+                base_url,
+                proxy,
+            )
+            if products:
+                return products
+        except Exception:
+            pass
+
+    # Fallback: session get (with peaceful headers + delay)
+    products_url = f"{base_url.rstrip('/')}/products.json?limit=100"
     for attempt in range(FETCH_RETRIES):
         try:
             resp = await asyncio.wait_for(
@@ -252,6 +266,18 @@ async def fetch_products_json(
             products = _parse_products_json(raw)
             if products:
                 return products
+            # If response is HTML (captcha), try cloudscraper again
+            if raw.strip().startswith("<") and HAS_CLOUDSCRAPER:
+                try:
+                    products = await asyncio.to_thread(
+                        _fetch_products_cloudscraper_sync,
+                        base_url,
+                        proxy,
+                    )
+                    if products:
+                        return products
+                except Exception:
+                    pass
         except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
             pass
 

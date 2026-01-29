@@ -185,14 +185,15 @@ def _products_from_json_text(text: str):
     raise ValueError("SITE_PRODUCTS_EMPTY")
 
 
-def _fetch_products_cloudscraper_sync(url: str):
+def _fetch_products_cloudscraper_sync(url: str, proxy: Optional[str] = None):
     """Fetch /products.json via cloudscraper (captcha bypass). Returns (product_id, price) or raises."""
     if not HAS_CLOUDSCRAPER:
         raise ValueError("SITE_CAPTCHA_BLOCK")
     u = url.rstrip("/").split("?")[0]
     fetch_url = f"{u}/products.json?limit=100"
     scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
-    r = scraper.get(fetch_url, timeout=20)
+    proxies = {"http": proxy, "https": proxy} if proxy and str(proxy).strip() else None
+    r = scraper.get(fetch_url, timeout=20, proxies=proxies)
     if r.status_code != 200:
         raise ValueError(f"SITE_HTTP_{r.status_code}")
     return _products_from_json_text(r.text or "")
@@ -207,6 +208,28 @@ def _fetch_checkout_cloudscraper_sync(checkout_url: str, proxy: Optional[str] = 
     try:
         r = scraper.get(
             checkout_url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+            timeout=20,
+            proxies=proxies,
+        )
+        return (r.status_code, r.text or "")
+    except Exception:
+        return (0, "")
+
+
+def _fetch_store_page_cloudscraper_sync(store_url: str, proxy: Optional[str] = None):
+    """Fetch store page via cloudscraper (captcha bypass). Returns (status_code, text)."""
+    if not HAS_CLOUDSCRAPER:
+        return (0, "")
+    scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        r = scraper.get(
+            store_url,
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
@@ -369,102 +392,127 @@ async def autoshopify(url, card, session, proxy=None):
         }
         
         # Removed tokenization - using bulletproof session instead
-        
-        # Fetch products with retry on 429/5xx (rate-limit, server errors) and connection errors
+
+        # Bulletproof: try cloudscraper first for products to avoid triggering captcha on session
+        product_id, price = None, None
         request = None
+        if HAS_CLOUDSCRAPER:
+            try:
+                product_id, price = await asyncio.to_thread(_fetch_products_cloudscraper_sync, url, proxy)
+                if product_id and price is not None:
+                    logger.info(f"Products via cloudscraper-first (captcha avoidance) for {url}")
+            except Exception:
+                product_id, price = None, None
+
+        # Fetch products via session only when cloudscraper didn't succeed
         products_fetch_retries = 5  # Increased retries for connection stability
         last_error = None
-        for attempt in range(products_fetch_retries):
-            try:
-                request = await session.get(f"{url}/products.json", headers=headers, follow_redirects=True, timeout=25)
-                # Check if request failed
-                if not request:
-                    last_error = "No response object"
-                    if attempt < products_fetch_retries - 1:
-                        await asyncio.sleep(0.8 + attempt * 0.5)  # Longer backoff
-                        continue
+        if not product_id:
+            for attempt in range(products_fetch_retries):
+                try:
+                    request = await session.get(f"{url}/products.json", headers=headers, follow_redirects=True, timeout=25)
+                    # Check if request failed
+                    if not request:
+                        last_error = "No response object"
+                        if attempt < products_fetch_retries - 1:
+                            await asyncio.sleep(0.8 + attempt * 0.5)  # Longer backoff
+                            continue
+                        output.update({
+                            "Response": "SITE_CONNECTION_ERROR",
+                            "Status": False,
+                        })
+                        _log_output_to_terminal(output)
+                        return output
+
+                    sc = getattr(request, "status_code", 0)
+                    if sc == 0:
+                        # Bubble up the underlying client error text if present (DNS/proxy/TLS/etc.)
+                        last_error = (getattr(request, "text", "") or "").strip() or "Status code 0 (connection failed)"
+                        if attempt < products_fetch_retries - 1:
+                            await asyncio.sleep(0.8 + attempt * 0.5)  # Exponential backoff
+                            continue
+                        output.update({
+                            "Response": f"SITE_CONNECTION_ERROR: {last_error[:80]}",
+                            "Status": False,
+                        })
+                        _log_output_to_terminal(output)
+                        return output
+
+                    if sc == 200:
+                        break
+                    if sc == 429 or (500 <= sc <= 599):
+                        if attempt < products_fetch_retries - 1:
+                            backoff = 2.0 + attempt * 1.0 if sc == 429 else 0.8 + attempt * 0.6
+                            await asyncio.sleep(backoff)
+                            continue
                     output.update({
-                        "Response": "SITE_CONNECTION_ERROR",
+                        "Response": f"SITE_HTTP_{sc}",
                         "Status": False,
                     })
                     _log_output_to_terminal(output)
                     return output
-                
-                sc = getattr(request, "status_code", 0)
-                if sc == 0:
-                    # Bubble up the underlying client error text if present (DNS/proxy/TLS/etc.)
-                    last_error = (getattr(request, "text", "") or "").strip() or "Status code 0 (connection failed)"
+                except Exception as e:
+                    last_error = str(e)
                     if attempt < products_fetch_retries - 1:
-                        await asyncio.sleep(0.8 + attempt * 0.5)  # Exponential backoff
+                        # Exponential backoff for connection errors
+                        await asyncio.sleep(0.8 + attempt * 0.5)
                         continue
                     output.update({
-                        "Response": f"SITE_CONNECTION_ERROR: {last_error[:80]}",
+                        "Response": f"SITE_CONNECTION_ERROR: {last_error[:50]}",
                         "Status": False,
                     })
                     _log_output_to_terminal(output)
                     return output
-                
-                if sc == 200:
-                    break
-                if sc == 429 or (500 <= sc <= 599):
-                    if attempt < products_fetch_retries - 1:
-                        backoff = 2.0 + attempt * 1.0 if sc == 429 else 0.8 + attempt * 0.6
-                        await asyncio.sleep(backoff)
-                        continue
+
+            # Ensure we have a valid request after retries
+            if not request or not hasattr(request, 'text'):
                 output.update({
-                    "Response": f"SITE_HTTP_{sc}",
+                    "Response": f"SITE_CONNECTION_ERROR: {(last_error or 'unknown')[:80]}",
                     "Status": False,
                 })
                 _log_output_to_terminal(output)
                 return output
-            except Exception as e:
-                last_error = str(e)
-                if attempt < products_fetch_retries - 1:
-                    # Exponential backoff for connection errors
-                    await asyncio.sleep(0.8 + attempt * 0.5)
-                    continue
-                output.update({
-                    "Response": f"SITE_CONNECTION_ERROR: {last_error[:50]}",
-                    "Status": False,
-                })
-                _log_output_to_terminal(output)
-                return output
-        
-        # Ensure we have a valid request after retries
-        if not request or not hasattr(request, 'text'):
-            output.update({
-                "Response": f"SITE_CONNECTION_ERROR: {(last_error or 'unknown')[:80]}",
-                "Status": False,
-            })
-            _log_output_to_terminal(output)
-            return output
-        
-        # Parse products with detailed error handling; cloudscraper fallback on captcha
-        product_id, price = None, None
-        try:
-            # Ensure request has text attribute
-            if not hasattr(request, 'text') or not request.text:
+
+            # Parse products: bulletproof captcha avoidance - use cloudscraper when response is HTML/captcha
+            product_id, price = None, None
+            req_text = (request.text or "").strip() if hasattr(request, 'text') else ""
+            if not req_text:
                 output.update({"Response": "SITE_EMPTY_RESPONSE", "Status": False})
                 _log_output_to_terminal(output)
                 return output
-            product_id, price = get_product_id(request)
-        except ValueError as e:
-            error_msg = str(e)
-            if error_msg == "SITE_CAPTCHA_BLOCK" and HAS_CLOUDSCRAPER:
+
+            # If response is HTML (captcha/challenge), try cloudscraper first without calling get_product_id
+            if req_text.startswith("<") or req_text.startswith("<!") or "captcha" in req_text.lower() or "challenge" in req_text.lower():
+                if HAS_CLOUDSCRAPER:
+                    try:
+                        product_id, price = await asyncio.to_thread(_fetch_products_cloudscraper_sync, url, proxy)
+                        logger.info(f"Products via cloudscraper bypass (HTML/captcha response) for {url}")
+                    except Exception:
+                        pass
+                if not product_id:
+                    output.update({"Response": "SITE_CAPTCHA_BLOCK", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+            else:
                 try:
-                    product_id, price = await asyncio.to_thread(_fetch_products_cloudscraper_sync, url)
-                    logger.info(f"Products fetch via cloudscraper bypass for {url}")
-                except Exception:
-                    pass
+                    product_id, price = get_product_id(request)
+                except ValueError as e:
+                    error_msg = str(e)
+                    if error_msg == "SITE_CAPTCHA_BLOCK" and HAS_CLOUDSCRAPER:
+                        try:
+                            product_id, price = await asyncio.to_thread(_fetch_products_cloudscraper_sync, url, proxy)
+                            logger.info(f"Products fetch via cloudscraper bypass for {url}")
+                        except Exception:
+                            pass
+                    if not product_id:
+                        output.update({"Response": error_msg, "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+
             if not product_id:
-                output.update({"Response": error_msg, "Status": False})
+                output.update({"Response": "NO_AVAILABLE_PRODUCTS", "Status": False})
                 _log_output_to_terminal(output)
                 return output
-        
-        if not product_id:
-            output.update({"Response": "NO_AVAILABLE_PRODUCTS", "Status": False})
-            _log_output_to_terminal(output)
-            return output
 
         try:
             request = await session.get(url, follow_redirects=True, timeout=20)
@@ -493,6 +541,18 @@ async def autoshopify(url, card, session, proxy=None):
             return output
         
         request_text_for_capture = (request.text or "") if request and hasattr(request, 'text') else ""
+        # If store page is HTML with captcha and no token, try cloudscraper (captcha bypass)
+        if (not request_text_for_capture.strip().startswith("{") and
+            any(x in (request_text_for_capture or "").lower() for x in ["captcha", "hcaptcha", "recaptcha", "challenge", "verify"])):
+            if HAS_CLOUDSCRAPER:
+                try:
+                    cs_sc, cs_store = await asyncio.to_thread(_fetch_store_page_cloudscraper_sync, url, proxy)
+                    if cs_sc == 200 and cs_store:
+                        request_text_for_capture = cs_store
+                        logger.info(f"Store page via cloudscraper bypass for {url}")
+                except Exception:
+                    pass
+
         site_key = (
             _capture_multi(
                 request_text_for_capture,
@@ -512,6 +572,35 @@ async def autoshopify(url, card, session, proxy=None):
             m = re.search(r'storefrontAccessToken["\']?\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture, re.I)
             if m:
                 site_key = m.group(1)
+
+        # Bulletproof: if store page was HTML but no token found, try cloudscraper (e.g. challenge page)
+        if (not site_key or not str(site_key).strip()) and request_text_for_capture.strip().startswith("<") and HAS_CLOUDSCRAPER:
+            try:
+                cs_sc, cs_store = await asyncio.to_thread(_fetch_store_page_cloudscraper_sync, url, proxy)
+                if cs_sc == 200 and cs_store:
+                    request_text_for_capture = cs_store
+                    logger.info(f"Store page via cloudscraper (no token in HTML) for {url}")
+                    site_key = (
+                        _capture_multi(
+                            request_text_for_capture,
+                            ('"accessToken":"', '"'),
+                            ("'accessToken':'", "'"),
+                            ('accessToken":"', '"'),
+                            ('storefrontAccessToken":"', '"'),
+                            ('StorefrontApiAccessToken":"', '"'),
+                        )
+                        or capture(request_text_for_capture, '"accessToken":"', '"')
+                    )
+                    if not site_key:
+                        m = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture)
+                        if m:
+                            site_key = m.group(1)
+                    if not site_key:
+                        m = re.search(r'storefrontAccessToken["\']?\s*:\s*["\']([a-zA-Z0-9]+)["\']', request_text_for_capture, re.I)
+                        if m:
+                            site_key = m.group(1)
+            except Exception:
+                pass
 
         # print(f"{product_id}\n{price}\n{site_key}")
         checkout_url = None
