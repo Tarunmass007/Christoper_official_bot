@@ -109,21 +109,26 @@ async def handle_mstarr_command(client: Client, message):
             user_locks.pop(user_id, None)
             return await message.reply("❌ No valid cards (cc|mm|yy|cvv).", reply_to_message_id=message.id)
         plan_info = users.get(user_id, {}).get("plan", {})
-        mlimit = plan_info.get("mlimit")
-        if mlimit is None or str(mlimit).lower() in ("null", "none", ""):
-            mlimit = 10_000
-        else:
+        plan_name = (plan_info.get("plan") or "Free").strip()
+        mlimit_raw = plan_info.get("mlimit")
+        # VIP / unlimited: no limit check — never prompt "Max X cards per run"
+        is_unlimited = (
+            str(plan_name).upper() == "VIP"
+            or mlimit_raw is None
+            or str(mlimit_raw).strip().lower() in ("null", "none", "")
+        )
+        if not is_unlimited:
             try:
-                mlimit = int(mlimit)
+                mlimit = int(mlimit_raw)
             except (TypeError, ValueError):
-                mlimit = 10_000
-        if len(all_cards) > mlimit:
-            user_locks.pop(user_id, None)
-            return await message.reply(
-                f"❌ Max <code>{mlimit}</code> cards per run (plan limit).",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML,
-            )
+                mlimit = 50
+            if len(all_cards) > mlimit:
+                user_locks.pop(user_id, None)
+                return await message.reply(
+                    f"❌ Max <code>{mlimit}</code> cards per run (plan limit).",
+                    reply_to_message_id=message.id,
+                    parse_mode=ParseMode.HTML,
+                )
         proxy = get_rotating_proxy(int(user_id))
         total = len(all_cards)
         sites_list = [
