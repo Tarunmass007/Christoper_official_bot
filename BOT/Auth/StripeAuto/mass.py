@@ -5,6 +5,7 @@ Mass card check with asyncio concurrency. Threads = sites * 15, capped by card c
 Uses random saved site per card. Approved/CCN live sent as separate messages (same as /msh and /mau).
 """
 
+import os
 import re
 import random
 import asyncio
@@ -73,14 +74,33 @@ async def handle_mstarr_command(client: Client, message):
                 parse_mode=ParseMode.HTML,
             )
         target_text = None
-        if message.reply_to_message and message.reply_to_message.text:
-            target_text = message.reply_to_message.text
-        elif len((message.text or "").split(maxsplit=1)) > 1:
+        if message.reply_to_message:
+            if message.reply_to_message.text:
+                target_text = message.reply_to_message.text
+            elif message.reply_to_message.document:
+                doc = message.reply_to_message.document
+                fname = (doc.file_name or "").lower()
+                if fname.endswith(".txt") or (doc.mime_type and "text" in (doc.mime_type or "")):
+                    path = None
+                    try:
+                        path = await client.download_media(message.reply_to_message)
+                        if path and os.path.isfile(path):
+                            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                                target_text = f.read()
+                    except Exception:
+                        pass
+                    finally:
+                        if path and os.path.isfile(path):
+                            try:
+                                os.remove(path)
+                            except Exception:
+                                pass
+        if not target_text and len((message.text or "").split(maxsplit=1)) > 1:
             target_text = message.text.split(maxsplit=1)[1]
         if not target_text:
             user_locks.pop(user_id, None)
             return await message.reply(
-                "<pre>No cards ❌</pre>\nReply to a message with cards or paste after <code>/mstarr</code>",
+                "<pre>No cards ❌</pre>\nReply to a <b>message</b> or <b>.txt file</b> with cards, or paste after <code>/mstarr</code>",
                 reply_to_message_id=message.id,
                 parse_mode=ParseMode.HTML,
             )
@@ -88,7 +108,15 @@ async def handle_mstarr_command(client: Client, message):
         if not all_cards:
             user_locks.pop(user_id, None)
             return await message.reply("❌ No valid cards (cc|mm|yy|cvv).", reply_to_message_id=message.id)
-        mlimit = int(users.get(user_id, {}).get("plan", {}).get("mlimit", 50) or 50)
+        plan_info = users.get(user_id, {}).get("plan", {})
+        mlimit = plan_info.get("mlimit")
+        if mlimit is None or str(mlimit).lower() in ("null", "none", ""):
+            mlimit = 10_000
+        else:
+            try:
+                mlimit = int(mlimit)
+            except (TypeError, ValueError):
+                mlimit = 10_000
         if len(all_cards) > mlimit:
             user_locks.pop(user_id, None)
             return await message.reply(
