@@ -854,6 +854,31 @@ async def autoshopify(url, card, session, proxy=None):
                     output.update({"Response": "CART_NO_CHECKOUT_URL", "Status": False})
                     _log_output_to_terminal(output)
                     return output
+                # Bulletproof: if checkout URL is on different host, session cookies won't carry cart; use same-origin
+                try:
+                    store_netloc = (urlparse(url).netloc or "").lower().strip()
+                    checkout_netloc = (urlparse(checkout_url).netloc or "").lower().strip()
+                    if store_netloc and checkout_netloc and store_netloc != checkout_netloc:
+                        add_headers = {
+                            'User-Agent': getua,
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'Origin': url,
+                            'Referer': url,
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        }
+                        add_resp = await session.post(
+                            f'{url}/cart/add',
+                            headers=add_headers,
+                            data={'id': product_id, 'quantity': 1},
+                            timeout=15,
+                            follow_redirects=True,
+                        )
+                        if add_resp and getattr(add_resp, 'status_code', 0) in (200, 302):
+                            checkout_url = url.rstrip('/') + '/checkout'
+                            await asyncio.sleep(0.6)
+                            logger.info(f"Using same-origin checkout for {url} (external checkout URL)")
+                except Exception:
+                    pass
             except json.JSONDecodeError:
                 output.update({"Response": "CART_INVALID_JSON", "Status": False})
                 _log_output_to_terminal(output)
@@ -885,13 +910,39 @@ async def autoshopify(url, card, session, proxy=None):
         request = None
         checkout_sc = 0
         checkout_text = ""
+        store_netloc_check = (urlparse(url).netloc or "").lower().strip()
         for _checkout_attempt in range(6):
-            req = await session.get(checkout_url, headers=headers, params=params, follow_redirects=True, timeout=18)
+            # First try without following redirects to detect cross-host redirect (session cookies wouldn't be sent)
+            req = await session.get(checkout_url, headers=headers, params=params, follow_redirects=False, timeout=18)
             checkout_sc = getattr(req, "status_code", 0)
             checkout_text = req.text if req.text else ""
+            if checkout_sc in (301, 302, 303, 307, 308):
+                location = (getattr(req, "headers", None) or {}).get("location") or (getattr(req, "headers", None) or {}).get("Location") or ""
+                if location and store_netloc_check:
+                    try:
+                        loc_parsed = urlparse(location if location.startswith("http") else f"https://{location}")
+                        loc_netloc = (loc_parsed.netloc or "").lower().strip()
+                        if loc_netloc and loc_netloc != store_netloc_check:
+                            add_h = {'User-Agent': getua, 'Content-Type': 'application/x-www-form-urlencoded', 'Origin': url, 'Referer': url, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}
+                            add_r = await session.post(f'{url}/cart/add', headers=add_h, data={'id': product_id, 'quantity': 1}, timeout=15, follow_redirects=True)
+                            if add_r and getattr(add_r, 'status_code', 0) in (200, 302):
+                                await asyncio.sleep(0.6)
+                                checkout_url = url.rstrip('/') + '/checkout'
+                                req = await session.get(checkout_url, headers=headers, params=params, follow_redirects=True, timeout=18)
+                                checkout_sc = getattr(req, "status_code", 0)
+                                checkout_text = req.text if req.text else ""
+                    except Exception:
+                        pass
             if checkout_sc == 200:
                 request = req
                 break
+            if checkout_sc in (301, 302, 303, 307, 308) and _checkout_attempt == 0:
+                req = await session.get(checkout_url, headers=headers, params=params, follow_redirects=True, timeout=18)
+                checkout_sc = getattr(req, "status_code", 0)
+                checkout_text = req.text if req.text else ""
+                if checkout_sc == 200:
+                    request = req
+                    break
             if checkout_sc in (429, 502, 503, 504) and _checkout_attempt < 5:
                 backoff = 2.0 + _checkout_attempt * 1.0 if checkout_sc == 429 else 1.0 + _checkout_attempt * 0.7
                 await asyncio.sleep(backoff)
@@ -1051,8 +1102,74 @@ async def autoshopify(url, card, session, proxy=None):
             web_build = "a5ffb15727136fbf537411f8d32d7c41fb371075"
 
         if not x_checkout_one_session_token or not token or not queue_token or not stable_id:
+            # Bulletproof: try same-origin checkout (cart/add + GET /checkout) so session cookies carry cart
+            same_origin_checkout = url.rstrip('/') + '/checkout'
+            try:
+                add_headers_cart = {
+                    'User-Agent': getua,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Origin': url,
+                    'Referer': url,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                }
+                add_resp = await session.post(
+                    f'{url}/cart/add',
+                    headers=add_headers_cart,
+                    data={'id': product_id, 'quantity': 1},
+                    timeout=15,
+                    follow_redirects=True,
+                )
+                if add_resp and getattr(add_resp, 'status_code', 0) in (200, 302):
+                    await asyncio.sleep(0.6)
+                    req2 = await session.get(
+                        same_origin_checkout,
+                        headers={
+                            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                            'accept-language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
+                            'sec-ch-ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
+                            'sec-ch-ua-mobile': f'{mobile}',
+                            'sec-ch-ua-platform': f'"{clienthint}"',
+                            'sec-fetch-dest': 'document',
+                            'sec-fetch-mode': 'navigate',
+                            'sec-fetch-site': 'same-origin',
+                            'sec-fetch-user': f'{mobile}',
+                            'upgrade-insecure-requests': '1',
+                            'user-agent': f'{getua}',
+                        },
+                        params={'auto_redirect': 'false'},
+                        follow_redirects=True,
+                        timeout=18,
+                    )
+                    if req2 and getattr(req2, 'status_code', 0) == 200 and getattr(req2, 'text', None):
+                        new_text = (req2.text or "").strip()
+                        if len(new_text) > 1000:
+                            checkout_text = new_text
+                            checkout_lower = checkout_text.lower()
+                            robust2 = _extract_checkout_tokens_robust(checkout_text)
+                            x_checkout_one_session_token = x_checkout_one_session_token or robust2.get("session_token")
+                            token = token or robust2.get("source_token")
+                            queue_token = queue_token or robust2.get("queue_token")
+                            stable_id = stable_id or robust2.get("stable_id")
+                            if x_checkout_one_session_token or token or queue_token or stable_id:
+                                try:
+                                    if not paymentMethodIdentifier:
+                                        paymentMethodIdentifier = _capture_multi(checkout_text, ('paymentMethodIdentifier&quot;:&quot;', '&quot'), ('paymentMethodIdentifier":"', '"')) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot")
+                                    if not currencyCode:
+                                        currencyCode = _capture_multi(checkout_text, ('currencyCode&quot;:&quot;', '&quot'), ('currencyCode":"', '"')) or capture(checkout_text, "currencyCode&quot;:&quot;", "&quot")
+                                    if not countryCode:
+                                        countryCode = capture(checkout_text, "countryCode&quot;:&quot;", "&quot") or capture(checkout_text, 'countryCode":"', '"') or currencyCode
+                                    if not web_build or not str(web_build).strip():
+                                        match = re.search(r'"sha"\s*:\s*"([a-fA-F0-9]{40})"', checkout_text)
+                                        if match:
+                                            web_build = match.group(1)
+                                except Exception:
+                                    pass
+                                logger.info(f"Checkout tokens via same-origin retry for {url}")
+            except Exception:
+                pass
+
             # Bulletproof: try checkout page via cloudscraper once (challenge/captcha page may lack tokens)
-            if (checkout_text.strip().startswith("<") and HAS_CLOUDSCRAPER):
+            if (not x_checkout_one_session_token or not token or not queue_token or not stable_id) and checkout_text.strip().startswith("<") and HAS_CLOUDSCRAPER:
                 try:
                     cs_sc, cs_text = await asyncio.to_thread(
                         _fetch_checkout_cloudscraper_sync, checkout_url, proxy
