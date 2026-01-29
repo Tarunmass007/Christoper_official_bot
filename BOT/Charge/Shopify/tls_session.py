@@ -1,8 +1,13 @@
 """
-TLS Async Session with Fingerprinting
-======================================
-Professional async HTTP client with TLS fingerprinting support.
-Uses curl_cffi for browser-like TLS fingerprints to bypass detection.
+TLS Async Session with Fingerprinting & Peaceful Requests
+==========================================================
+Professional async HTTP client: browser-like headers and request jitter
+to avoid captcha and HTTPS restriction flags. Used by all Shopify gates.
+
+IMPORTANT: This layer only affects how each HTTP request is sent (headers + delay).
+It does NOT change any caller logic: command names, sh/msh/tsh retries, thread
+counts, addurl/txturl flow, or site rotation remain exactly as in single.py,
+mass.py, tsh.py, addurl.py, txturl.py, slf.py.
 """
 
 import asyncio
@@ -11,19 +16,38 @@ from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 try:
+    from BOT.Charge.Shopify.async_request import (
+        get_browser_headers,
+        peaceful_delay,
+        get_random_user_agent,
+    )
+    PEACEFUL_LAYER_AVAILABLE = True
+except Exception:
+    try:
+        from .async_request import (
+            get_browser_headers,
+            peaceful_delay,
+            get_random_user_agent,
+        )
+        PEACEFUL_LAYER_AVAILABLE = True
+    except Exception:
+        PEACEFUL_LAYER_AVAILABLE = False
+        get_browser_headers = None
+        peaceful_delay = None
+        get_random_user_agent = None
+
+try:
     from curl_cffi import requests as curl_requests
     from curl_cffi.requests import AsyncSession as CurlAsyncSession
     CURL_CFFI_AVAILABLE = True
 except (ImportError, Exception) as e:
     CURL_CFFI_AVAILABLE = False
-    print(f"[TLSAsyncSession] curl_cffi not available: {e}")
 
 try:
     import aiohttp
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
-    print("[TLSAsyncSession] aiohttp not available")
     raise  # aiohttp is required
 
 # Default client identifiers for TLS fingerprinting
@@ -57,24 +81,26 @@ class TLSAsyncSession:
         proxy: Optional[str] = None,
         follow_redirects: bool = True,
         client_identifier: Optional[str] = None,
+        peaceful: bool = True,
     ):
         """
         Initialize TLS Async Session.
-        
+
         Args:
             timeout_seconds: Request timeout in seconds (default: 60)
             proxy: Proxy URL in format http://user:pass@host:port or http://host:port
             follow_redirects: Whether to follow HTTP redirects (default: True)
             client_identifier: TLS fingerprint identifier (chrome120, firefox120, etc.)
+            peaceful: If True, use browser-like headers and request jitter to avoid captcha/flags (default: True)
         """
         self.timeout = timeout_seconds
         self.proxy = proxy
         self.follow_redirects = follow_redirects
         self.client_id = client_identifier or DEFAULT_CLIENT_ID
-        
+        self.peaceful = peaceful and PEACEFUL_LAYER_AVAILABLE
+
         # Validate client identifier
         if self.client_id not in SUPPORTED_CLIENTS:
-            # Try to map common variations
             client_map = {
                 "chrome_120": "chrome120",
                 "chrome_124": "chrome124",
@@ -83,10 +109,9 @@ class TLSAsyncSession:
                 "safari_16_0": "safari16_0",
             }
             self.client_id = client_map.get(self.client_id, DEFAULT_CLIENT_ID)
-        
+
         self._session = None
-        # Prefer aiohttp if curl_cffi is not available or unreliable
-        self._use_curl_cffi = CURL_CFFI_AVAILABLE and AIOHTTP_AVAILABLE  # Only use curl_cffi if both are available (fallback safety)
+        self._use_curl_cffi = False
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -154,28 +179,30 @@ class TLSAsyncSession:
         """
         if not self._session:
             raise RuntimeError("Session not initialized. Use 'async with' context manager.")
-        
+
+        # Peaceful: small delay before request (does not change caller retry/thread logic)
+        if self.peaceful and peaceful_delay:
+            await peaceful_delay()
+
+        # Peaceful: merge browser-like default headers (caller headers override)
+        if self.peaceful and get_browser_headers:
+            default_h = get_browser_headers()
+            merged = {**default_h, **(headers or {})}
+            headers = merged
+
         # Convert follow_redirects to allow_redirects for aiohttp
         allow_redirects = kwargs.pop('follow_redirects', True)
-        # Handle timeout - aiohttp uses timeout parameter or ClientTimeout
         timeout = kwargs.pop('timeout', None)
-        if timeout:
-            # Convert timeout to aiohttp.ClientTimeout
-            if isinstance(timeout, (int, float)):
-                timeout = aiohttp.ClientTimeout(total=float(timeout))
-        
-        # Build proxy dict for aiohttp
-        proxy_url = None
-        if self._proxy:
-            proxy_url = self._proxy
-        
-        # Use per-request timeout if provided, otherwise use session timeout
+        if timeout and isinstance(timeout, (int, float)):
+            timeout = aiohttp.ClientTimeout(total=float(timeout))
+
+        proxy_url = self._proxy if self._proxy else None
         req_timeout = timeout
         if req_timeout and isinstance(req_timeout, (int, float)):
             req_timeout = aiohttp.ClientTimeout(
                 total=float(req_timeout),
-                connect=20.0,  # Longer connect timeout for stability
-                sock_read=float(req_timeout) * 0.8  # Read timeout
+                connect=20.0,
+                sock_read=float(req_timeout) * 0.8
             )
         elif not req_timeout:
             req_timeout = aiohttp.ClientTimeout(
@@ -183,11 +210,10 @@ class TLSAsyncSession:
                 connect=20.0,
                 sock_read=30.0
             )
-        
-        # Retry logic for connection errors
+
         max_retries = 3
         last_exception = None
-        
+
         for retry in range(max_retries):
             try:
                 async with self._session.get(
@@ -266,28 +292,27 @@ class TLSAsyncSession:
         """
         if not self._session:
             raise RuntimeError("Session not initialized. Use 'async with' context manager.")
-        
-        # Convert follow_redirects to allow_redirects for aiohttp
+
+        if self.peaceful and peaceful_delay:
+            await peaceful_delay()
+
+        if self.peaceful and get_browser_headers:
+            default_h = get_browser_headers()
+            merged = {**default_h, **(headers or {})}
+            headers = merged
+
         allow_redirects = kwargs.pop('follow_redirects', True)
-        # Handle timeout - aiohttp uses timeout parameter or ClientTimeout
         timeout = kwargs.pop('timeout', None)
-        if timeout:
-            # Convert timeout to aiohttp.ClientTimeout
-            if isinstance(timeout, (int, float)):
-                timeout = aiohttp.ClientTimeout(total=float(timeout))
-        
-        # Build proxy dict for aiohttp
-        proxy_url = None
-        if self._proxy:
-            proxy_url = self._proxy
-        
-        # Use per-request timeout if provided, otherwise use session timeout
+        if timeout and isinstance(timeout, (int, float)):
+            timeout = aiohttp.ClientTimeout(total=float(timeout))
+
+        proxy_url = self._proxy if self._proxy else None
         req_timeout = timeout
         if req_timeout and isinstance(req_timeout, (int, float)):
             req_timeout = aiohttp.ClientTimeout(
                 total=float(req_timeout),
-                connect=20.0,  # Longer connect timeout for stability
-                sock_read=float(req_timeout) * 0.8  # Read timeout
+                connect=20.0,
+                sock_read=float(req_timeout) * 0.8
             )
         elif not req_timeout:
             req_timeout = aiohttp.ClientTimeout(
@@ -295,11 +320,10 @@ class TLSAsyncSession:
                 connect=20.0,
                 sock_read=30.0
             )
-        
-        # Retry logic for connection errors
+
         max_retries = 3
         last_exception = None
-        
+
         for retry in range(max_retries):
             try:
                 async with self._session.post(
