@@ -1002,102 +1002,102 @@ async def autoshopify(url, card, session, proxy=None):
                 if not checkout_url:
                     # 2) Establish session and optionally get site_key from product page (many themes put token only there)
                     try:
-                    prod_resp = await session.get(f'{url.rstrip("/")}/products.json', headers={'User-Agent': getua, 'Accept': 'application/json'}, follow_redirects=True, timeout=15)
-                    prod_text = (getattr(prod_resp, 'text', None) or '') if prod_resp else ''
-                    if getattr(prod_resp, 'status_code', 0) == 200 and prod_text.strip().startswith('{'):
-                        handle = _first_product_handle_from_json_text(prod_text)
-                        if handle:
-                            await asyncio.sleep(0.2)
-                            page_resp = await session.get(f'{url.rstrip("/")}/products/{handle}', headers={'User-Agent': getua, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8'}, follow_redirects=True, timeout=15)
-                            page_text = (getattr(page_resp, 'text', None) or '') if page_resp else ''
-                            if page_text:
-                                for (a, b) in [('"accessToken":"', '"'), ("'accessToken':'", "'"), ('accessToken":"', '"'), ('storefrontAccessToken":"', '"')]:
-                                    try:
-                                        tok = capture(page_text, a, b)
-                                        if tok and str(tok).strip():
-                                            site_key = tok.strip()
-                                            logger.info(f"Site key from product page /products/{handle} for {url}")
-                                            break
-                                    except Exception:
-                                        pass
-                                if not site_key:
-                                    mm = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', page_text)
-                                    if mm:
-                                        site_key = mm.group(1)
-                    await asyncio.sleep(0.2)
-                except Exception as e:
-                    logger.debug(f"Product page token fetch: {e}")
-                # If still no site_key, add to cart via form so we can hit /checkout
-                if not site_key or not str(site_key).strip():
-                    add_headers = {
-                        'User-Agent': getua,
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        'Origin': url.rstrip('/'),
-                        'Referer': url.rstrip('/') + '/',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'sec-ch-ua': '"Chromium";v="144", "Not(A:Brand";v="8"',
-                        'sec-ch-ua-mobile': '?0',
-                        'sec-ch-ua-platform': f'"{clienthint}"',
-                        'sec-fetch-dest': 'document',
-                        'sec-fetch-mode': 'navigate',
-                        'sec-fetch-site': 'same-origin',
-                        'sec-fetch-user': '?1',
-                        'upgrade-insecure-requests': '1',
-                    }
-                    vid = product_id
-                    try:
-                        if isinstance(vid, str) and vid.isdigit():
-                            vid = int(vid)
-                    except (ValueError, TypeError):
-                        pass
-                    variant_id_str = str(vid) if vid is not None else ''
-                    for cart_attempt in range(3):
+                        prod_resp = await session.get(f'{url.rstrip("/")}/products.json', headers={'User-Agent': getua, 'Accept': 'application/json'}, follow_redirects=True, timeout=15)
+                        prod_text = (getattr(prod_resp, 'text', None) or '') if prod_resp else ''
+                        if getattr(prod_resp, 'status_code', 0) == 200 and prod_text.strip().startswith('{'):
+                            handle = _first_product_handle_from_json_text(prod_text)
+                            if handle:
+                                await asyncio.sleep(0.2)
+                                page_resp = await session.get(f'{url.rstrip("/")}/products/{handle}', headers={'User-Agent': getua, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8'}, follow_redirects=True, timeout=15)
+                                page_text = (getattr(page_resp, 'text', None) or '') if page_resp else ''
+                                if page_text:
+                                    for (a, b) in [('"accessToken":"', '"'), ("'accessToken':'", "'"), ('accessToken":"', '"'), ('storefrontAccessToken":"', '"')]:
+                                        try:
+                                            tok = capture(page_text, a, b)
+                                            if tok and str(tok).strip():
+                                                site_key = tok.strip()
+                                                logger.info(f"Site key from product page /products/{handle} for {url}")
+                                                break
+                                        except Exception:
+                                            pass
+                                    if not site_key:
+                                        mm = re.search(r'["\']accessToken["\']\s*:\s*["\']([a-zA-Z0-9]+)["\']', page_text)
+                                        if mm:
+                                            site_key = mm.group(1)
+                        await asyncio.sleep(0.2)
+                    except Exception as e:
+                        logger.debug(f"Product page token fetch: {e}")
+                    # If still no site_key, add to cart via form so we can hit /checkout
+                    if not site_key or not str(site_key).strip():
+                        add_headers = {
+                            'User-Agent': getua,
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'Origin': url.rstrip('/'),
+                            'Referer': url.rstrip('/') + '/',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'sec-ch-ua': '"Chromium";v="144", "Not(A:Brand";v="8"',
+                            'sec-ch-ua-mobile': '?0',
+                            'sec-ch-ua-platform': f'"{clienthint}"',
+                            'sec-fetch-dest': 'document',
+                            'sec-fetch-mode': 'navigate',
+                            'sec-fetch-site': 'same-origin',
+                            'sec-fetch-user': '?1',
+                            'upgrade-insecure-requests': '1',
+                        }
+                        vid = product_id
                         try:
-                            if cart_attempt == 0:
-                                await session.get(url.rstrip('/'), headers={'User-Agent': getua, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}, follow_redirects=True, timeout=12)
-                                await asyncio.sleep(0.3)
-                            add_resp = await session.post(
-                                f'{url.rstrip("/")}/cart/add',
-                                headers=add_headers,
-                                data={'id': variant_id_str, 'quantity': '1', 'form_type': 'product'},
-                                timeout=18,
-                                follow_redirects=True,
-                            )
-                            sc = getattr(add_resp, 'status_code', 0)
-                            if sc in (200, 302, 303):
-                                checkout_url = url.rstrip('/') + '/checkout'
-                                await asyncio.sleep(0.6)
-                                logger.info(f"Cart/add succeeded for {url} (attempt {cart_attempt + 1})")
-                                break
-                            if sc >= 400 and variant_id_str:
-                                add_js_resp = await session.post(
-                                    f'{url.rstrip("/")}/cart/add.js',
-                                    headers={'User-Agent': getua, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Origin': url.rstrip('/'), 'Referer': url.rstrip('/') + '/'},
-                                    json={'items': [{'id': vid if isinstance(vid, int) else int(vid) if str(vid).isdigit() else vid, 'quantity': 1}]},
+                            if isinstance(vid, str) and vid.isdigit():
+                                vid = int(vid)
+                        except (ValueError, TypeError):
+                            pass
+                        variant_id_str = str(vid) if vid is not None else ''
+                        for cart_attempt in range(3):
+                            try:
+                                if cart_attempt == 0:
+                                    await session.get(url.rstrip('/'), headers={'User-Agent': getua, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}, follow_redirects=True, timeout=12)
+                                    await asyncio.sleep(0.3)
+                                add_resp = await session.post(
+                                    f'{url.rstrip("/")}/cart/add',
+                                    headers=add_headers,
+                                    data={'id': variant_id_str, 'quantity': '1', 'form_type': 'product'},
                                     timeout=18,
+                                    follow_redirects=True,
                                 )
-                                if getattr(add_js_resp, 'status_code', 0) == 200:
-                                    try:
-                                        js = add_js_resp.json() if hasattr(add_js_resp, 'json') else {}
-                                        if isinstance(js, dict) and (js.get('id') or js.get('items') or 'id' in str(js)):
-                                            checkout_url = url.rstrip('/') + '/checkout'
-                                            await asyncio.sleep(0.6)
-                                            logger.info(f"Cart/add.js succeeded for {url}")
-                                            break
-                                    except Exception:
-                                        pass
-                        except Exception as e:
-                            logger.debug(f"Cart/add attempt {cart_attempt + 1} failed: {e}")
-                        if cart_attempt < 2:
-                            await asyncio.sleep(0.5 + cart_attempt * 0.3)
-                    if not checkout_url:
-                        output.update({
-                            "Response": "SITE_ACCESS_TOKEN_MISSING",
-                            "Status": False,
-                        })
-                        _log_output_to_terminal(output)
-                        return output
+                                sc = getattr(add_resp, 'status_code', 0)
+                                if sc in (200, 302, 303):
+                                    checkout_url = url.rstrip('/') + '/checkout'
+                                    await asyncio.sleep(0.6)
+                                    logger.info(f"Cart/add succeeded for {url} (attempt {cart_attempt + 1})")
+                                    break
+                                if sc >= 400 and variant_id_str:
+                                    add_js_resp = await session.post(
+                                        f'{url.rstrip("/")}/cart/add.js',
+                                        headers={'User-Agent': getua, 'Content-Type': 'application/json', 'Accept': 'application/json', 'Origin': url.rstrip('/'), 'Referer': url.rstrip('/') + '/'},
+                                        json={'items': [{'id': vid if isinstance(vid, int) else int(vid) if str(vid).isdigit() else vid, 'quantity': 1}]},
+                                        timeout=18,
+                                    )
+                                    if getattr(add_js_resp, 'status_code', 0) == 200:
+                                        try:
+                                            js = add_js_resp.json() if hasattr(add_js_resp, 'json') else {}
+                                            if isinstance(js, dict) and (js.get('id') or js.get('items') or 'id' in str(js)):
+                                                checkout_url = url.rstrip('/') + '/checkout'
+                                                await asyncio.sleep(0.6)
+                                                logger.info(f"Cart/add.js succeeded for {url}")
+                                                break
+                                        except Exception:
+                                            pass
+                            except Exception as e:
+                                logger.debug(f"Cart/add attempt {cart_attempt + 1} failed: {e}")
+                            if cart_attempt < 2:
+                                await asyncio.sleep(0.5 + cart_attempt * 0.3)
+                        if not checkout_url:
+                            output.update({
+                                "Response": "SITE_ACCESS_TOKEN_MISSING",
+                                "Status": False,
+                            })
+                            _log_output_to_terminal(output)
+                            return output
 
             if site_key and str(site_key).strip():
                 headers = {
