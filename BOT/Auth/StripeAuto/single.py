@@ -38,7 +38,6 @@ def extract_card(text: str):
 def format_response(fullcc: str, result: dict, user_info: dict, time_taken: float) -> str:
     resp = result.get("response", "UNKNOWN")
     msg = result.get("message", "Unknown")[:80]
-    site = result.get("site", "")
     status = determine_stripe_auto_status(result)
     if status == "APPROVED":
         header, status_text = "APPROVED", "Stripe Auth 0.0$ ✅"
@@ -48,7 +47,6 @@ def format_response(fullcc: str, result: dict, user_info: dict, time_taken: floa
         header, status_text = "DECLINED", "Declined ❌"
     else:
         header, status_text = "ERROR", "Error ⚠️"
-    site_display = site.replace("https://", "").replace("http://", "")[:28] if site else "Stripe Auto"
     bin_data = get_bin_details(fullcc.split("|")[0][:6]) if get_bin_details else None
     if bin_data:
         vendor = bin_data.get("vendor", "N/A")
@@ -62,7 +60,7 @@ def format_response(fullcc: str, result: dict, user_info: dict, time_taken: floa
     return f"""<b>[#StripeAuto] | {header}</b> ✦
 ━━━━━━━━━━━━━━━
 <b>[•] Card:</b> <code>{fullcc}</code>
-<b>[•] Gateway:</b> <code>Stripe Auth [{site_display}]</code>
+<b>[•] Gateway:</b> <code>Stripe Auth</code>
 <b>[•] Status:</b> <code>{status_text}</code>
 <b>[•] Response:</b> <code>{msg}</code>
 ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
