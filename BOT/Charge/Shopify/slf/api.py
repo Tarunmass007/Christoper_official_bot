@@ -1286,6 +1286,11 @@ async def autoshopify(url, card, session, proxy=None):
                     return output
 
         await asyncio.sleep(0.35)
+        # Use same minimal headers as diagnostic (/testsh) so we get the same checkout HTML with tokens.
+        checkout_headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": getua,
+        }
         headers = {
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
             'accept-language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
@@ -1308,11 +1313,11 @@ async def autoshopify(url, card, session, proxy=None):
         checkout_sc = 0
         checkout_text = ""
         store_netloc_check = (urlparse(url).netloc or "").lower().strip()
-        # Always follow redirects when fetching checkout page so we get final HTML with tokens (matches diagnostic; handles /checkouts/ and shop.app redirects).
+        # Always follow redirects; use minimal headers (same as diagnostic) so we get final HTML with tokens.
         for _checkout_attempt in range(6):
             req = await session.get(
                 checkout_url,
-                headers=headers,
+                headers=checkout_headers,
                 params=params,
                 follow_redirects=True,
                 timeout=22,
@@ -1618,6 +1623,35 @@ async def autoshopify(url, card, session, proxy=None):
                         except Exception:
                             pass
                         logger.info(f"Checkout tokens via cloudscraper retry for {url}")
+                except Exception:
+                    pass
+
+            # Diagnostic-style fallback: GET checkout_url with minimal headers (same as /testsh) and re-extract tokens.
+            if (not x_checkout_one_session_token or not token or not queue_token or not stable_id) and checkout_url:
+                try:
+                    diag_headers = {
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "User-Agent": getua,
+                    }
+                    diag_req = await session.get(checkout_url, headers=diag_headers, follow_redirects=True, timeout=22)
+                    if getattr(diag_req, "status_code", 0) == 200 and getattr(diag_req, "text", None):
+                        diag_text = (diag_req.text or "").strip()
+                        if len(diag_text) > 5000 and "serialized-sessionToken" in diag_text:
+                            checkout_text = diag_text
+                            checkout_lower = checkout_text.lower()
+                            x_checkout_one_session_token = _extract_session_token(checkout_text) or x_checkout_one_session_token
+                            robust2 = _extract_checkout_tokens_robust(checkout_text)
+                            if not x_checkout_one_session_token and robust2.get("session_token"):
+                                x_checkout_one_session_token = robust2["session_token"]
+                            if not token and robust2.get("source_token"):
+                                token = robust2["source_token"]
+                            if not queue_token and robust2.get("queue_token"):
+                                queue_token = robust2["queue_token"]
+                            if not stable_id and robust2.get("stable_id"):
+                                stable_id = robust2["stable_id"]
+                            if not paymentMethodIdentifier:
+                                paymentMethodIdentifier = _capture_multi(checkout_text, ('paymentMethodIdentifier&quot;:&quot;', '&quot;'), ('paymentMethodIdentifier":"', '"')) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot;")
+                            logger.info(f"Checkout tokens via diagnostic-style fetch for {url}")
                 except Exception:
                     pass
 
