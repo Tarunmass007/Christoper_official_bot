@@ -917,6 +917,8 @@ async def autoshopify(url, card, session, proxy=None):
                     follow_redirects=False,
                 )
                 post_sc = getattr(ch_post, "status_code", 0)
+                get_sc_after_redirect = None
+                get_len_after_redirect = 0
                 if post_sc in (301, 302, 303, 307, 308):
                     loc = (getattr(ch_post, "headers", None) or {}).get("location") or (getattr(ch_post, "headers", None) or {}).get("Location") or ""
                     if loc:
@@ -933,14 +935,40 @@ async def autoshopify(url, card, session, proxy=None):
                         )
                         _sc = getattr(get_final, "status_code", 0)
                         _text = (getattr(get_final, "text", None) or "").strip()
-                        # Accept any substantial checkout HTML (tokens may be in different format or load later)
-                        if _sc == 200 and len(_text) > 1500 and _text.strip().startswith("<"):
+                        get_sc_after_redirect = _sc
+                        get_len_after_redirect = len(_text)
+                        # Accept any 200 that looks like checkout HTML (lenient: short loading pages or token in any format)
+                        looks_like_checkout = (
+                            _sc == 200
+                            and _text
+                            and (
+                                len(_text) > 1500
+                                or "sessionToken" in _text
+                                or "session_token" in _text
+                                or "serialized-sessionToken" in _text
+                                or ("checkout" in _text.lower() and ("<" in _text or "<!" in _text))
+                            )
+                            and (_text.strip().startswith("<") or "sessionToken" in _text or "checkout" in _text.lower())
+                        )
+                        if looks_like_checkout:
                             checkout_text = _text
                             request = get_final
                             checkout_sc = 200
                             logger.info(f"✅ Non-shipping checkout page for {url} (len=%s)", len(checkout_text))
+                        if not checkout_text and _sc == 200 and len(_text) > 200:
+                            # Accept any 200 with minimal HTML so downstream can try token extraction / cloudscraper
+                            checkout_text = _text
+                            request = get_final
+                            checkout_sc = 200
+                            logger.info(f"✅ Non-shipping checkout page (lenient) for {url} (len=%s)", len(checkout_text))
+                        if not checkout_text and _sc == 200 and _text and len(_text) > 50:
+                            # Last resort: use any 200 with any body so downstream can try (e.g. loading page -> cloudscraper retry)
+                            checkout_text = _text
+                            request = get_final
+                            checkout_sc = 200
+                            logger.info(f"✅ Non-shipping checkout page (any 200) for {url} (len=%s)", len(checkout_text))
                         if not checkout_text and _sc == 200 and _text:
-                            # Retry with follow_redirects in case first response was intermediate
+                            # Retry same URL in case first response was intermediate redirect
                             get_final2 = await session.get(
                                 checkout_url,
                                 headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": getua},
@@ -949,7 +977,8 @@ async def autoshopify(url, card, session, proxy=None):
                                 timeout=22,
                             )
                             _text2 = (getattr(get_final2, "text", None) or "").strip()
-                            if getattr(get_final2, "status_code", 0) == 200 and len(_text2) > 1500 and _text2.strip().startswith("<"):
+                            _sc2 = getattr(get_final2, "status_code", 0)
+                            if _sc2 == 200 and (len(_text2) > 200 or "sessionToken" in _text2 or "checkout" in _text2.lower()):
                                 checkout_text = _text2
                                 request = get_final2
                                 checkout_sc = 200
@@ -968,7 +997,7 @@ async def autoshopify(url, card, session, proxy=None):
                         )
                         fb_sc = getattr(get_fb, "status_code", 0)
                         fb_text = (getattr(get_fb, "text", None) or "").strip()
-                        if fb_sc == 200 and len(fb_text) > 1500 and fb_text.strip().startswith("<"):
+                        if fb_sc == 200 and (len(fb_text) > 200 or "sessionToken" in fb_text or "checkout" in fb_text.lower()):
                             checkout_text = fb_text
                             request = get_fb
                             checkout_sc = 200
@@ -978,11 +1007,13 @@ async def autoshopify(url, card, session, proxy=None):
                     except Exception as e:
                         logger.debug(f"Non-shipping GET /checkout fallback failed: {e}")
                 if not checkout_text:
-                    # Include diagnostic in error so user can debug
+                    # Include diagnostic: GET after redirect status and body length
                     diag = f"post_sc={post_sc}"
                     if post_sc in (301, 302, 303, 307, 308):
                         loc = (getattr(ch_post, "headers", None) or {}).get("location") or (getattr(ch_post, "headers", None) or {}).get("Location") or ""
                         diag += f" loc={bool(loc)}"
+                    if get_sc_after_redirect is not None:
+                        diag += f" get_sc={get_sc_after_redirect} get_len={get_len_after_redirect}"
                     output.update({"Response": f"CHECKOUT_NON_SHIPPING_NO_PAGE ({diag})", "Status": False})
                     _log_output_to_terminal(output)
                     return output
