@@ -652,6 +652,20 @@ async def auto_stripe_auth(
                     result["response"] = "APPROVED"
                     result["message"] = "Card authenticated"
                     return result
+                # Some gateways put success inside data (e.g. data.success, data.result, or data = "Payment method added")
+                if isinstance(data, dict):
+                    if data.get("success") is True or data.get("result") in ("success", "ok", True):
+                        result["success"] = True
+                        result["response"] = "APPROVED"
+                        result["message"] = "Card authenticated"
+                        return result
+                if isinstance(ajax_json.get("data"), str) and ajax_json.get("data", "").strip():
+                    # e.g. {"success": false, "data": "Payment method added"} — some plugins return this
+                    if "success" in str(ajax_json.get("data", "")).lower() or "added" in str(ajax_json.get("data", "")).lower():
+                        result["success"] = True
+                        result["response"] = "APPROVED"
+                        result["message"] = "Card authenticated"
+                        return result
                 error_obj = data.get("error")
                 if not isinstance(error_obj, dict):
                     error_obj = {}

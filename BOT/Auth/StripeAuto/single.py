@@ -182,17 +182,24 @@ async def handle_starr_command(client: Client, message: Message):
             return await auto_stripe_auth(site_url, fullcc, session=None, proxy=proxy, timeout_seconds=50)
 
         tasks = [asyncio.create_task(check_one_site(url)) for url in sites_list]
-        result = None
+        result = None  # best result so far (prefer APPROVED > CCN LIVE > DECLINED)
         try:
             for done in asyncio.as_completed(tasks):
                 res = await done
                 status = determine_stripe_auto_status(res)
-                if status in ("APPROVED", "CCN LIVE", "DECLINED"):
+                if status in ("APPROVED", "CCN LIVE"):
+                    # Good result: use it and stop (no fake decline from one slow site)
                     result = res
                     for t in tasks:
                         if not t.done():
                             t.cancel()
                     break
+                if status == "DECLINED":
+                    # Keep as fallback; keep waiting for other sites (might be APPROVED/CCN)
+                    result = res
+                # ERROR / other: keep previous result or use this as fallback
+                elif result is None:
+                    result = res
             if result is None:
                 result = res
         except asyncio.CancelledError:
