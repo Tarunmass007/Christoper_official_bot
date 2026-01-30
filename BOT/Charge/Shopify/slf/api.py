@@ -1308,8 +1308,15 @@ async def autoshopify(url, card, session, proxy=None):
         checkout_sc = 0
         checkout_text = ""
         store_netloc_check = (urlparse(url).netloc or "").lower().strip()
-        # When we already have full checkout URL (/checkouts/cn/...), follow redirects so we get final HTML with tokens (same as diagnostic).
-        follow_redirects_first = bool(checkout_url and "/checkouts/" in checkout_url)
+        # Follow redirects when: (1) full store checkout URL (/checkouts/cn/...), or (2) redirect went to another host (e.g. shop.app) so we must follow to get final HTML with tokens.
+        try:
+            check_netloc = (urlparse(checkout_url or "").netloc or "").lower().strip()
+            follow_redirects_first = bool(
+                checkout_url
+                and ("/checkouts/" in checkout_url or (check_netloc and check_netloc != store_netloc_check))
+            )
+        except Exception:
+            follow_redirects_first = bool(checkout_url and "/checkouts/" in checkout_url)
         for _checkout_attempt in range(6):
             req = await session.get(
                 checkout_url,
