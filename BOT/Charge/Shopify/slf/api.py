@@ -117,29 +117,64 @@ def capture(data, first, last):
       return None
 
 
-# ========== SINGLE CANONICAL SESSION TOKEN PARSING ==========
-# One inbuilt parsing only. Exact format: <meta name="serialized-sessionToken" content="&quot;TOKEN&quot;"/>
+# ========== SESSION TOKEN PARSING (multi-pattern for stickerdad.com and similar) ==========
+# Canonical format: <meta name="serialized-sessionToken" content="&quot;TOKEN&quot;"/>
 # Variable name used everywhere: x_checkout_one_session_token (headers + GraphQL sessionToken).
 SESSION_TOKEN_PREFIX = '<meta name="serialized-sessionToken" content="&quot;'
 SESSION_TOKEN_SUFFIX = '&quot;"/>'
 
+SESSION_TOKEN_PATTERNS = [
+    (r'<meta\s+name="serialized-sessionToken"\s+content="&quot;([^&]+)&quot;"\s*/>', 'meta_standard'),
+    (r'<meta\s+content="&quot;([^&]+)&quot;"\s+name="serialized-sessionToken"\s*/>', 'meta_reversed'),
+    (r'"serializedSessionToken"\s*:\s*"([^"]+)"', 'json_script'),
+    (r"name='serialized-sessionToken'\s+content='&quot;([^&]+)&quot;'", 'meta_single_quote'),
+    (r'name="serialized-sessionToken"\s+content="([^"]+)"', 'meta_plain'),
+    (r'<meta\s+name="serialized-session-token"\s+content="&quot;([^&]+)&quot;"', 'meta_hyphen'),
+]
+
 
 def _extract_session_token(checkout_text: str) -> Optional[str]:
     """
-    Extract x_checkout_one_session_token using the single canonical prefix/suffix.
-    Prefix: <meta name="serialized-sessionToken" content="&quot;
-    Suffix: &quot;"/>
-    Use this value everywhere: x-checkout-one-session-token header and sessionToken in GraphQL.
+    Extract x_checkout_one_session_token using multiple patterns for maximum compatibility.
+    Enhanced for stickerdad.com and similar sites; fallback to canonical prefix/suffix.
     """
     if not checkout_text or not isinstance(checkout_text, str):
         return None
+    # Try regex patterns first
+    for pattern, name in SESSION_TOKEN_PATTERNS:
+        try:
+            match = re.search(pattern, checkout_text, re.IGNORECASE | re.DOTALL)
+            if match:
+                token = (match.group(1) or "").strip()
+                if len(token) > 10:
+                    logger.debug(f"Session token found via {name}")
+                    return token
+        except Exception:
+            continue
+    # Canonical prefix/suffix
     v = capture(checkout_text, SESSION_TOKEN_PREFIX, SESSION_TOKEN_SUFFIX)
     if not v or not isinstance(v, str):
-        v = capture(checkout_text, SESSION_TOKEN_PREFIX, '&quot;" />')  # variant: space before />
+        v = capture(checkout_text, SESSION_TOKEN_PREFIX, '&quot;" />')
     if not v and SESSION_TOKEN_PREFIX.startswith("<meta "):
-        # Fallback: try without leading "<meta " in case attribute order differs
         alt_prefix = 'name="serialized-sessionToken" content="&quot;'
         v = capture(checkout_text, alt_prefix, SESSION_TOKEN_SUFFIX) or capture(checkout_text, alt_prefix, '&quot;" />')
+    # Capture fallbacks
+    if not v:
+        for prefix, suffix in [
+            ('<meta name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+            ('<meta name="serialized-sessionToken" content="&quot;', '&quot;" />'),
+            ('name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+            ('name="serialized-sessionToken" content="&quot;', '&quot;" />'),
+            ('<meta name="serialized-session-token" content="&quot;', '&quot;"/>'),
+            ('"serializedSessionToken":"', '"'),
+            ("'serializedSessionToken':'", "'"),
+        ]:
+            try:
+                v = capture(checkout_text, prefix, suffix)
+                if v and isinstance(v, str) and len(v.strip()) > 10:
+                    return v.strip()
+            except Exception:
+                continue
     if v and isinstance(v, str):
         v = v.strip()
         if len(v) > 10:
@@ -1379,6 +1414,13 @@ async def autoshopify(url, card, session, proxy=None):
                 await asyncio.sleep(backoff)
                 continue
             break
+        # Trace: log what we received so CHECKOUT_TOKENS_MISSING can be debugged
+        _has_session = "serialized-sessionToken" in (checkout_text or "")
+        _has_source = "serialized-sourceToken" in (checkout_text or "")
+        logger.info(
+            "[checkout] url=%.80s status=%s len=%s has_session_meta=%s has_source_meta=%s",
+            checkout_url or "", checkout_sc, len(checkout_text or ""), _has_session, _has_source,
+        )
         if request is None and checkout_sc != 200:
             output.update({
                 "Response": f"CHECKOUT_HTTP_{checkout_sc}",
@@ -1396,9 +1438,15 @@ async def autoshopify(url, card, session, proxy=None):
                     if len(follow_text) > 5000 and ("serialized-sessionToken" in follow_text or "serialized-sourceToken" in follow_text):
                         checkout_text = follow_text
                         checkout_lower = checkout_text.lower()
-                        logger.info(f"Checkout page refreshed with follow_redirects=True for {url}")
-            except Exception:
-                pass
+                        logger.info("Checkout page refreshed with follow_redirects=True for %s (len=%s)", url, len(checkout_text))
+                    else:
+                        logger.info(
+                            "[checkout] no-token retry: follow status=%s len=%s has_session=%s has_source=%s",
+                            getattr(req_follow, "status_code", 0), len(follow_text or ""),
+                            "serialized-sessionToken" in (follow_text or ""), "serialized-sourceToken" in (follow_text or ""),
+                        )
+            except Exception as e:
+                logger.debug("Checkout no-token retry failed: %s", e)
         checkout_lower = checkout_text.lower()
 
         if checkout_text.strip().startswith("<"):
@@ -1718,9 +1766,13 @@ async def autoshopify(url, card, session, proxy=None):
                                 if not loc.startswith("http"):
                                     loc = urljoin(url.rstrip("/") + "/", loc)
                                 get_final = await session.get(loc, headers=checkout_headers, follow_redirects=True, timeout=22)
-                                if getattr(get_final, "status_code", 0) == 200 and getattr(get_final, "text", None):
-                                    final_text = (get_final.text or "").strip()
-                                    if len(final_text) > 5000 and "serialized-sessionToken" in final_text:
+                                _final_sc = getattr(get_final, "status_code", 0)
+                                final_text = (getattr(get_final, "text", None) or "").strip()
+                                logger.info(
+                                    "[last-resort] GET %.80s status=%s len=%s has_session_meta=%s",
+                                    loc or "", _final_sc, len(final_text), "serialized-sessionToken" in final_text,
+                                )
+                                if _final_sc == 200 and final_text and len(final_text) > 5000 and "serialized-sessionToken" in final_text:
                                         checkout_text = final_text
                                         checkout_lower = checkout_text.lower()
                                         x_checkout_one_session_token = _extract_session_token(checkout_text) or x_checkout_one_session_token

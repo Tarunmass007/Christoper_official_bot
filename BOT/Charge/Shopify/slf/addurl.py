@@ -355,9 +355,20 @@ async def validate_and_parse_site(
         result["url"] = normalized_url
         
         products = await fetch_products_json(session, normalized_url, proxy)
-        
+        # Enhanced: one more cloudscraper attempt when session fetch returned no products (stickerdad.com etc.)
+        if not products and HAS_CLOUDSCRAPER:
+            try:
+                products = await asyncio.to_thread(
+                    _fetch_products_cloudscraper_sync,
+                    normalized_url,
+                    proxy,
+                )
+                if products:
+                    pass  # continue with parsing below
+            except Exception:
+                pass
         if not products:
-            result["error"] = "No products from products.json (not Shopify or unreachable)"
+            result["error"] = "No products (not Shopify or protected)"
             return result
         lowest = find_lowest_variant_from_products(products)
         if not lowest:
@@ -646,9 +657,10 @@ async def add_site_handler(client: Client, message: Message):
                     pr = str(pr) if pr else "N/A"
                 site_info["price"] = pr
                 site_info["formatted_price"] = f"${pr}"
-                # Save immediately when receipt found
+                site_info["test_result"] = test_res.get("Response", "OK")
                 save_site_for_user_unified(user_id, site_info["url"], site_info.get("gateway", "Normal"), pr)
                 return site_info
+            site_info["test_error"] = (test_res.get("Response") or "NO_RECEIPT").strip()
             return None
         
         # Run all tests in parallel
@@ -661,21 +673,17 @@ async def add_site_handler(client: Client, message: Message):
                 sites_with_receipt.append(result)
         if not sites_with_receipt:
             time_taken = round(time.time() - start_time, 2)
-            # Surface first gate error for debugging (e.g. CHECKOUT_TOKENS_MISSING, SITE_ACCESS_TOKEN_MISSING)
-            first_err = ""
-            if valid_sites:
-                try:
-                    _, err_res = await test_site_with_card(valid_sites[0]["url"], proxy_url, max_retries=1)
-                    first_err = (err_res.get("Response") or "").strip()
-                    if first_err:
-                        first_err = f"\n<b>Gate error:</b> <code>{first_err[:60]}</code>"
-                except Exception:
-                    pass
+            error_lines = []
+            for s in valid_sites[:5]:
+                err = (s.get("test_error") or "NO_RECEIPT").strip()[:50]
+                error_lines.append(f"• <code>{s['url'][:35]}</code>\n  └─ {err}")
+            error_text = "\n".join(error_lines) if error_lines else "All test checkouts failed to generate receipt."
             return await status_msg.edit_text(
                 f"""<pre>No Sites Verified ❌</pre>
 ━━━━━━━━━━━━━
 <b>Gate test did not return receipt/bill.</b>
-(Site has products; test checkout failed.){first_err}
+(Site has products; test checkout failed.)
+<b>Gate error:</b> <code>{(valid_sites[0].get('test_error') or 'NO_RECEIPT')[:60]}</code>
 
 <b>Tips:</b>
 • Set proxy: <code>/setpx</code>
