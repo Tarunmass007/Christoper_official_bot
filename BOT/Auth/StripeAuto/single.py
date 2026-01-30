@@ -38,7 +38,12 @@ def extract_card(text: str):
 
 def format_response(fullcc: str, result: dict, user_info: dict, time_taken: float) -> str:
     resp = result.get("response", "UNKNOWN")
-    msg = result.get("message", "Unknown")[:80]
+    msg = (result.get("message") or "Unknown")
+    if not isinstance(msg, str):
+        msg = str(msg)
+    msg = msg.strip()[:80]
+    if not msg or msg in ("0", "0.0") or msg.isdigit():
+        msg = "Card declined" if resp == "DECLINED" else (msg or "Unknown")
     status = determine_stripe_auto_status(result)
     if status == "APPROVED":
         header, status_text = "APPROVED", "Stripe Auth 0.0$ ✅"

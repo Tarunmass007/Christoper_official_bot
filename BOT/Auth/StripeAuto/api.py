@@ -632,6 +632,14 @@ async def auto_stripe_auth(
                 data = ajax_json.get("data", {})
                 if not isinstance(data, dict):
                     data = {}
+                # Top-level message/code (some gateways return {"success":false,"message":"..."} or {"data":0})
+                top_msg = ajax_json.get("message")
+                if isinstance(top_msg, str) and top_msg.strip():
+                    pass
+                elif top_msg is not None and not isinstance(top_msg, str):
+                    top_msg = str(top_msg)
+                else:
+                    top_msg = ""
                 # action_required / 3DS = CCN LIVE (same as starr-shop.eu gate) — check before success
                 data_str = str(data).lower()
                 if any(x in data_str for x in ["action_required", "action required", "challenge", "authentication_required", "authentication required", "requires_action"]):
@@ -647,10 +655,19 @@ async def auto_stripe_auth(
                 error_obj = data.get("error")
                 if not isinstance(error_obj, dict):
                     error_obj = {}
-                err_msg = error_obj.get("message", ajax_text)
+                err_msg = error_obj.get("message", top_msg or ajax_text)
                 if isinstance(err_msg, dict):
                     err_msg = str(err_msg)
-                result["message"] = (err_msg or ajax_text)[:200]
+                if err_msg is not None and not isinstance(err_msg, str):
+                    err_msg = str(err_msg)
+                raw_msg = (err_msg or ajax_text or "").strip()
+                if not raw_msg or raw_msg in ("0", "0.0") or raw_msg.isdigit():
+                    err_code = error_obj.get("code") if isinstance(error_obj, dict) else None
+                    if isinstance(err_code, str) and err_code.strip():
+                        raw_msg = err_code.strip()
+                    else:
+                        raw_msg = "Card declined"
+                result["message"] = (raw_msg or "Card declined")[:200]
                 err_upper = result["message"].upper()
                 # CCN LIVE: CVC/AVS/3DS/action required / insufficient
                 ccn_patterns = [
