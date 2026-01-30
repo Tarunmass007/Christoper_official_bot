@@ -75,6 +75,7 @@ async def run_bot():
         BotCommand("msh", "Mass Shopify charge"),
         BotCommand("tsh", "Test Shopify"),
         BotCommand("tslf", "Test SLF"),
+        BotCommand("testsh", "Shopify gate diagnostic (debug file)"),
         BotCommand("br", "Braintree checker"),
         BotCommand("st", "Stripe $20 charge"),
         BotCommand("register", "Register with the bot"),

@@ -3383,6 +3383,207 @@ def is_site_error_response(response: str) -> bool:
     return any(pattern in response_upper for pattern in site_error_patterns)
 
 
+async def run_shopify_checkout_diagnostic(
+    url: str, session, proxy: Optional[str] = None
+) -> dict:
+    """
+    Run Shopify gate flow up to checkout page and collect parsing/debug info.
+    Returns a dict with steps: low_product, products, cart_add, checkout_url,
+    checkout_page (status, length, snippet), token_presence, robust_tokens,
+    regex_session_tests, capture_session_tests, capture_source_tests, etc.
+    Used by /testsh to write a debug file.
+    """
+    parsed = urlparse(url)
+    domain = parsed.netloc if parsed and parsed.netloc else (url.split("//")[-1].split("/")[0] if "//" in url else url)
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    else:
+        url = f"https://{domain}"
+    out = {
+        "url": url,
+        "domain": domain,
+        "step1_low_product": {},
+        "step2_products": {},
+        "step3_cart_add": {},
+        "step4_checkout_url": None,
+        "step5_checkout_page": {},
+        "step6_token_presence": {},
+        "step7_robust_tokens": {},
+        "step8_regex_session_tests": [],
+        "step9_capture_session_tests": [],
+        "step10_capture_source_tests": [],
+        "checkout_text_length": 0,
+        "error": None,
+    }
+    headers = {
+        "User-Agent": get_random_user_agent(),
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    product_id, price = None, None
+    try:
+        low_product = await _fetch_low_product_api(domain, session, proxy)
+        out["step1_low_product"] = {
+            "success": bool(low_product),
+            "variantid": low_product.get("variantid") if low_product else None,
+            "price": low_product.get("price") if low_product else None,
+            "error": None if low_product else "No data",
+        }
+        if low_product and low_product.get("variantid") is not None:
+            product_id = low_product["variantid"]
+            price = low_product.get("price", 0.0)
+    except Exception as e:
+        out["step1_low_product"] = {"success": False, "error": str(e)}
+    if not product_id:
+        try:
+            req = await session.get(f"{url}/products.json", headers=headers, follow_redirects=True, timeout=25)
+            sc = getattr(req, "status_code", 0)
+            txt = (getattr(req, "text", None) or "").strip()
+            out["step2_products"] = {"status_code": sc, "response_length": len(txt), "is_json": txt.startswith("{")}
+            if sc == 200 and txt.startswith("{"):
+                try:
+                    product_id, price = get_product_id(req)
+                except ValueError as ve:
+                    out["step2_products"]["parse_error"] = str(ve)
+        except Exception as e:
+            out["step2_products"] = {"error": str(e)}
+    else:
+        out["step2_products"] = {"skipped": True, "reason": "product_id from low_product"}
+    if not product_id:
+        out["error"] = "No product_id (low_product and products.json failed)"
+        return out
+    checkout_url = None
+    try:
+        add_resp = await session.post(
+            f"{url.rstrip('/')}/cart/add.js",
+            headers={
+                "User-Agent": get_random_user_agent(),
+                "Content-Type": "application/json",
+                "Origin": url.rstrip("/"),
+                "Referer": url.rstrip("/") + "/",
+                "Accept": "*/*",
+            },
+            json={"items": [{"id": product_id, "quantity": 1}]},
+            timeout=18,
+        )
+        add_sc = getattr(add_resp, "status_code", 0)
+        out["step3_cart_add"] = {"status_code": add_sc, "success": add_sc == 200}
+        await asyncio.sleep(0.5)
+        ch_post = await session.post(
+            f"{url.rstrip('/')}/checkout",
+            headers={
+                "User-Agent": get_random_user_agent(),
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": url.rstrip("/"),
+                "Referer": url.rstrip("/") + "/",
+                "Accept": "*/*",
+            },
+            data="",
+            timeout=18,
+            follow_redirects=False,
+        )
+        post_sc = getattr(ch_post, "status_code", 0)
+        if post_sc in (301, 302, 303, 307, 308):
+            loc = (getattr(ch_post, "headers", None) or {}).get("location") or (getattr(ch_post, "headers", None) or {}).get("Location") or ""
+            if loc:
+                if not loc.startswith("http"):
+                    loc = urljoin(url.rstrip("/") + "/", loc)
+                checkout_url = loc
+        if not checkout_url:
+            checkout_url = url.rstrip("/") + "/checkout"
+        out["step4_checkout_url"] = checkout_url
+    except Exception as e:
+        out["step3_cart_add"] = {"error": str(e)}
+        out["step4_checkout_url"] = url.rstrip("/") + "/checkout"
+        checkout_url = out["step4_checkout_url"]
+    if not checkout_url:
+        out["error"] = "No checkout URL"
+        return out
+    try:
+        ch_get = await session.get(
+            checkout_url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "User-Agent": get_random_user_agent(),
+            },
+            follow_redirects=True,
+            timeout=22,
+        )
+        ch_sc = getattr(ch_get, "status_code", 0)
+        checkout_text = (getattr(ch_get, "text", None) or "").strip()
+        out["checkout_text_length"] = len(checkout_text)
+        out["step5_checkout_page"] = {
+            "status_code": ch_sc,
+            "length": len(checkout_text),
+            "snippet_first_500": checkout_text[:500] if checkout_text else "",
+            "snippet_meta_session": "",
+        }
+        if checkout_text:
+            if "serialized-sessionToken" in checkout_text:
+                idx = checkout_text.find("serialized-sessionToken")
+                out["step5_checkout_page"]["snippet_meta_session"] = checkout_text[max(0, idx - 20) : idx + 200]
+            elif "serialized-session-token" in checkout_text:
+                idx = checkout_text.find("serialized-session-token")
+                out["step5_checkout_page"]["snippet_meta_session"] = checkout_text[max(0, idx - 20) : idx + 200]
+        out["step6_token_presence"] = {
+            "serialized-sessionToken": "serialized-sessionToken" in checkout_text,
+            "serialized-session-token": "serialized-session-token" in checkout_text,
+            "serializedSessionToken": "serializedSessionToken" in checkout_text,
+            "serialized-sourceToken": "serialized-sourceToken" in checkout_text,
+            "serialized-source-token": "serialized-source-token" in checkout_text,
+            "serializedSourceToken": "serializedSourceToken" in checkout_text,
+            "queueToken": "queueToken" in checkout_text or '"queueToken"' in checkout_text,
+            "stableId": "stableId" in checkout_text or '"stableId"' in checkout_text,
+        }
+        robust = _extract_checkout_tokens_robust(checkout_text)
+        for k, v in robust.items():
+            out["step7_robust_tokens"][k] = (
+                {"len": len(v), "first_80": (v[:80] if v else ""), "value": (v[:200] + "..." if v and len(v) > 200 else v)}
+                if v
+                else None
+            )
+        session_regexes = [
+            (r'name\s*=\s*["\']serialized-sessionToken["\'][^>]*?content\s*=\s*["\']&quot;(.+?)&quot;\s*"\s*/\s*>', "new_meta_sessionToken"),
+            (r'name\s*=\s*["\']serialized-sessionToken["\'][^>]*?content\s*=\s*&quot;(.+?)&quot;\s*"\s*/\s*>', "new_meta_entity"),
+            (r'content\s*=\s*["\']&quot;(.+?)&quot;\s*"\s*/\s*>[^<]*name\s*=\s*["\']serialized-sessionToken["\']', "content_first"),
+        ]
+        for pat, name in session_regexes:
+            m = re.search(pat, checkout_text, re.I | re.DOTALL)
+            out["step8_regex_session_tests"].append({
+                "name": name,
+                "matched": bool(m),
+                "group1_len": len(m.group(1)) if m and m.group(1) else 0,
+                "group1_first80": (m.group(1)[:80] if m and m.group(1) else ""),
+            })
+        for prefix, suffix in [
+            ('name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+            ('name="serialized-sessionToken" content="&quot;', '&quot;" />'),
+            ("name='serialized-sessionToken' content='&quot;", '&quot;"/>'),
+        ]:
+            res = capture(checkout_text, prefix, suffix)
+            out["step9_capture_session_tests"].append({
+                "prefix": prefix[:50] + "..." if len(prefix) > 50 else prefix,
+                "suffix": suffix,
+                "result_len": len(res) if res else 0,
+                "result_first80": (res[:80] if res else None),
+            })
+        for prefix, suffix in [
+            ('name="serialized-sourceToken" content="&quot;', '&quot;"/>'),
+            ('serialized-source-token" content="&quot;', '&quot'),
+        ]:
+            res = capture(checkout_text, prefix, suffix)
+            out["step10_capture_source_tests"].append({
+                "prefix": prefix[:50] + "..." if len(prefix) > 50 else prefix,
+                "suffix": suffix,
+                "result_len": len(res) if res else 0,
+                "result_first80": (res[:80] if res else None),
+            })
+    except Exception as e:
+        out["step5_checkout_page"] = {"error": str(e)}
+        out["error"] = str(e)
+    return out
+
+
 async def main():
     async with TLSAsyncSession(timeout_seconds=90) as session:
         await autoshopify("https://maxandfix.com/", "5312378810154759|04|31|921", session)
