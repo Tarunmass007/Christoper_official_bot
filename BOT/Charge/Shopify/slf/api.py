@@ -117,7 +117,6 @@ def capture(data, first, last):
       return None
 
 
-<<<<<<< HEAD
 # ========== SESSION TOKEN PARSING (multi-pattern for stickerdad.com and similar) ==========
 # Canonical format: <meta name="serialized-sessionToken" content="&quot;TOKEN&quot;"/>
 # Variable name used everywhere: x_checkout_one_session_token (headers + GraphQL sessionToken).
@@ -133,47 +132,18 @@ SESSION_TOKEN_PATTERNS = [
     (r'<meta\s+name="serialized-session-token"\s+content="&quot;([^&]+)&quot;"', 'meta_hyphen'),
 ]
 
-=======
-# ========== ENHANCED SESSION TOKEN PARSING ==========
-# Multiple patterns for better compatibility
-SESSION_TOKEN_PATTERNS = [
-    # Pattern 1: Standard meta tag with &quot;
-    (r'<meta\s+name="serialized-sessionToken"\s+content="&quot;([^&]+)&quot;"\s*/>', 'meta_standard'),
-    # Pattern 2: Meta tag with reversed attributes
-    (r'<meta\s+content="&quot;([^&]+)&quot;"\s+name="serialized-sessionToken"\s*/>', 'meta_reversed'),
-    # Pattern 3: JSON embedded in script
-    (r'"serializedSessionToken"\s*:\s*"([^"]+)"', 'json_script'),
-    # Pattern 4: Alternative quote style
-    (r"name='serialized-sessionToken'\s+content='&quot;([^&]+)&quot;'", 'meta_single_quote'),
-    # Pattern 5: No entity encoding
-    (r'name="serialized-sessionToken"\s+content="([^"]+)"', 'meta_plain'),
-    # Pattern 6: Hyphenated version
-    (r'<meta\s+name="serialized-session-token"\s+content="&quot;([^&]+)&quot;"', 'meta_hyphen'),
-]
->>>>>>> 956d20fcca140dbf0cbec8a2c29bc10adc94b725
-
 def _extract_session_token(checkout_text: str) -> Optional[str]:
     """
     Extract x_checkout_one_session_token using multiple patterns for maximum compatibility.
-<<<<<<< HEAD
     Enhanced for stickerdad.com and similar sites; fallback to canonical prefix/suffix.
     """
     if not checkout_text or not isinstance(checkout_text, str):
         return None
     # Try regex patterns first
-=======
-    Enhanced for stickerdad.com and similar sites.
-    """
-    if not checkout_text or not isinstance(checkout_text, str):
-        return None
-    
-    # Try all regex patterns first
->>>>>>> 956d20fcca140dbf0cbec8a2c29bc10adc94b725
     for pattern, name in SESSION_TOKEN_PATTERNS:
         try:
             match = re.search(pattern, checkout_text, re.IGNORECASE | re.DOTALL)
             if match:
-<<<<<<< HEAD
                 token = (match.group(1) or "").strip()
                 if len(token) > 10:
                     logger.debug(f"Session token found via {name}")
@@ -208,36 +178,6 @@ def _extract_session_token(checkout_text: str) -> Optional[str]:
         v = v.strip()
         if len(v) > 10:
             return v
-=======
-                token = match.group(1).strip()
-                if len(token) > 10:
-                    logger.info(f"Session token found via {name}")
-                    return token
-        except Exception as e:
-            logger.debug(f"Pattern {name} failed: {e}")
-            continue
-    
-    # Fallback to string capture methods
-    capture_patterns = [
-        ('<meta name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
-        ('<meta name="serialized-sessionToken" content="&quot;', '&quot;" />'),
-        ('name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
-        ('name="serialized-sessionToken" content="&quot;', '&quot;" />'),
-        ('<meta name="serialized-session-token" content="&quot;', '&quot;"/>'),
-        ('"serializedSessionToken":"', '"'),
-        ("'serializedSessionToken':'", "'"),
-    ]
-    
-    for prefix, suffix in capture_patterns:
-        try:
-            v = capture(checkout_text, prefix, suffix)
-            if v and isinstance(v, str) and len(v.strip()) > 10:
-                logger.info(f"Session token found via capture: {prefix[:30]}...")
-                return v.strip()
-        except Exception:
-            continue
-    
->>>>>>> 956d20fcca140dbf0cbec8a2c29bc10adc94b725
     return None
 
 
@@ -1216,7 +1156,6 @@ async def autoshopify(url, card, session, proxy=None):
                 # (Rest of the code remains the same - GraphQL cart creation, etc.)
                 pass  # ... existing code continues
 
-<<<<<<< HEAD
                 params = {
                     'operation_name': 'cartCreate',
                 }
@@ -1887,15 +1826,6 @@ async def autoshopify(url, card, session, proxy=None):
 
         # Removed tokenization - using bulletproof session
         request = await session.post('https://checkout.pci.shopifyinc.com/sessions', headers=headers, json=json_data, timeout=18)
-=======
-        # Now fetch checkout page with enhanced token extraction
-        logger.info(f"🌐 Fetching checkout page: {checkout_url if 'checkout_url' in locals() else 'NOT SET'}")
->>>>>>> 956d20fcca140dbf0cbec8a2c29bc10adc94b725
-        
-        # ... rest of autoshopify implementation continues with enhanced _extract_session_token
-        
-        # PLACEHOLDER - Continue with rest of implementation
-        # For brevity, I'm showing the key fixes. The rest follows the same pattern.
         
     except Exception as e:
         logger.error(f"❌ Fatal error in autoshopify: {e}")
