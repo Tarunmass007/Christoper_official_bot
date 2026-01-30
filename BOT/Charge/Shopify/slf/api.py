@@ -933,13 +933,57 @@ async def autoshopify(url, card, session, proxy=None):
                         )
                         _sc = getattr(get_final, "status_code", 0)
                         _text = (getattr(get_final, "text", None) or "").strip()
-                        if _sc == 200 and len(_text) > 5000 and "serialized-sessionToken" in _text:
+                        # Accept any substantial checkout HTML (tokens may be in different format or load later)
+                        if _sc == 200 and len(_text) > 1500 and _text.strip().startswith("<"):
                             checkout_text = _text
                             request = get_final
                             checkout_sc = 200
                             logger.info(f"✅ Non-shipping checkout page for {url} (len=%s)", len(checkout_text))
+                        if not checkout_text and _sc == 200 and _text:
+                            # Retry with follow_redirects in case first response was intermediate
+                            get_final2 = await session.get(
+                                checkout_url,
+                                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": getua},
+                                params=get_params,
+                                follow_redirects=True,
+                                timeout=22,
+                            )
+                            _text2 = (getattr(get_final2, "text", None) or "").strip()
+                            if getattr(get_final2, "status_code", 0) == 200 and len(_text2) > 1500 and _text2.strip().startswith("<"):
+                                checkout_text = _text2
+                                request = get_final2
+                                checkout_sc = 200
+                                logger.info(f"✅ Non-shipping checkout page (retry) for {url} (len=%s)", len(checkout_text))
                 if not checkout_text:
-                    output.update({"Response": "CHECKOUT_NON_SHIPPING_NO_PAGE", "Status": False})
+                    # Fallback: POST may have returned 200 or GET failed; try GET store /checkout (cart already added)
+                    fallback_checkout_url = f"{url.rstrip('/')}/checkout"
+                    get_params_fb = {"skip_shop_pay": "true"}
+                    try:
+                        get_fb = await session.get(
+                            fallback_checkout_url,
+                            headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": getua},
+                            params=get_params_fb,
+                            follow_redirects=True,
+                            timeout=22,
+                        )
+                        fb_sc = getattr(get_fb, "status_code", 0)
+                        fb_text = (getattr(get_fb, "text", None) or "").strip()
+                        if fb_sc == 200 and len(fb_text) > 1500 and fb_text.strip().startswith("<"):
+                            checkout_text = fb_text
+                            request = get_fb
+                            checkout_sc = 200
+                            checkout_url = fallback_checkout_url
+                            get_params = get_params_fb
+                            logger.info(f"✅ Non-shipping checkout via GET /checkout fallback for {url} (len=%s)", len(checkout_text))
+                    except Exception as e:
+                        logger.debug(f"Non-shipping GET /checkout fallback failed: {e}")
+                if not checkout_text:
+                    # Include diagnostic in error so user can debug
+                    diag = f"post_sc={post_sc}"
+                    if post_sc in (301, 302, 303, 307, 308):
+                        loc = (getattr(ch_post, "headers", None) or {}).get("location") or (getattr(ch_post, "headers", None) or {}).get("Location") or ""
+                        diag += f" loc={bool(loc)}"
+                    output.update({"Response": f"CHECKOUT_NON_SHIPPING_NO_PAGE ({diag})", "Status": False})
                     _log_output_to_terminal(output)
                     return output
                 # Define for rest of function (trace, retries, token extraction)
