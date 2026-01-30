@@ -1251,29 +1251,56 @@ async def autoshopify(url, card, session, proxy=None):
                         output.update({"Response": "CART_NO_CHECKOUT_URL", "Status": False})
                         _log_output_to_terminal(output)
                         return output
-                    # Bulletproof: if checkout URL is on different host, session cookies won't carry cart; use same-origin
+                    # Mirror diagnostic flow when checkout URL is cross-host (e.g. shop.app) or when it's the
+                    # new checkout path (/checkouts/...) so we get the same final HTML with tokens. Do cart/add
+                    # then POST /checkout (no follow); use redirect Location as checkout_url for the subsequent GET.
                     try:
                         store_netloc = (urlparse(url).netloc or "").lower().strip()
                         checkout_netloc = (urlparse(checkout_url).netloc or "").lower().strip()
-                        if store_netloc and checkout_netloc and store_netloc != checkout_netloc:
+                        checkout_path = (urlparse(checkout_url).path or "").strip()
+                        cross_host = store_netloc and checkout_netloc and store_netloc != checkout_netloc
+                        new_checkout_path = "/checkouts/" in checkout_path
+                        if cross_host or new_checkout_path:
                             add_headers = {
                                 'User-Agent': getua,
                                 'Content-Type': 'application/x-www-form-urlencoded',
-                                'Origin': url,
-                                'Referer': url,
+                                'Origin': url.rstrip('/'),
+                                'Referer': url.rstrip('/') + '/',
                                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                             }
                             add_resp = await session.post(
-                                f'{url}/cart/add',
+                                f'{url.rstrip("/")}/cart/add',
                                 headers=add_headers,
                                 data={'id': product_id, 'quantity': 1},
                                 timeout=15,
                                 follow_redirects=True,
                             )
                             if add_resp and getattr(add_resp, 'status_code', 0) in (200, 302):
+                                await asyncio.sleep(0.5)
+                                ch_post = await session.post(
+                                    f'{url.rstrip("/")}/checkout',
+                                    headers={
+                                        'User-Agent': getua,
+                                        'Content-Type': 'application/x-www-form-urlencoded',
+                                        'Origin': url.rstrip('/'),
+                                        'Referer': url.rstrip('/') + '/',
+                                        'Accept': '*/*',
+                                    },
+                                    data='',
+                                    timeout=18,
+                                    follow_redirects=False,
+                                )
+                                post_sc = getattr(ch_post, 'status_code', 0)
+                                if post_sc in (301, 302, 303, 307, 308):
+                                    loc = (getattr(ch_post, 'headers', None) or {}).get('location') or (getattr(ch_post, 'headers', None) or {}).get('Location') or ''
+                                    if loc:
+                                        if not loc.startswith('http'):
+                                            loc = urljoin(url.rstrip('/') + '/', loc)
+                                        checkout_url = loc
+                                        logger.info(f"Checkout: using POST redirect URL for {url} -> {checkout_url[:80]}...")
+                            elif cross_host:
                                 checkout_url = url.rstrip('/') + '/checkout'
-                                await asyncio.sleep(0.6)
-                                logger.info(f"Using same-origin checkout for {url} (external checkout URL)")
+                                logger.info(f"Using same-origin checkout for {url} (cart/add or POST redirect failed)")
                     except Exception:
                         pass
                 except json.JSONDecodeError:
