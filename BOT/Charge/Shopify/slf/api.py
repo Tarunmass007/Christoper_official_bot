@@ -400,8 +400,11 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
         return out
     text = checkout_text
 
-    # Session token: meta name="serialized-session-token" content="..." (any order)
+    # Session token: meta name (Shopify updates: serialized-sessionToken + content="&quot;...&quot;"/>)
+    # New format: <meta name="serialized-sessionToken" content="&quot;  -> prefix,  &quot;"/>  -> suffix
     for name_pat, content_pat in [
+        (r'name=["\']serialized-sessionToken["\'][^>]+content=["\']&quot;(.+?)&quot;"/>', None),
+        (r'name=["\']serialized-sessionToken["\'][^>]+content=&quot;(.+?)&quot;"/>', None),
         (r'name=["\']serialized-session-token["\'][^>]+content=["\']([^"\']+)["\']', r'content=["\']([^"\']+)["\'][^>]+name=["\']serialized-session-token["\']'),
         (r'name=["\']serialized-session-token["\'][^>]+content=&quot;([^&]+)&quot;', None),
         (r'content="([^"]+)"[^>]+name="serialized-session-token"', None),
@@ -422,6 +425,10 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
     if not out["session_token"]:
         out["session_token"] = _capture_multi(
             text,
+            ('name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+            ('name="serialized-sessionToken" content="&quot;', '&quot;" />'),
+            ("name='serialized-sessionToken' content='&quot;", "&quot;"/>"),
+            ('serialized-sessionToken" content="&quot;', '&quot;"/>'),
             ('serialized-session-token" content="&quot;', '&quot'),
             ('serialized-session-token" content="', '"'),
             ('name="serialized-session-token" content="', '"'),
@@ -431,6 +438,19 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
         m = re.search(r'"serializedSessionToken"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
         if m:
             out["session_token"] = m.group(1).replace("\\\"", '"').strip()
+    if not out["session_token"]:
+        m = re.search(r'"sessionToken"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+        if m:
+            out["session_token"] = m.group(1).replace("\\\"", '"').strip()
+    if not out["session_token"]:
+        m = re.search(r"'sessionToken'\s*:\s*'([^']+)'", text)
+        if m:
+            out["session_token"] = m.group(1).strip()
+    # Normalize: strip and ensure non-empty
+    if out["session_token"] and isinstance(out["session_token"], str):
+        out["session_token"] = out["session_token"].strip() or None
+    if out["session_token"] and len(out["session_token"]) < 10:
+        out["session_token"] = None
 
     # Source token
     for name_pat, content_pat in [
@@ -462,6 +482,18 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
         m = re.search(r'"serializedSourceToken"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
         if m:
             out["source_token"] = m.group(1).replace("\\\"", '"').strip()
+    if not out["source_token"]:
+        m = re.search(r'"sourceToken"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+        if m:
+            out["source_token"] = m.group(1).replace("\\\"", '"').strip()
+    if not out["source_token"]:
+        m = re.search(r"'sourceToken'\s*:\s*'([^']+)'", text)
+        if m:
+            out["source_token"] = m.group(1).strip()
+    if out["source_token"] and isinstance(out["source_token"], str):
+        out["source_token"] = out["source_token"].strip() or None
+    if out["source_token"] and len(out["source_token"]) < 10:
+        out["source_token"] = None
 
     # Queue token (often in JSON blob)
     if not out["queue_token"]:
@@ -479,6 +511,12 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
             m = re.search(r"'queueToken'\s*:\s*'([^']+)'", text)
             if m:
                 out["queue_token"] = m.group(1)
+        if not out["queue_token"]:
+            m = re.search(r'"queueToken"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+            if m:
+                out["queue_token"] = m.group(1).replace("\\\"", '"').strip()
+    if out["queue_token"] and isinstance(out["queue_token"], str):
+        out["queue_token"] = out["queue_token"].strip() or None
 
     # Stable ID
     if not out["stable_id"]:
@@ -496,6 +534,12 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
             m = re.search(r"'stableId'\s*:\s*'([^']+)'", text)
             if m:
                 out["stable_id"] = m.group(1)
+        if not out["stable_id"]:
+            m = re.search(r'stableId["\']?\s*:\s*["\']([^"\']+)["\']', text)
+            if m:
+                out["stable_id"] = m.group(1).strip()
+    if out["stable_id"] and isinstance(out["stable_id"], str):
+        out["stable_id"] = out["stable_id"].strip() or None
 
     return out
 
@@ -1318,7 +1362,7 @@ async def autoshopify(url, card, session, proxy=None):
                         cs_sc, cs_text = await asyncio.to_thread(
                             _fetch_checkout_cloudscraper_sync, checkout_url, proxy
                         )
-                        if cs_sc == 200 and cs_text and "serialized-session-token" in cs_text and "serialized-source-token" in cs_text:
+                        if cs_sc == 200 and cs_text and ("serialized-session-token" in cs_text or "serialized-sessionToken" in cs_text) and ("serialized-source-token" in cs_text or "serializedSourceToken" in cs_text):
                             checkout_text = cs_text
                             checkout_lower = checkout_text.lower()
                         else:
@@ -1333,7 +1377,7 @@ async def autoshopify(url, card, session, proxy=None):
                     output.update({"Response": "HCAPTCHA_DETECTED", "Status": False})
                     _log_output_to_terminal(output)
                     return output
-            if "serialized-session-token" not in checkout_text and "serialized-source-token" not in checkout_text:
+            if "serialized-session-token" not in checkout_text and "serialized-sessionToken" not in checkout_text and "serialized-source-token" not in checkout_text:
                 # May be challenge page (e.g. Cloudflare); try cloudscraper once before giving up
                 if HAS_CLOUDSCRAPER:
                     try:
@@ -1341,13 +1385,13 @@ async def autoshopify(url, card, session, proxy=None):
                             _fetch_checkout_cloudscraper_sync, checkout_url, proxy
                         )
                         if cs_sc == 200 and cs_text and len(cs_text) > 1000:
-                            if "serialized-session-token" in cs_text or "serializedSessionToken" in cs_text:
+                            if "serialized-session-token" in cs_text or "serialized-sessionToken" in cs_text or "serializedSessionToken" in cs_text:
                                 checkout_text = cs_text
                                 checkout_lower = checkout_text.lower()
                                 logger.info(f"Checkout page via cloudscraper (no tokens in initial HTML) for {url}")
                     except Exception:
                         pass
-                if "serialized-session-token" not in checkout_text and "serialized-source-token" not in checkout_text and "serializedSessionToken" not in checkout_text:
+                if "serialized-session-token" not in checkout_text and "serialized-sessionToken" not in checkout_text and "serialized-source-token" not in checkout_text and "serializedSessionToken" not in checkout_text:
                     output.update({"Response": "CHECKOUT_HTML_ERROR", "Status": False})
                     _log_output_to_terminal(output)
                     return output
@@ -1400,9 +1444,13 @@ async def autoshopify(url, card, session, proxy=None):
         except Exception:
             countryCode = currencyCode
 
-        # Session and source tokens: multiple patterns for different Shopify checkout renders
+        # Session and source tokens: multiple patterns (Shopify update: serialized-sessionToken + &quot;...&quot;"/>)
         x_checkout_one_session_token = _capture_multi(
             checkout_text,
+            ('name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+            ('name="serialized-sessionToken" content="&quot;', '&quot;" />'),
+            ("name='serialized-sessionToken' content='&quot;", "&quot;"/>"),
+            ('serialized-sessionToken" content="&quot;', '&quot;"/>'),
             ('serialized-session-token" content="&quot;', '&quot'),
             ('serialized-session-token" content="', '"'),
             ('serialized-session-token&quot; content=&quot;&quot;', '&quot;'),
@@ -1410,7 +1458,7 @@ async def autoshopify(url, card, session, proxy=None):
             ("name='serialized-session-token' content='", "'"),
             ('serialized-session-token" content=\'', "'"),
         )
-        if not x_checkout_one_session_token and 'serializedSessionToken' in checkout_text:
+        if not x_checkout_one_session_token and ('serializedSessionToken' in checkout_text or 'serialized-sessionToken' in checkout_text):
             m = re.search(r'"serializedSessionToken"\s*:\s*"([^"]+)"', checkout_text)
             if m:
                 x_checkout_one_session_token = m.group(1)
