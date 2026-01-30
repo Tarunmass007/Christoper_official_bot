@@ -1,10 +1,12 @@
 """
 Stripe Auto Auth - Single Check (/starr)
 ========================================
-Single card check using user's saved Stripe Auth site (from /sturl).
+Single card check across up to 15 saved Stripe Auth sites in parallel.
+First definitive result (APPROVED / CCN LIVE / DECLINED) from any site is shown.
 Reply to CC or /starr cc|mm|yy|cvv. Does NOT use /au, /mau gate.
 """
 
+import asyncio
 import re
 from time import time
 
@@ -27,8 +29,7 @@ except ImportError:
         return None
 
 user_locks = {}
-# Rotation index per user for multi-site round-robin
-user_site_index = {}
+MAX_STARR_SITES = 15  # max parallel site threads for /starr
 
 def extract_card(text: str):
     m = re.search(r"(\d{12,19})\|(\d{1,2})\|(\d{2,4})\|(\d{3,4})", text)
@@ -141,19 +142,19 @@ async def handle_starr_command(client: Client, message: Message):
                 reply_to_message_id=message.id,
                 parse_mode=ParseMode.HTML,
             )
-        # Rotate through added sites (round-robin)
-        idx = user_site_index.get(user_id, 0) % len(sites)
-        site_info = sites[idx] if isinstance(sites[idx], dict) else {"url": str(sites[idx])}
-        user_site_index[user_id] = (idx + 1) % len(sites)
-        site_url = site_info.get("url") or (str(sites[idx]) if not isinstance(sites[idx], dict) else "")
-        if not site_url:
+        sites_list = [
+            (s.get("url") or str(s)).strip()
+            for s in sites
+            if (s.get("url") if isinstance(s, dict) else str(s))
+        ]
+        sites_list = [u for u in sites_list if u][:MAX_STARR_SITES]
+        if not sites_list:
             user_locks.pop(user_id, None)
             return await message.reply(
                 "<pre>No Stripe Auth Site ❌</pre>\n<b>Add a site first:</b> <code>/sturl https://yoursite.com</code>",
                 reply_to_message_id=message.id,
                 parse_mode=ParseMode.HTML,
             )
-        site_info = {"url": site_url}
         card_num, mm, yy, cvv = extracted
         if len(yy) == 2:
             yy = "20" + yy
@@ -164,13 +165,43 @@ async def handle_starr_command(client: Client, message: Message):
         profile = f"<a href='tg://user?id={user_id}'>{message.from_user.first_name}</a>"
         user_info = {"profile": profile, "plan": plan, "badge": badge}
         start_time = time()
+        num_sites = len(sites_list)
         loading_msg = await message.reply(
-            f"<pre>Stripe Auto Auth...</pre>\n<b>• Card:</b> <code>{fullcc}</code>\n<b>• Site:</b> <code>{site_info['url'][:35]}...</code>\n<b>• Status:</b> <i>Registering & checking... ◐</i>",
+            f"<pre>Stripe Auto Auth...</pre>\n<b>• Card:</b> <code>{fullcc}</code>\n<b>• Status:</b> <i>Checking across {num_sites} site(s)... ◐</i>",
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML,
         )
-        proxy = get_rotating_proxy(int(user_id))
-        result = await auto_stripe_auth(site_info["url"], fullcc, session=None, proxy=proxy, timeout_seconds=50)
+
+        async def check_one_site(site_url: str):
+            proxy = get_rotating_proxy(int(user_id))
+            return await auto_stripe_auth(site_url, fullcc, session=None, proxy=proxy, timeout_seconds=50)
+
+        tasks = [asyncio.create_task(check_one_site(url)) for url in sites_list]
+        result = None
+        try:
+            for done in asyncio.as_completed(tasks):
+                res = await done
+                status = determine_stripe_auto_status(res)
+                if status in ("APPROVED", "CCN LIVE", "DECLINED"):
+                    result = res
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    break
+            if result is None:
+                result = res
+        except asyncio.CancelledError:
+            pass
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
         time_taken = round(time() - start_time, 2)
         final_message = format_response(fullcc, result, user_info, time_taken)
         await loading_msg.edit(

@@ -42,8 +42,15 @@ ACCOUNT_PATH_CANDIDATES = [
     "/customer-dashboard/",
     "/dashboard/",
     "/login/",
+    "/customer-login/",
+    "/sign-in/",
+    "/log-in/",
+    "/auth/",
     "/my-account-3/",
     "/account-2/",
+    "/customer-login-2/",
+    "/shop/account/",
+    "/store/account/",
 ]
 
 USER_AGENTS = [
@@ -63,7 +70,7 @@ def _random_password() -> str:
 
 
 def _extract_base_and_path_hint(site_url: str) -> Tuple[str, Optional[str]]:
-    """Return (base_url, path_hint). path_hint e.g. /account/ from .../account/add-payment-method/."""
+    """Return (base_url, path_hint). path_hint e.g. /account/ or /shop/my-account/ from .../account/add-payment-method/."""
     url = site_url.strip().rstrip("/")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -75,11 +82,22 @@ def _extract_base_and_path_hint(site_url: str) -> Tuple[str, Optional[str]]:
     parts = [p for p in path.split("/") if p]
     if not parts:
         return base, None
+    known = ("account", "my-account", "myaccount", "customer-area", "dashboard", "login", "customer-login", "sign-in", "auth", "my-account-2", "account-2", "customer-dashboard")
+    # Prefer full path up to and including account-like segment (e.g. /shop/my-account/ from /shop/my-account/add-payment-method)
+    for i, seg in enumerate(parts):
+        s = seg.lower()
+        for k in known:
+            if s == k or s.startswith(k + "-") or s.startswith(k + "2") or k in s:
+                path_hint = "/" + "/".join(parts[: i + 1]) + "/"
+                return base, path_hint
+        if "account" in s or "login" in s or "signin" in s:
+            path_hint = "/" + "/".join(parts[: i + 1]) + "/"
+            return base, path_hint
     first_seg = parts[0].lower()
-    for known in ("account", "my-account", "myaccount", "customer-area", "dashboard", "login", "my-account-2", "account-2", "customer-dashboard"):
-        if first_seg == known or first_seg.startswith(known + "-") or first_seg.startswith(known + "2"):
+    for k in known:
+        if first_seg == k or first_seg.startswith(k + "-") or first_seg.startswith(k + "2"):
             return base, "/" + parts[0] + "/"
-    if "account" in first_seg or "my-account" in first_seg:
+    if "account" in first_seg or "login" in first_seg:
         return base, "/" + parts[0] + "/"
     return base, None
 
@@ -99,9 +117,10 @@ def _looks_like_woo_account(html: str) -> bool:
         or "publishablekey" in h
         or "stripe" in h
         or "my-account" in h
-        or 'name="woocommerce-register-nonce"' in h
+        or "woocommerce-register-nonce" in h
         or "lost your password" in h
         or "customer-area" in h
+        or ("password" in h and ("email" in h or "login" in h or "log in" in h or "sign in" in h))
     )
 
 
@@ -126,7 +145,7 @@ async def _discover_account_path(
                 if resp.status != 200:
                     continue
                 html = await resp.text()
-                if _looks_like_woo_account(html):
+                if _looks_like_woo_account(html) or "woocommerce-register-nonce" in (html or "").lower():
                     return prefix
         except Exception:
             continue
@@ -302,14 +321,20 @@ async def auto_stripe_auth(
                         async with session.get(try_url, headers=headers_base, proxy=proxy) as resp2:
                             if resp2.status == 200:
                                 html_reg = await resp2.text()
-                                if html_reg and _looks_like_woo_account(html_reg):
+                                # Accept if Woo-like or if page has registration nonce (so we can extract it)
+                                if html_reg and (
+                                    _looks_like_woo_account(html_reg)
+                                    or "woocommerce-register-nonce" in html_reg.lower()
+                                ):
                                     account_url = try_url
                                     acc_path = prefix.strip("/")
                                     referer_path = prefix
                                     break
                     except Exception:
                         continue
-                if not html_reg or not _looks_like_woo_account(html_reg):
+                if not html_reg or not (
+                    _looks_like_woo_account(html_reg) or "woocommerce-register-nonce" in (html_reg or "").lower()
+                ):
                     result["response"] = "SITE_HTTP_ERROR"
                     result["message"] = f"Account page returned {resp_status or 404} (tried account paths; none returned WooCommerce)"
                     break
