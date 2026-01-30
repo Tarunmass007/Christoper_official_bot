@@ -117,6 +117,28 @@ def capture(data, first, last):
       return None
 
 
+# Canonical session token parsing: one main accurate prefix/suffix for x_checkout_one_session_token.
+# Exact format: <meta name="serialized-sessionToken" content="&quot;TOKEN&quot;"/>
+SESSION_TOKEN_PREFIX = 'name="serialized-sessionToken" content="&quot;'
+SESSION_TOKEN_SUFFIX = '&quot;"/>'
+
+
+def _extract_session_token_primary(checkout_text: str) -> Optional[str]:
+    """
+    Extract session token using the single canonical prefix/suffix.
+    This value must be used as x_checkout_one_session_token in all upcoming requests.
+    Returns stripped token or None.
+    """
+    if not checkout_text or not isinstance(checkout_text, str):
+        return None
+    v = capture(checkout_text, SESSION_TOKEN_PREFIX, SESSION_TOKEN_SUFFIX)
+    if v and isinstance(v, str):
+        v = v.strip()
+        if len(v) > 10:
+            return v
+    return None
+
+
 def _capture_multi(data: str, *pairs) -> Optional[str]:
     """Try multiple (first, last) patterns; return first non-empty match."""
     if not data:
@@ -401,9 +423,9 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
         return out
     text = checkout_text
 
-    # Session token: exact Shopify format <meta name="serialized-sessionToken" content="&quot;TOKEN&quot;"/>
-    # Try regex first (handles optional whitespace; escape " in regex so pattern is complete)
-    if "serialized-sessionToken" in text or "serialized-session-token" in text:
+    # Session token: one main accurate extraction (canonical prefix/suffix), then fallbacks
+    out["session_token"] = _extract_session_token_primary(text)
+    if not out["session_token"] and ("serialized-sessionToken" in text or "serialized-session-token" in text):
         for pat in [
             r'name\s*=\s*["\']serialized-sessionToken["\'][^>]*?content\s*=\s*["\']&quot;(.+?)&quot;\s*"\s*/\s*>',
             r'name\s*=\s*["\']serialized-sessionToken["\'][^>]*?content\s*=\s*&quot;(.+?)&quot;\s*"\s*/\s*>',
@@ -415,13 +437,10 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
                 if v and len(v) > 10:
                     out["session_token"] = v
                     break
-        if out["session_token"]:
-            pass
-        else:
-            # Fallback: capture between prefix and suffix (exact format)
+        if not out["session_token"]:
             out["session_token"] = _capture_multi(
                 text,
-                ('name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+                (SESSION_TOKEN_PREFIX, SESSION_TOKEN_SUFFIX),
                 ('name="serialized-sessionToken" content="&quot;', '&quot;" />'),
                 ("name='serialized-sessionToken' content='&quot;", '&quot;"/>'),
                 ('serialized-sessionToken" content="&quot;', '&quot;"/>'),
@@ -1477,9 +1496,9 @@ async def autoshopify(url, card, session, proxy=None):
         except Exception:
             countryCode = currencyCode
 
-        # Session token: exact format <meta name="serialized-sessionToken" content="&quot;TOKEN&quot;"/>
-        x_checkout_one_session_token = None
-        if "serialized-sessionToken" in checkout_text or "serialized-session-token" in checkout_text:
+        # Session token: one main accurate parsing (canonical prefix/suffix) — used in all upcoming requests
+        x_checkout_one_session_token = _extract_session_token_primary(checkout_text)
+        if not x_checkout_one_session_token and ("serialized-sessionToken" in checkout_text or "serialized-session-token" in checkout_text):
             for pat in [
                 r'name\s*=\s*["\']serialized-sessionToken["\'][^>]*?content\s*=\s*["\']&quot;(.+?)&quot;\s*"\s*/\s*>',
                 r'name\s*=\s*["\']serialized-sessionToken["\'][^>]*?content\s*=\s*&quot;(.+?)&quot;\s*"\s*/\s*>',
@@ -1494,7 +1513,7 @@ async def autoshopify(url, card, session, proxy=None):
         if not x_checkout_one_session_token:
             x_checkout_one_session_token = _capture_multi(
                 checkout_text,
-                ('name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+                (SESSION_TOKEN_PREFIX, SESSION_TOKEN_SUFFIX),
                 ('name="serialized-sessionToken" content="&quot;', '&quot;" />'),
                 ("name='serialized-sessionToken' content='&quot;", '&quot;"/>'),
                 ('serialized-sessionToken" content="&quot;', '&quot;"/>'),
@@ -1540,7 +1559,7 @@ async def autoshopify(url, card, session, proxy=None):
             if m:
                 token = m.group(1)
 
-        # Bulletproof: fill any missing tokens from robust extractor (meta + JSON patterns)
+        # Fill missing tokens from robust extractor; never overwrite primary session token
         robust_tokens = _extract_checkout_tokens_robust(checkout_text)
         if not x_checkout_one_session_token and robust_tokens.get("session_token"):
             x_checkout_one_session_token = robust_tokens["session_token"]
@@ -3555,8 +3574,14 @@ async def run_shopify_checkout_diagnostic(
                 "group1_len": len(m.group(1)) if m and m.group(1) else 0,
                 "group1_first80": (m.group(1)[:80] if m and m.group(1) else ""),
             })
+        primary_session = _extract_session_token_primary(checkout_text)
+        out["step7_robust_tokens"]["session_token_primary"] = (
+            {"len": len(primary_session), "first_80": (primary_session[:80] if primary_session else ""), "value": (primary_session[:200] + "..." if primary_session and len(primary_session) > 200 else primary_session)}
+            if primary_session
+            else None
+        )
         for prefix, suffix in [
-            ('name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+            (SESSION_TOKEN_PREFIX, SESSION_TOKEN_SUFFIX),
             ('name="serialized-sessionToken" content="&quot;', '&quot;" />'),
             ("name='serialized-sessionToken' content='&quot;", '&quot;"/>'),
         ]:
