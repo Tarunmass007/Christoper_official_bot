@@ -1308,9 +1308,16 @@ async def autoshopify(url, card, session, proxy=None):
         checkout_sc = 0
         checkout_text = ""
         store_netloc_check = (urlparse(url).netloc or "").lower().strip()
+        # When we already have full checkout URL (/checkouts/cn/...), follow redirects so we get final HTML with tokens (same as diagnostic).
+        follow_redirects_first = bool(checkout_url and "/checkouts/" in checkout_url)
         for _checkout_attempt in range(6):
-            # First try without following redirects to detect cross-host redirect (session cookies wouldn't be sent)
-            req = await session.get(checkout_url, headers=headers, params=params, follow_redirects=False, timeout=18)
+            req = await session.get(
+                checkout_url,
+                headers=headers,
+                params=params,
+                follow_redirects=follow_redirects_first or (_checkout_attempt > 0),
+                timeout=22,
+            )
             checkout_sc = getattr(req, "status_code", 0)
             checkout_text = req.text if req.text else ""
             if checkout_sc in (301, 302, 303, 307, 308):
@@ -1352,6 +1359,19 @@ async def autoshopify(url, card, session, proxy=None):
             })
             _log_output_to_terminal(output)
             return output
+        # If we got 200 but page has no tokens (e.g. intermediate/loading page), retry with follow_redirects=True
+        # so we get the same final HTML as the diagnostic (which always follows redirects).
+        if checkout_sc == 200 and checkout_text and "serialized-sessionToken" not in checkout_text and "serialized-sourceToken" not in checkout_text:
+            try:
+                req_follow = await session.get(checkout_url, headers=headers, params=params, follow_redirects=True, timeout=22)
+                if getattr(req_follow, "status_code", 0) == 200 and getattr(req_follow, "text", None):
+                    follow_text = (req_follow.text or "").strip()
+                    if len(follow_text) > 5000 and ("serialized-sessionToken" in follow_text or "serialized-sourceToken" in follow_text):
+                        checkout_text = follow_text
+                        checkout_lower = checkout_text.lower()
+                        logger.info(f"Checkout page refreshed with follow_redirects=True for {url}")
+            except Exception:
+                pass
         checkout_lower = checkout_text.lower()
 
         if checkout_text.strip().startswith("<"):
