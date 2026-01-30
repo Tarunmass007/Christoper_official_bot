@@ -1291,6 +1291,7 @@ async def autoshopify(url, card, session, proxy=None):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "User-Agent": getua,
         }
+        params = {"auto_redirect": "false"}
         headers = {
             'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
             'accept-language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
@@ -1305,20 +1306,15 @@ async def autoshopify(url, card, session, proxy=None):
             'user-agent': f'{getua}',
         }
 
-        params = {
-            'auto_redirect': 'false',
-        }
-
         request = None
         checkout_sc = 0
         checkout_text = ""
         store_netloc_check = (urlparse(url).netloc or "").lower().strip()
-        # Always follow redirects; use minimal headers (same as diagnostic) so we get final HTML with tokens.
+        # Same as diagnostic: GET checkout_url with minimal headers, no query params, follow_redirects=True.
         for _checkout_attempt in range(6):
             req = await session.get(
                 checkout_url,
                 headers=checkout_headers,
-                params=params,
                 follow_redirects=True,
                 timeout=22,
             )
@@ -1336,7 +1332,7 @@ async def autoshopify(url, card, session, proxy=None):
                             if add_r and getattr(add_r, 'status_code', 0) in (200, 302):
                                 await asyncio.sleep(0.6)
                                 checkout_url = url.rstrip('/') + '/checkout'
-                                req = await session.get(checkout_url, headers=headers, params=params, follow_redirects=True, timeout=18)
+                                req = await session.get(checkout_url, headers=checkout_headers, follow_redirects=True, timeout=22)
                                 checkout_sc = getattr(req, "status_code", 0)
                                 checkout_text = req.text if req.text else ""
                     except Exception:
@@ -1345,7 +1341,7 @@ async def autoshopify(url, card, session, proxy=None):
                 request = req
                 break
             if checkout_sc in (301, 302, 303, 307, 308) and _checkout_attempt == 0:
-                req = await session.get(checkout_url, headers=headers, params=params, follow_redirects=True, timeout=18)
+                req = await session.get(checkout_url, headers=checkout_headers, follow_redirects=True, timeout=22)
                 checkout_sc = getattr(req, "status_code", 0)
                 checkout_text = req.text if req.text else ""
                 if checkout_sc == 200:
@@ -1367,7 +1363,7 @@ async def autoshopify(url, card, session, proxy=None):
         # so we get the same final HTML as the diagnostic (which always follows redirects).
         if checkout_sc == 200 and checkout_text and "serialized-sessionToken" not in checkout_text and "serialized-sourceToken" not in checkout_text:
             try:
-                req_follow = await session.get(checkout_url, headers=headers, params=params, follow_redirects=True, timeout=22)
+                req_follow = await session.get(checkout_url, headers=checkout_headers, follow_redirects=True, timeout=22)
                 if getattr(req_follow, "status_code", 0) == 200 and getattr(req_follow, "text", None):
                     follow_text = (req_follow.text or "").strip()
                     if len(follow_text) > 5000 and ("serialized-sessionToken" in follow_text or "serialized-sourceToken" in follow_text):
@@ -1628,13 +1624,13 @@ async def autoshopify(url, card, session, proxy=None):
 
             # Diagnostic-style fallback: GET checkout_url with minimal headers (same as /testsh) and re-extract tokens.
             if (not x_checkout_one_session_token or not token or not queue_token or not stable_id) and checkout_url:
-                try:
-                    diag_headers = {
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "User-Agent": getua,
-                    }
-                    diag_req = await session.get(checkout_url, headers=diag_headers, follow_redirects=True, timeout=22)
-                    if getattr(diag_req, "status_code", 0) == 200 and getattr(diag_req, "text", None):
+                for try_url in (checkout_url, url.rstrip("/") + "/checkout"):
+                    if not try_url:
+                        continue
+                    try:
+                        diag_req = await session.get(try_url, headers=checkout_headers, follow_redirects=True, timeout=22)
+                        if getattr(diag_req, "status_code", 0) != 200 or not getattr(diag_req, "text", None):
+                            continue
                         diag_text = (diag_req.text or "").strip()
                         if len(diag_text) > 5000 and "serialized-sessionToken" in diag_text:
                             checkout_text = diag_text
@@ -1652,8 +1648,9 @@ async def autoshopify(url, card, session, proxy=None):
                             if not paymentMethodIdentifier:
                                 paymentMethodIdentifier = _capture_multi(checkout_text, ('paymentMethodIdentifier&quot;:&quot;', '&quot;'), ('paymentMethodIdentifier":"', '"')) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot;")
                             logger.info(f"Checkout tokens via diagnostic-style fetch for {url}")
-                except Exception:
-                    pass
+                            break
+                    except Exception:
+                        continue
 
             missing = []
             if not x_checkout_one_session_token:
