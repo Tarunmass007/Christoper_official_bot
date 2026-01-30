@@ -1838,6 +1838,141 @@ async def autoshopify(url, card, session, proxy=None):
     return output
 
 
+async def run_shopify_checkout_diagnostic(
+    url: str,
+    session,
+    proxy: Optional[str] = None,
+) -> dict:
+    """
+    Run step-by-step checkout diagnostic for /testsh. Returns dict with step1_* .. step10_*
+    for _format_diagnostic_to_text. Session can be BulletproofSession or TLSAsyncSession.
+    """
+    parsed = urlparse(url)
+    domain = (parsed.netloc or url).strip().lower()
+    if "://" in domain:
+        domain = urlparse(url).netloc or ""
+    base_url = url.rstrip("/") if "://" in url else f"https://{domain}"
+    data = {
+        "url": url,
+        "domain": domain,
+        "error": None,
+        "step1_low_product": {},
+        "step2_products": {},
+        "step3_cart_add": {},
+        "step4_checkout_url": None,
+        "step5_checkout_page": {},
+        "checkout_text_length": 0,
+        "step6_token_presence": {},
+        "step7_robust_tokens": {},
+        "step8_regex_session_tests": [],
+        "step9_capture_session_tests": [],
+        "step10_capture_source_tests": [],
+    }
+    checkout_text = ""
+    product_id = None
+    try:
+        step1 = await _fetch_low_product_api(domain, session, proxy)
+        data["step1_low_product"] = step1 or {"error": "no response"}
+        if step1 and step1.get("variantid"):
+            product_id = str(step1["variantid"])
+    except Exception as e:
+        data["step1_low_product"] = {"error": str(e)[:200]}
+    try:
+        prod_url = f"{base_url}/products.json?limit=5"
+        r = await session.get(prod_url, timeout=15)
+        raw = getattr(r, "text", None) or ""
+        if not raw and isinstance(getattr(r, "content", None), bytes):
+            raw = (r.content or b"").decode("utf-8", errors="ignore")
+        prods = []
+        if raw.strip().startswith("{"):
+            try:
+                j = json.loads(raw)
+                prods = j.get("products") or []
+            except Exception:
+                pass
+        low = find_lowest_variant_from_products(prods) if prods else None
+        if low:
+            product_id = str(low["variant"].get("id", ""))
+        data["step2_products"] = {"count": len(prods), "product_id": product_id or "N/A"}
+    except Exception as e:
+        data["step2_products"] = {"error": str(e)[:200]}
+    if product_id:
+        try:
+            add_r = await session.post(
+                f"{base_url}/cart/add.js",
+                data={"id": product_id, "quantity": 1},
+                timeout=12,
+            )
+            data["step3_cart_add"] = {"status": getattr(add_r, "status_code", 0), "product_id": product_id}
+        except Exception as e:
+            data["step3_cart_add"] = {"error": str(e)[:200]}
+    checkout_url = f"{base_url}/checkout"
+    data["step4_checkout_url"] = checkout_url
+    try:
+        req = await session.get(checkout_url, timeout=22, follow_redirects=True)
+        checkout_text = getattr(req, "text", None) or ""
+        if isinstance(getattr(req, "content", None), bytes):
+            checkout_text = (req.content or b"").decode("utf-8", errors="ignore")
+        data["checkout_text_length"] = len(checkout_text or "")
+        data["step5_checkout_page"] = {
+            "status": getattr(req, "status_code", 0),
+            "snippet_first_500": (checkout_text or "")[:500],
+            "snippet_meta_session": (checkout_text or "").split("serialized-sessionToken", 1)[-1][:400] if "serialized-sessionToken" in (checkout_text or "") else "",
+        }
+    except Exception as e:
+        data["step5_checkout_page"] = {"error": str(e)[:200]}
+    data["step6_token_presence"] = {
+        "serialized-sessionToken": "serialized-sessionToken" in (checkout_text or ""),
+        "serialized-sourceToken": "serialized-sourceToken" in (checkout_text or "") or "serializedSourceToken" in (checkout_text or ""),
+        "queueToken": "queueToken" in (checkout_text or ""),
+        "stableId": "stableId" in (checkout_text or ""),
+    }
+    robust = _extract_checkout_tokens_robust(checkout_text or "")
+    data["step7_robust_tokens"] = {
+        k: {"len": len(v) if v else 0, "first_80": (v or "")[:80], "value": v}
+        for k, v in robust.items()
+    }
+    for i, (pat, name) in enumerate(SESSION_TOKEN_PATTERNS):
+        m = re.search(pat, checkout_text or "", re.I | re.DOTALL) if pat else None
+        data["step8_regex_session_tests"].append({
+            "name": name,
+            "matched": bool(m),
+            "group1_len": len(m.group(1)) if m and m.lastindex else 0,
+            "group1_first80": (m.group(1)[:80] if m and m.lastindex and m.group(1) else None),
+        })
+    for prefix, suffix in [('<meta name="serialized-sessionToken" content="&quot;', '&quot;"/>'), ('name="serialized-sessionToken" content="&quot;', '&quot;" />')]:
+        v = capture(checkout_text or "", prefix, suffix)
+        data["step9_capture_session_tests"].append({
+            "prefix": prefix[:40], "suffix": suffix[:20],
+            "result_len": len(v) if v else 0, "result_first80": (v or "")[:80],
+        })
+    for prefix, suffix in [('<meta name="serialized-sourceToken" content="&quot;', '&quot;"/>'), ('name="serialized-sourceToken" content="&quot;', '&quot;" />')]:
+        v = capture(checkout_text or "", prefix, suffix)
+        data["step10_capture_source_tests"].append({
+            "prefix": prefix[:40], "suffix": suffix[:20],
+            "result_len": len(v) if v else 0, "result_first80": (v or "")[:80],
+        })
+    return data
+
+
+def find_lowest_variant_from_products(products: list) -> Optional[dict]:
+    """Find lowest priced variant from products list. Used by diagnostic."""
+    if not products:
+        return None
+    lowest_price = float("inf")
+    lowest_item = None
+    for product in products:
+        for variant in (product.get("variants") or []):
+            try:
+                price = float(variant.get("price") or 0)
+                if price >= 0.1 and price < lowest_price:
+                    lowest_price = price
+                    lowest_item = {"product": product, "variant": variant, "price": price}
+            except (TypeError, ValueError):
+                continue
+    return lowest_item
+
+
 # ==================== CAPTCHA-AWARE WRAPPER ====================
 
 async def autoshopify_with_captcha_retry(
@@ -1847,6 +1982,22 @@ async def autoshopify_with_captcha_retry(
     max_captcha_retries: int = 5,
     proxy: Optional[str] = None,
 ) -> dict:
-    """Wrapper with enhanced retry logic"""
-    # ... existing implementation
-    pass
+    """Wrapper: call autoshopify with retries on captcha/errors."""
+    last = {"Response": "UNKNOWN", "Status": False, "ReceiptId": None, "Price": None}
+    for attempt in range(max(1, max_captcha_retries)):
+        try:
+            res = await autoshopify(url, card, session, proxy)
+            if res:
+                last = res
+                if res.get("ReceiptId") or res.get("Status") is True:
+                    return res
+                if res.get("Response") and ("captcha" in str(res.get("Response")).lower() or "hcaptcha" in str(res.get("Response")).lower()):
+                    await asyncio.sleep(1.0 + attempt * 0.5)
+                    continue
+            return last
+        except Exception as e:
+            last = {"Response": f"ERROR: {str(e)[:80]}", "Status": False, "ReceiptId": None, "Price": None}
+            if attempt == max_captcha_retries - 1:
+                return last
+            await asyncio.sleep(0.5 * (attempt + 1))
+    return last
