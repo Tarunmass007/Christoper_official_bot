@@ -110,8 +110,7 @@ async def add_site_handler(client: Client, message: Message):
             error_lines = []
             for site in invalid_sites[:5]:
                 err = site.get('error', 'Invalid')[:45]
-                error_lines.append(f"• <code>{site['url'][:35]}</code>
-  └─ {err}")
+                error_lines.append(f"• <code>{site['url'][:35]}</code>\n  └─ {err}")
             error_text = "\n".join(error_lines)
             return await status_msg.edit_text(
                 f"""<pre>Invalid Sites ❌</pre>
