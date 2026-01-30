@@ -325,6 +325,16 @@ def _parse_low_product_api_response(text: str) -> Optional[dict]:
     if isinstance(location, dict):
         country_code = (location.get("country_code") or "")
     price1 = (formatted_price.lstrip("$").strip() or None) if formatted_price else None
+    checkout = data.get("checkout")
+    direct_url = ""
+    cart_add_url = ""
+    if isinstance(checkout, dict):
+        direct_url = (checkout.get("direct_url") or "").strip()
+        cart_add_url = (checkout.get("cart_add_url") or "").strip()
+        if direct_url and not direct_url.startswith("http"):
+            direct_url = ""
+        if cart_add_url and not cart_add_url.startswith("http"):
+            cart_add_url = ""
     return {
         "variantid": variant_id,
         "price": price_val if price_val is not None else 0.0,
@@ -334,6 +344,8 @@ def _parse_low_product_api_response(text: str) -> Optional[dict]:
         "currency_symbol": currency_symbol,
         "country_code": country_code,
         "price1": price1 or formatted_price,
+        "direct_url": direct_url,
+        "cart_add_url": cart_add_url,
     }
 
 
@@ -724,10 +736,16 @@ async def autoshopify(url, card, session, proxy=None):
             "Accept-Language": "en-US,en;q=0.9",
         }
         
-        # Low-product API first (Silver-bullet style): GET shopify-api-new-production.up.railway.app/<site>
+        # Low-product API first: https://shopify-api-new-production.up.railway.app/<site>
+        # API returns variant, requires_shipping, checkout.direct_url, checkout.cart_add_url
         low_product_flow = False
+        non_shipping_flow = False  # True when API says requires_shipping=False -> use cart_add_url + POST checkout + GET Location only
         product_id, price = None, None
         request = None
+        site_key = None  # set in standard flow; non_shipping_flow skips fallback/GraphQL
+        checkout_url = None
+        checkout_text = ""
+        checkout_sc = 0
         try:
             low_product = await _fetch_low_product_api(domain, session, proxy)
             if low_product and low_product.get("variantid") is not None:
@@ -736,7 +754,12 @@ async def autoshopify(url, card, session, proxy=None):
                 if price is None:
                     price = 0.0
                 low_product_flow = True
-                logger.info(f"✅ Low-product API used for {url}: variant={product_id}, price={price}")
+                requires_shipping = low_product.get("requires_shipping", True)
+                if requires_shipping is False:
+                    non_shipping_flow = True
+                    logger.info(f"✅ Low-product API (non-shipping) for {url}: variant={product_id}, price={price}")
+                else:
+                    logger.info(f"✅ Low-product API (shipping) for {url}: variant={product_id}, price={price}")
         except Exception as e:
             logger.debug(f"Low-product API failed: {e}")
 
@@ -864,8 +887,72 @@ async def autoshopify(url, card, session, proxy=None):
 
         logger.info(f"✅ Product found: ID={product_id}, Price={price}")
 
-        # Low-product flow: cart/add.js -> POST checkout -> redirect -> GET checkout page
-        if low_product_flow:
+        # Non-shipping flow (API says requires_shipping=False): cart_add_url or cart/add -> POST checkout -> GET Location -> tokens
+        if non_shipping_flow and low_product:
+            logger.info("📦 Using non-shipping flow (API requires_shipping=False)")
+            try:
+                cart_add_url_api = (low_product.get("cart_add_url") or "").strip()
+                add_ok = False
+                if cart_add_url_api and cart_add_url_api.startswith("http"):
+                    add_resp = await session.get(cart_add_url_api, headers={"User-Agent": getua, "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}, follow_redirects=True, timeout=15)
+                    if add_resp and getattr(add_resp, "status_code", 0) in (200, 302):
+                        add_ok = True
+                        logger.info(f"✅ Cart add via API cart_add_url for {url}")
+                if not add_ok:
+                    add_resp = await session.post(
+                        f"{url.rstrip('/')}/cart/add",
+                        headers={"User-Agent": getua, "Content-Type": "application/x-www-form-urlencoded", "Origin": url.rstrip("/"), "Referer": url.rstrip("/") + "/", "Accept": "*/*"},
+                        data={"id": product_id, "quantity": 1},
+                        timeout=15,
+                        follow_redirects=True,
+                    )
+                    if add_resp and getattr(add_resp, "status_code", 0) in (200, 302):
+                        logger.info(f"✅ Cart add via POST cart/add for {url}")
+                await asyncio.sleep(0.6)
+                ch_post = await session.post(
+                    f"{url.rstrip('/')}/checkout",
+                    headers={"User-Agent": getua, "Content-Type": "application/x-www-form-urlencoded", "Origin": url.rstrip("/"), "Referer": url.rstrip("/") + "/", "Accept": "*/*"},
+                    data="",
+                    timeout=18,
+                    follow_redirects=False,
+                )
+                post_sc = getattr(ch_post, "status_code", 0)
+                if post_sc in (301, 302, 303, 307, 308):
+                    loc = (getattr(ch_post, "headers", None) or {}).get("location") or (getattr(ch_post, "headers", None) or {}).get("Location") or ""
+                    if loc:
+                        if not loc.startswith("http"):
+                            loc = urljoin(url.rstrip("/") + "/", loc)
+                        checkout_url = loc
+                        get_params = {"skip_shop_pay": "true"} if "skip_shop_pay" not in (loc or "") else None
+                        get_final = await session.get(
+                            checkout_url,
+                            headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": getua},
+                            params=get_params,
+                            follow_redirects=True,
+                            timeout=22,
+                        )
+                        _sc = getattr(get_final, "status_code", 0)
+                        _text = (getattr(get_final, "text", None) or "").strip()
+                        if _sc == 200 and len(_text) > 5000 and "serialized-sessionToken" in _text:
+                            checkout_text = _text
+                            request = get_final
+                            checkout_sc = 200
+                            logger.info(f"✅ Non-shipping checkout page for {url} (len=%s)", len(checkout_text))
+                if not checkout_text:
+                    output.update({"Response": "CHECKOUT_NON_SHIPPING_NO_PAGE", "Status": False})
+                    _log_output_to_terminal(output)
+                    return output
+                # Define for rest of function (trace, retries, token extraction)
+                checkout_headers = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": getua}
+                get_params = {"skip_shop_pay": "true"} if (checkout_url and "skip_shop_pay" not in checkout_url) else None
+            except Exception as e:
+                logger.debug(f"Non-shipping flow error: {e}")
+                output.update({"Response": f"NON_SHIPPING_ERROR: {str(e)[:40]}", "Status": False})
+                _log_output_to_terminal(output)
+                return output
+
+        # Low-product flow (shipping): cart/add.js -> POST checkout -> redirect -> GET checkout page
+        elif low_product_flow:
             logger.info("🛒 Using low-product flow (cart/add.js)")
             add_js_headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
@@ -996,8 +1083,8 @@ async def autoshopify(url, card, session, proxy=None):
             logger.info(f"🔑 Site key found: {bool(site_key)}")
 
             checkout_url = None
-            # Fallback when Storefront API token missing
-            if not site_key or not str(site_key).strip():
+            # Fallback when Storefront API token missing (skip when non_shipping_flow; we already have checkout_text)
+            if not non_shipping_flow and (not site_key or not str(site_key).strip()):
                 logger.info("⚠️ No site_key, trying fallback methods...")
                 # Try low-product API fallback
                 try:
@@ -1151,11 +1238,8 @@ async def autoshopify(url, card, session, proxy=None):
                             _log_output_to_terminal(output)
                             return output
 
-            if site_key and str(site_key).strip():
-                # Continue with standard Storefront API flow
-                # (Rest of the code remains the same - GraphQL cart creation, etc.)
-                pass  # ... existing code continues
-
+            if not non_shipping_flow and site_key and str(site_key).strip():
+                # Continue with standard Storefront API flow (shipping / token-based)
                 params = {
                     'operation_name': 'cartCreate',
                 }
@@ -1328,52 +1412,79 @@ async def autoshopify(url, card, session, proxy=None):
             'user-agent': f'{getua}',
         }
 
-        request = None
-        checkout_sc = 0
-        checkout_text = ""
-        store_netloc_check = (urlparse(url).netloc or "").lower().strip()
-        # Same as diagnostic: GET checkout_url with minimal headers, no query params, follow_redirects=True.
-        for _checkout_attempt in range(6):
-            req = await session.get(
-                checkout_url,
-                headers=checkout_headers,
-                follow_redirects=True,
-                timeout=22,
-            )
-            checkout_sc = getattr(req, "status_code", 0)
-            checkout_text = req.text if req.text else ""
-            if checkout_sc in (301, 302, 303, 307, 308):
-                location = (getattr(req, "headers", None) or {}).get("location") or (getattr(req, "headers", None) or {}).get("Location") or ""
-                if location and store_netloc_check:
-                    try:
-                        loc_parsed = urlparse(location if location.startswith("http") else f"https://{location}")
-                        loc_netloc = (loc_parsed.netloc or "").lower().strip()
-                        if loc_netloc and loc_netloc != store_netloc_check:
-                            add_h = {'User-Agent': getua, 'Content-Type': 'application/x-www-form-urlencoded', 'Origin': url, 'Referer': url, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}
-                            add_r = await session.post(f'{url}/cart/add', headers=add_h, data={'id': product_id, 'quantity': 1}, timeout=15, follow_redirects=True)
-                            if add_r and getattr(add_r, 'status_code', 0) in (200, 302):
-                                await asyncio.sleep(0.6)
-                                checkout_url = url.rstrip('/') + '/checkout'
-                                req = await session.get(checkout_url, headers=checkout_headers, follow_redirects=True, timeout=22)
-                                checkout_sc = getattr(req, "status_code", 0)
-                                checkout_text = req.text if req.text else ""
-                    except Exception:
-                        pass
-            if checkout_sc == 200:
-                request = req
-                break
-            if checkout_sc in (301, 302, 303, 307, 308) and _checkout_attempt == 0:
-                req = await session.get(checkout_url, headers=checkout_headers, follow_redirects=True, timeout=22)
-                checkout_sc = getattr(req, "status_code", 0)
-                checkout_text = req.text if req.text else ""
-                if checkout_sc == 200:
-                    request = req
+        # Skip re-fetching checkout when non-shipping flow already set checkout_text/request/checkout_sc
+        if not non_shipping_flow:
+            request = None
+            checkout_sc = 0
+            checkout_text = ""
+            store_netloc_check = (urlparse(url).netloc or "").lower().strip()
+            # When we have a /checkouts/ URL (from POST redirect), GET it immediately with skip_shop_pay=true
+            # so we land on the same page as browser (stickerdad.com-style) and get tokens in one shot.
+            get_params = None
+            if checkout_url and "skip_shop_pay" not in (checkout_url or ""):
+                get_params = {"skip_shop_pay": "true"}
+            if checkout_url and "/checkouts/" in (urlparse(checkout_url).path or ""):
+                try:
+                    get_immediate = await session.get(
+                        checkout_url,
+                        headers=checkout_headers,
+                        params=get_params,
+                        follow_redirects=True,
+                        timeout=22,
+                    )
+                    imm_sc = getattr(get_immediate, "status_code", 0)
+                    imm_text = (getattr(get_immediate, "text", None) or "").strip()
+                    if imm_sc == 200 and len(imm_text) > 5000 and "serialized-sessionToken" in imm_text:
+                        checkout_text = imm_text
+                        request = get_immediate
+                        checkout_sc = 200
+                        logger.info("Checkout page from POST redirect GET for %s (len=%s)", url, len(checkout_text))
+                except Exception as e:
+                    logger.debug("Immediate GET after POST redirect failed: %s", e)
+            # Same as diagnostic: GET checkout_url with minimal headers; use skip_shop_pay=true when missing.
+            if request is None:
+                for _checkout_attempt in range(6):
+                    req = await session.get(
+                        checkout_url,
+                        headers=checkout_headers,
+                        params=get_params,
+                        follow_redirects=True,
+                        timeout=22,
+                    )
+                    checkout_sc = getattr(req, "status_code", 0)
+                    checkout_text = req.text if req.text else ""
+                    if checkout_sc in (301, 302, 303, 307, 308):
+                        location = (getattr(req, "headers", None) or {}).get("location") or (getattr(req, "headers", None) or {}).get("Location") or ""
+                        if location and store_netloc_check:
+                            try:
+                                loc_parsed = urlparse(location if location.startswith("http") else f"https://{location}")
+                                loc_netloc = (loc_parsed.netloc or "").lower().strip()
+                                if loc_netloc and loc_netloc != store_netloc_check:
+                                    add_h = {'User-Agent': getua, 'Content-Type': 'application/x-www-form-urlencoded', 'Origin': url, 'Referer': url, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}
+                                    add_r = await session.post(f'{url}/cart/add', headers=add_h, data={'id': product_id, 'quantity': 1}, timeout=15, follow_redirects=True)
+                                    if add_r and getattr(add_r, 'status_code', 0) in (200, 302):
+                                        await asyncio.sleep(0.6)
+                                        checkout_url = url.rstrip('/') + '/checkout'
+                                        req = await session.get(checkout_url, headers=checkout_headers, params=get_params, follow_redirects=True, timeout=22)
+                                        checkout_sc = getattr(req, "status_code", 0)
+                                        checkout_text = req.text if req.text else ""
+                            except Exception:
+                                pass
+                    if checkout_sc == 200:
+                        request = req
+                        break
+                    if checkout_sc in (301, 302, 303, 307, 308) and _checkout_attempt == 0:
+                        req = await session.get(checkout_url, headers=checkout_headers, params=get_params, follow_redirects=True, timeout=22)
+                        checkout_sc = getattr(req, "status_code", 0)
+                        checkout_text = req.text if req.text else ""
+                        if checkout_sc == 200:
+                            request = req
+                            break
+                    if checkout_sc in (429, 502, 503, 504) and _checkout_attempt < 5:
+                        backoff = 2.0 + _checkout_attempt * 1.0 if checkout_sc == 429 else 1.0 + _checkout_attempt * 0.7
+                        await asyncio.sleep(backoff)
+                        continue
                     break
-            if checkout_sc in (429, 502, 503, 504) and _checkout_attempt < 5:
-                backoff = 2.0 + _checkout_attempt * 1.0 if checkout_sc == 429 else 1.0 + _checkout_attempt * 0.7
-                await asyncio.sleep(backoff)
-                continue
-            break
         # Trace: log what we received so CHECKOUT_TOKENS_MISSING can be debugged
         _has_session = "serialized-sessionToken" in (checkout_text or "")
         _has_source = "serialized-sourceToken" in (checkout_text or "")
@@ -1392,7 +1503,7 @@ async def autoshopify(url, card, session, proxy=None):
         # so we get the same final HTML as the diagnostic (which always follows redirects).
         if checkout_sc == 200 and checkout_text and "serialized-sessionToken" not in checkout_text and "serialized-sourceToken" not in checkout_text:
             try:
-                req_follow = await session.get(checkout_url, headers=checkout_headers, follow_redirects=True, timeout=22)
+                req_follow = await session.get(checkout_url, headers=checkout_headers, params=get_params, follow_redirects=True, timeout=22)
                 if getattr(req_follow, "status_code", 0) == 200 and getattr(req_follow, "text", None):
                     follow_text = (req_follow.text or "").strip()
                     if len(follow_text) > 5000 and ("serialized-sessionToken" in follow_text or "serialized-sourceToken" in follow_text):
