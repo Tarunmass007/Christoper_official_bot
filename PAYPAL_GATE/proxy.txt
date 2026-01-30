@@ -1,0 +1,3 @@
+# One proxy per line: http://user:pass@host:port  or  host:port
+# Example:
+# http://user:pass@proxy.example.com:8080

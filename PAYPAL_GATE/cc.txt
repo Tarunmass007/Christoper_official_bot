@@ -1,0 +1,4 @@
+# One CC per line: number|month|year|cvv  or  number|month|year|cvv|first|last|email
+# Example:
+# 4815820997382518|08|27|183
+# 4833160289037902|08|27|350|Mass|TH|mass652004@gmail.com
