@@ -1679,6 +1679,66 @@ async def autoshopify(url, card, session, proxy=None):
                     except Exception:
                         continue
 
+            # Last-resort: full diagnostic flow (cart/add -> POST /checkout -> GET redirect) to get same page as /testsh.
+            if (not x_checkout_one_session_token or not token or not queue_token or not stable_id) and product_id is not None:
+                try:
+                    add_h = {
+                        "User-Agent": getua,
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": url.rstrip("/"),
+                        "Referer": url.rstrip("/") + "/",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    }
+                    add_r = await session.post(
+                        f"{url.rstrip('/')}/cart/add",
+                        headers=add_h,
+                        data={"id": product_id, "quantity": 1},
+                        timeout=15,
+                        follow_redirects=True,
+                    )
+                    if add_r and getattr(add_r, "status_code", 0) in (200, 302):
+                        await asyncio.sleep(0.6)
+                        ch_post = await session.post(
+                            f"{url.rstrip('/')}/checkout",
+                            headers={
+                                "User-Agent": getua,
+                                "Content-Type": "application/x-www-form-urlencoded",
+                                "Origin": url.rstrip("/"),
+                                "Referer": url.rstrip("/") + "/",
+                                "Accept": "*/*",
+                            },
+                            data="",
+                            timeout=18,
+                            follow_redirects=False,
+                        )
+                        post_sc = getattr(ch_post, "status_code", 0)
+                        if post_sc in (301, 302, 303, 307, 308):
+                            loc = (getattr(ch_post, "headers", None) or {}).get("location") or (getattr(ch_post, "headers", None) or {}).get("Location") or ""
+                            if loc:
+                                if not loc.startswith("http"):
+                                    loc = urljoin(url.rstrip("/") + "/", loc)
+                                get_final = await session.get(loc, headers=checkout_headers, follow_redirects=True, timeout=22)
+                                if getattr(get_final, "status_code", 0) == 200 and getattr(get_final, "text", None):
+                                    final_text = (get_final.text or "").strip()
+                                    if len(final_text) > 5000 and "serialized-sessionToken" in final_text:
+                                        checkout_text = final_text
+                                        checkout_lower = checkout_text.lower()
+                                        x_checkout_one_session_token = _extract_session_token(checkout_text) or x_checkout_one_session_token
+                                        robust2 = _extract_checkout_tokens_robust(checkout_text)
+                                        if not x_checkout_one_session_token:
+                                            x_checkout_one_session_token = robust2.get("session_token")
+                                        if not token:
+                                            token = robust2.get("source_token")
+                                        if not queue_token:
+                                            queue_token = robust2.get("queue_token")
+                                        if not stable_id:
+                                            stable_id = robust2.get("stable_id")
+                                        if not paymentMethodIdentifier:
+                                            paymentMethodIdentifier = _capture_multi(checkout_text, ('paymentMethodIdentifier&quot;:&quot;', '&quot;'), ('paymentMethodIdentifier":"', '"')) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot;")
+                                        logger.info(f"Checkout tokens via last-resort diagnostic flow for {url}")
+                except Exception:
+                    pass
+
             missing = []
             if not x_checkout_one_session_token:
                 missing.append("session_token")
