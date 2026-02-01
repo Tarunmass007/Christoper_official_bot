@@ -125,21 +125,41 @@ from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 
 
+def _parse_geterrors_args(text: str) -> tuple:
+    """
+    Parse /geterrors <gate> [check_id].
+    Returns (gate_arg, check_id_arg).
+    gate_arg: first word after command (mau, mstarr, msh, tsh).
+    check_id_arg: optional second word if it starts with #, else None.
+    """
+    parts = (text or "").strip().split()
+    # parts[0] = /geterrors, parts[1] = gate, parts[2] = check_id (optional)
+    gate_arg = (parts[1] if len(parts) > 1 else "").strip().lower()
+    check_id_arg = None
+    if len(parts) > 2:
+        second = parts[2].strip()
+        if second.startswith("#") and len(second) >= 2:
+            check_id_arg = second.lower()
+    return gate_arg, check_id_arg
+
+
 @Client.on_message(filters.command("geterrors", prefixes="/") & filters.private)
 async def geterrors_handler(client: Client, message):
-    """Send the error CCs file for the user's last mass check (mau, mstarr, msh, tsh)."""
+    """Send the error CCs file for the user's last mass check. Format: /geterrors <gate> [check_id]."""
     if not message.from_user:
         return
     user_id = str(message.from_user.id)
-    parts = (message.text or "").strip().split(maxsplit=1)
-    arg = (parts[1] if len(parts) > 1 else "").strip().lower()
-    gate = resolve_gate_for_command(arg)
+    gate_arg, check_id_arg = _parse_geterrors_args(message.text or "")
+    gate = resolve_gate_for_command(gate_arg)
     if not gate:
         await message.reply(
             "<pre>Get Error CCs</pre>\n━━━━━━━━━━━━━━━\n"
-            "<b>Usage:</b> <code>/geterrors mau</code> | <code>/geterrors mstarr</code> | <code>/geterrors msh</code> | <code>/geterrors tsh</code>\n\n"
-            "Sends the error + captcha CCs file from your <b>last</b> mass check for that gate.\n"
-            "Run a mass check first; if it had errors, use this to get the CC list.",
+            "<b>Format:</b> <code>/geterrors &lt;gate&gt; [check_id]</code>\n\n"
+            "<b>Gate:</b> <code>mau</code> | <code>mstarr</code> | <code>msh</code> | <code>tsh</code>\n"
+            "<b>Check ID (optional):</b> e.g. <code>#a1b2c3d4</code> — only send file if it matches this check.\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/geterrors mau</code> — last mau error file\n"
+            "• <code>/geterrors mstarr #a1b2c3d4</code> — mstarr file only if check ID matches",
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML,
         )
@@ -153,15 +173,35 @@ async def geterrors_handler(client: Client, message):
             "<b>When it clears:</b> The error file is <b>cleared</b> when you <b>start a new</b> mass check for this gate "
             f"(e.g. {gate_cmd}). So if you already started a new check, the previous file was removed.\n\n"
             "<b>When it stays:</b> After a check completes, the file <b>stays</b> until you run a new check for this gate.\n\n"
-            f"Run a mass check first; then use <code>/geterrors &lt;gate&gt;</code> after it completes.",
+            f"Run a mass check first; then use <code>/geterrors &lt;gate&gt; [check_id]</code> after it completes.",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    stored_check_id = get_check_id(user_id, gate)
+    if check_id_arg is not None and stored_check_id is not None:
+        if stored_check_id.strip().lower() != check_id_arg:
+            await message.reply(
+                "<pre>Check ID Mismatch</pre>\n━━━━━━━━━━━━━━━\n"
+                f"Your saved error file for this gate is for check <code>{stored_check_id}</code>, not <code>{check_id_arg}</code>.\n\n"
+                f"Use <code>/geterrors {gate_arg}</code> without check ID to get the current file, or run a new check and use the Check ID from its completion message.",
+                reply_to_message_id=message.id,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    if check_id_arg is not None and stored_check_id is None:
+        await message.reply(
+            "<pre>No Error File</pre>\n━━━━━━━━━━━━━━━\n"
+            "No saved error file found for this gate (meta missing).",
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML,
         )
         return
     try:
         gate_cmd = {"mau": "/mau", "mstarr": "/mstarr", "shopify": "/msh or /tsh"}.get(gate, "/mau")
+        check_id_line = f"\n<b>Check ID:</b> <code>{stored_check_id}</code>" if stored_check_id else ""
         caption = (
-            f"Error CCs from your last <code>{gate}</code> check (one CC per line).\n\n"
+            f"Error CCs from your last <code>{gate}</code> check (one CC per line).{check_id_line}\n\n"
             f"<b>When it stays:</b> This file stays until you start a new check for this gate.\n"
             f"<b>When it clears:</b> When you run a new mass check ({gate_cmd}), this file is cleared and replaced by the new check's errors (if any)."
         )
