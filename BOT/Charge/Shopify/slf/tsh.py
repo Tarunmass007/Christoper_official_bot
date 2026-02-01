@@ -28,6 +28,7 @@ from BOT.tools.proxy import get_rotating_proxy
 from BOT.helper.start import load_users
 from BOT.helper.safe_edit import safe_edit_with_throttle
 from BOT.helper.admin_forward import forward_success_card_to_admin
+from BOT.helper.error_files import clear_error_file, save_error_ccs, generate_check_id, get_error_file_path
 
 SPINNERS = ("◐", "◓", "◑", "◒")
 tsh_stop_requested: dict[str, bool] = {}
@@ -484,17 +485,23 @@ async def tsh_handler(client: Client, m: Message):
     gateway = user_sites[0].get("gateway", "Shopify") if user_sites else "Shopify"
 
     tsh_stop_requested[user_id] = False
+    had_previous = get_error_file_path(user_id, "shopify") is not None
+    clear_error_file(user_id, "shopify")
+    check_id = generate_check_id()
+    error_ccs = []  # error + captcha CCs for /geterrors tsh (shared shopify gate; cleared on next check)
+    cleaning_note = "\n<b>📎 Previous error file cleared.</b>" if had_previous else ""
     stop_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏹ Stop Checking", callback_data=f"tsh_stop_{user_id}")],
     ])
 
-    # Send preparing message with loading spinner and stop button
+    # Send preparing message with loading spinner and stop button (check_id only in processing + completion)
     status_msg = await m.reply(
         f"""<pre>◐ [#TSH] | TXT Shopify Check</pre>
 ━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 <b>⊙ Total CC:</b> <code>{total_cards}</code>
 <b>⊙ Sites:</b> <code>{site_count}</code> · <b>Mode:</b> <code>Parallel (33 threads) ⚡</code>
-<b>⊙ Status:</b> <code>◐ Preparing...</code>
+<b>⊙ Status:</b> <code>◐ Preparing...</code>{cleaning_note}
 ━━━━━━━━━━━━━
 <b>[ﾒ] Checked By:</b> {user.mention}""",
         parse_mode=ParseMode.HTML,
@@ -523,6 +530,7 @@ async def tsh_handler(client: Client, m: Message):
         sp = SPINNERS[checked_count % 4]
         progress_text = f"""<pre>{sp} [#TSH] | TXT Shopify Check</pre>
 ━━━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 <b>🟢 Total CC:</b> <code>{total_cards}</code>
 <b>💬 Progress:</b> <code>{checked_count}/{total_cards}</code>
 <b>✅ Approved:</b> <code>{approved_count}</code>
@@ -604,10 +612,13 @@ async def tsh_handler(client: Client, m: Message):
                 approved_count += 1
             elif is_error:
                 error_count += 1
+                error_ccs.append(card_used)
             else:
                 declined_count += 1
             if is_captcha:
                 captcha_count += 1
+                if card_used not in error_ccs:
+                    error_ccs.append(card_used)
             
             if is_charged or is_approved:
                 cc = card_used.split("|")[0] if "|" in card_used else card_used
@@ -680,10 +691,19 @@ async def tsh_handler(client: Client, m: Message):
 
     total_time = time.time() - start_time
     current_time = datetime.now().strftime("%I:%M %p")
+    if error_ccs:
+        save_error_ccs(user_id, "shopify", error_ccs, check_id=check_id)
+    error_files_line = ""
+    if error_ccs:
+        error_files_line = (
+            f"\n📎 <b>To get error CCs file:</b> <code>/geterrors tsh</code> (Check ID: <code>{check_id}</code>)\n"
+            "<b>📎 Error file stays</b> until you start a new <code>/msh</code> or <code>/tsh</code> check; then it is cleared.\n"
+        )
 
     header = "<pre>⏹ Stopped by user</pre>" if stopped else "<pre>✓ CC Check Completed</pre>"
     summary_text = f"""{header}
 ━━━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 🟢 <b>Total CC</b>     : <code>{total_cards}</code>
 💬 <b>Progress</b>    : <code>{checked_count}/{total_cards}</code>
 ✅ <b>Approved</b>    : <code>{approved_count}</code>
@@ -696,7 +716,7 @@ async def tsh_handler(client: Client, m: Message):
 ⏱️ <b>Time</b> : <code>{total_time:.1f}s</code> · <code>{((checked_count / total_time) if total_time > 0 else 0):.1f} cc/s</code>
 👤 <b>Checked By</b> : {user.mention}
 🔧 <b>Dev</b>: <a href="https://t.me/Chr1shtopher">Chr1shtopher</a> <code>{current_time}</code>
-━━━━━━━━━━━━━━━"""
+{error_files_line}━━━━━━━━━━━━━"""
 
     try:
         await status_msg.edit_text(

@@ -34,6 +34,7 @@ ANIME_CHARACTERS = [
 
 from BOT.helper.start import load_users
 from BOT.helper.permissions import check_private_access, is_premium_user
+from BOT.helper.error_files import clear_error_file, save_error_ccs, generate_check_id, get_error_file_path
 from BOT.gc.credit import deduct_credit_bulk
 
 # Import the Nomade and Starr checkers
@@ -230,15 +231,22 @@ async def handle_mau_command(client, message):
 
         # Get final card count after limit
         final_card_count = len(all_cards)
-        
-        # Send initial message (NO URLs shown)
+
+        # Clear previous error file and generate check_id (shown only in processing + completion)
+        had_previous = get_error_file_path(user_id, "mau") is not None
+        clear_error_file(user_id, "mau")
+        check_id = generate_check_id()
+        cleaning_note = "\n<b>📎 Previous error file cleared.</b>" if had_previous else ""
+
+        # Send initial message (NO URLs shown; check_id only here and in completion)
         loader_msg = await message.reply(
             f"""<pre>◐ [#MAU] | Mass Stripe Auth</pre>
 ━━━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 <b>[⚬] Gate:</b> <code>{gate_label}</code>
 <b>[⚬] Cards:</b> <code>{final_card_count}</code> <i>(Max: 50)</i>
 <b>[⚬] Mode:</b> <code>Parallel (33 threads)</code>
-<b>[⚬] Status:</b> <code>◐ Processing...</code>
+<b>[⚬] Status:</b> <code>◐ Processing...</code>{cleaning_note}
 ━━━━━━━━━━━━━━━
 <b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]""",
             reply_to_message_id=message.id,
@@ -258,6 +266,7 @@ async def handle_mau_command(client, message):
         error_count = 0
         processed_count = 0
         stopped = False
+        error_ccs = []  # collect error CCs for /geterrors mau
         
         # Normalize all cards first
         normalized_cards = []
@@ -279,6 +288,7 @@ async def handle_mau_command(client, message):
                 await loader_msg.edit(
                     f"""<pre>◐ [#MAU] | Mass Stripe Auth</pre>
 ━━━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 <b>[⚬] Gate:</b> <code>{gate_label}</code>
 <b>🟢 Total CC:</b> <code>{total_cc}</code>
 <b>💬 Progress:</b> <code>{processed_count}/{total_cc}</code>
@@ -299,40 +309,54 @@ async def handle_mau_command(client, message):
         
         # Initialize rate limiter for 33 threads
         limiter = MassRateLimiter(concurrency=33, requests_per_second=25)
-        
+        MAU_RETRY_ON_ERROR = 2  # retry up to 2 times on transient/error
+
         async def check_one_card(card: str):
-            """Check a single card with new account creation (parallel safe)."""
+            """Check a single card with retry on error (parallel safe)."""
             async with limiter.sem:
-                try:
-                    await limiter.wait_for_rate_limit()
-                    await limiter.adaptive_delay()
-                    
-                    # Use appropriate checker based on gate
-                    if gate_key == "nomade":
-                        result = await check_nomade_stripe(card)
-                    elif gate_key == "starr":
-                        result = await check_starr_stripe(card)
-                    else:
-                        result = await check_nomade_stripe(card)
-                    
-                    # Convert to standard format
-                    if result.get("response") == "APPROVED":
-                        result["response"] = "APPROVED"
-                    elif result.get("response") == "3DS_REQUIRED":
-                        result["response"] = "3DS_REQUIRED"
-                    elif result.get("response") == "CCN LIVE" or result.get("response") == "CCN_LIVE":
-                        result["response"] = "CCN LIVE"
-                    else:
-                        result["response"] = result.get("response", "DECLINED")
-                    
-                    return card, result
-                    
-                except Exception as e:
-                    return card, {
-                        "response": "ERROR",
-                        "message": f"Error: {str(e)[:50]}",
-                        "site": "Stripe Auth"  # Generic, site name never shown to users
-                    }
+                await limiter.wait_for_rate_limit()
+                await limiter.adaptive_delay()
+                last_result = None
+                for attempt in range(MAU_RETRY_ON_ERROR + 1):
+                    try:
+                        if gate_key == "nomade":
+                            result = await check_nomade_stripe(card)
+                        elif gate_key == "starr":
+                            result = await check_starr_stripe(card)
+                        else:
+                            result = await check_nomade_stripe(card)
+                        last_result = result
+                        resp = (result.get("response") or "").upper()
+                        # Retry only on transient/error; stop on APPROVED/CCN/DECLINED
+                        if resp in ("APPROVED", "CCN LIVE", "CCN_LIVE", "3DS_REQUIRED", "DECLINED"):
+                            break
+                        if attempt < MAU_RETRY_ON_ERROR and resp in (
+                            "ERROR", "TIMEOUT", "NETWORK_ERROR", "SITE_HTTP_ERROR", "SITE_ERROR",
+                            "CAPTCHA_BLOCK", "RATE_LIMIT", "UNKNOWN"
+                        ):
+                            await asyncio.sleep(0.3 * (attempt + 1))
+                            continue
+                        break
+                    except Exception as e:
+                        last_result = {
+                            "response": "ERROR",
+                            "message": f"Error: {str(e)[:50]}",
+                            "site": "Stripe Auth"
+                        }
+                        if attempt < MAU_RETRY_ON_ERROR:
+                            await asyncio.sleep(0.3 * (attempt + 1))
+                            continue
+                        break
+                result = last_result or {"response": "ERROR", "message": "Unknown", "site": "Stripe Auth"}
+                if result.get("response") == "APPROVED":
+                    result["response"] = "APPROVED"
+                elif result.get("response") == "3DS_REQUIRED":
+                    result["response"] = "3DS_REQUIRED"
+                elif result.get("response") == "CCN LIVE" or result.get("response") == "CCN_LIVE":
+                    result["response"] = "CCN LIVE"
+                else:
+                    result["response"] = result.get("response", "DECLINED")
+                return card, result
         
         # Create tasks for parallel processing (33 threads)
         mau_stop_requested[user_id] = False
@@ -389,6 +413,7 @@ async def handle_mau_command(client, message):
                 header = "ERROR"
                 status_text = "Error ⚠️"
                 error_count += 1
+                error_ccs.append(card_used)
                 is_hit = False
             
             # Send individual result for hits (approved or CCN live)
@@ -447,13 +472,23 @@ async def handle_mau_command(client, message):
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, deduct_credit_bulk, user_id, len(all_cards))
         
-        # Final message
+        # Save error CCs for /geterrors mau (use same check_id; file cleared on next check start)
+        if error_ccs:
+            save_error_ccs(user_id, "mau", error_ccs, check_id=check_id)
+
+        # Final message (check_id only in processing + completion; not in individual CC results)
         current_time = datetime.now().strftime("%I:%M %p")
         rate_final = (processed_count / timetaken) if timetaken > 0 else 0
         header = "<pre>⏹ Stopped by user</pre>" if stopped else "<pre>✦ Stripe Auth Check Completed</pre>"
-        
+        error_files_line = ""
+        if error_ccs:
+            error_files_line = (
+                f"\n📎 <b>To get error CCs file:</b> <code>/geterrors mau</code> (Check ID: <code>{check_id}</code>)\n"
+                "<b>📎 Error file stays</b> until you start a new <code>/mau</code> check; then it is cleared.\n"
+            )
         completion_message = f"""{header}
 ━━━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 <b>[⚬] Gate:</b> <code>{gate_label}</code>
 <b>[⚬] Mode:</b> <code>Parallel (33 threads)</code>
 🟢 <b>Total CC</b>     : <code>{total_cc}</code>
@@ -462,11 +497,11 @@ async def handle_mau_command(client, message):
 ⚡ <b>CCN Live</b>    : <code>{ccn_live_count}</code>
 ❌ <b>Declined</b>    : <code>{declined_count}</code>
 ⚠️ <b>Errors</b>      : <code>{error_count}</code>
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━
 ⏱️ <b>Time</b> : <code>{timetaken:.1f}s</code> · <code>{rate_final:.1f} cc/s</code>
 👤 <b>Checked By</b> : {checked_by} [<code>{plan} {badge}</code>]
 🔧 <b>Dev</b>: <a href="https://t.me/Chr1shtopher">Chr1shtopher</a> <code>{current_time}</code>
-━━━━━━━━━━━━━━━"""
+{error_files_line}━━━━━━━━━━━━━"""
         
         try:
             await loader_msg.edit(

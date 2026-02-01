@@ -17,6 +17,7 @@ from pyrogram.enums import ParseMode
 
 from BOT.helper.start import load_users
 from BOT.helper.permissions import check_private_access, is_premium_user
+from BOT.helper.error_files import clear_error_file, save_error_ccs, generate_check_id, get_error_file_path
 from BOT.gc.credit import deduct_credit_bulk, has_credits
 from BOT.db.store import get_stripe_auth_sites
 from BOT.tools.proxy import get_rotating_proxy
@@ -147,8 +148,14 @@ async def handle_mstarr_command(client: Client, message):
         max_concurrent = min(len(sites_list) * CONCURRENCY_PER_SITE, total)
         semaphore = asyncio.Semaphore(max_concurrent)
         site_label = f"{len(sites_list)} site(s)" if len(sites_list) > 1 else (sites_list[0][:35] if sites_list else "")
+        had_previous = get_error_file_path(user_id, "mstarr") is not None
+        clear_error_file(user_id, "mstarr")
+        check_id = generate_check_id()
+        error_ccs = []
+        cleaning_note = "\n<b>📎 Previous error file cleared.</b>" if had_previous else ""
+
         status_msg = await message.reply(
-            f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Sites:</b> <code>{site_label}...</code>\n<b>Threads:</b> <code>{max_concurrent}</code>\n<b>Status:</b> <i>Processing...</i>",
+            f"<pre>Stripe Auto Mass ◐</pre>\n<b>[⚬] Check ID:</b> <code>{check_id}</code>\n<b>Cards:</b> <code>{total}</code>\n<b>Sites:</b> <code>{site_label}...</code>\n<b>Threads:</b> <code>{max_concurrent}</code>\n<b>Status:</b> <i>Processing...</i>{cleaning_note}",
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML,
         )
@@ -216,7 +223,7 @@ async def handle_mstarr_command(client: Client, message):
                 if done_count % 5 == 0 or done_count == total:
                     try:
                         await status_msg.edit_text(
-                            f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Done:</b> <code>{done_count}/{total}</code>\n<b>✅ Approved:</b> <code>{approved_count}</code> <b>⚡ CCN:</b> <code>{ccn_count}</code>\n<b>Status:</b> <i>Processing...</i>",
+                            f"<pre>Stripe Auto Mass ◐</pre>\n<b>[⚬] Check ID:</b> <code>{check_id}</code>\n<b>Cards:</b> <code>{total}</code>\n<b>Done:</b> <code>{done_count}/{total}</code>\n<b>✅ Approved:</b> <code>{approved_count}</code> <b>⚡ CCN:</b> <code>{ccn_count}</code>\n<b>Status:</b> <i>Processing...</i>",
                             parse_mode=ParseMode.HTML,
                         )
                     except Exception:
@@ -229,6 +236,8 @@ async def handle_mstarr_command(client: Client, message):
                 ccn_count += 1
             elif status == "DECLINED":
                 declined_count += 1
+            else:
+                error_ccs.append(card)
             if status in ("APPROVED", "CCN LIVE"):
                 try:
                     hit_message = build_hit_message(card, status, res)
@@ -238,7 +247,7 @@ async def handle_mstarr_command(client: Client, message):
             if done_count % 5 == 0 or done_count == total:
                 try:
                     await status_msg.edit_text(
-                        f"<pre>Stripe Auto Mass ◐</pre>\n<b>Cards:</b> <code>{total}</code>\n<b>Done:</b> <code>{done_count}/{total}</code>\n<b>✅ Approved:</b> <code>{approved_count}</code> <b>⚡ CCN:</b> <code>{ccn_count}</code>\n<b>Status:</b> <i>Processing...</i>",
+                        f"<pre>Stripe Auto Mass ◐</pre>\n<b>[⚬] Check ID:</b> <code>{check_id}</code>\n<b>Cards:</b> <code>{total}</code>\n<b>Done:</b> <code>{done_count}/{total}</code>\n<b>✅ Approved:</b> <code>{approved_count}</code> <b>⚡ CCN:</b> <code>{ccn_count}</code>\n<b>Status:</b> <i>Processing...</i>",
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
@@ -247,9 +256,18 @@ async def handle_mstarr_command(client: Client, message):
         time_taken = round(time() - start_time, 2)
         err_count = total - approved_count - ccn_count - declined_count
         current_time = datetime.now().strftime("%I:%M %p")
+        if error_ccs:
+            save_error_ccs(user_id, "mstarr", error_ccs, check_id=check_id)
+        error_files_line = ""
+        if error_ccs:
+            error_files_line = (
+                f"\n📎 <b>To get error CCs file:</b> <code>/geterrors mstarr</code> (Check ID: <code>{check_id}</code>)\n"
+                "<b>📎 Error file stays</b> until you start a new <code>/mstarr</code> check; then it is cleared.\n"
+            )
 
         completion_message = f"""<pre>✦ Stripe Auto Check Completed</pre>
 ━━━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 🟢 <b>Total CC</b>     : <code>{total}</code>
 💬 <b>Progress</b>    : <code>{done_count}/{total}</code>
 ✅ <b>Approved</b>    : <code>{approved_count}</code>
@@ -260,7 +278,7 @@ async def handle_mstarr_command(client: Client, message):
 ⏱️ <b>Time Elapsed</b> : <code>{time_taken}s</code>
 👤 <b>Checked By</b> : {checked_by} [<code>{plan} {badge}</code>]
 🔧 <b>Dev</b>: <a href="https://t.me/Chr1shtopher">Chr1shtopher</a> <code>{current_time}</code>
-━━━━━━━━━━━━━"""
+{error_files_line}━━━━━━━━━━━━━"""
 
         await status_msg.edit_text(
             completion_message,

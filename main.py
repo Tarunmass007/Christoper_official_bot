@@ -107,6 +107,7 @@ async def run_bot():
         BotCommand("murl", "Add Stripe Auto Auth sites (mass)"),
         BotCommand("starr", "Stripe Auto Auth check (reply to CC)"),
         BotCommand("mstarr", "Stripe Auto Auth mass check"),
+        BotCommand("geterrors", "Get error CCs file (mau|mstarr|msh|tsh)"),
         BotCommand("mysite", "View your current site"),
         BotCommand("mystarrsite", "View Stripe Auto Auth site"),
         BotCommand("swurls", "List all Stripe Auth sites (rotation)"),
