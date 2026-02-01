@@ -31,6 +31,8 @@ def is_facility_owner(user_id: int) -> bool:
     return user.get("facility_owner", False)
 
 async def notify_user_plan_activated(app, user_id: str, plan_name: str):
+    from BOT.plans.plan_config import PLAN_DETAILS
+
     users = load_users()
     user = users.get(str(user_id))
     if not user:
@@ -40,27 +42,26 @@ async def notify_user_plan_activated(app, user_id: str, plan_name: str):
     activated_at = plan.get("activated_at", "N/A")
     expires_at = plan.get("expires_at", "N/A")
     antispam = plan.get("antispam", "N/A")
-    mlimit = plan.get("mlimit", "N/A")
+    mlimit = plan.get("mlimit")
+    mlimit_display = "Unlimited" if mlimit is None else str(mlimit)
     badge = plan.get("badge", "❓")
 
-    # Example prices — customize as needed
-    plan_prices = {
-        "Plus": "$1",
-        "Pro": "$6",
-        "Elite": "$9",
-        "VIP": "$15"
-    }
+    details = PLAN_DETAILS.get(plan_name, {})
+    price = details.get("price", "N/A")
+    features_list = "\n".join([f"  • {f}" for f in details.get("features", [])])
 
     await app.send_message(
         int(user_id),
         f"""<pre>✅ Plan Activated Successfully</pre>
-<b>• Plan:</b> <code>{plan_name}</code>
-<b>• Price:</b> <code>{plan_prices.get(plan_name, '₹0')}</code>
+<b>• Plan:</b> {badge} <code>{plan_name}</code>
+<b>• Price:</b> <code>{price}</code>
 <b>• Activated At:</b> <code>{activated_at}</code>
 <b>• Expires At:</b> <code>{expires_at}</code>
 <b>• Anti-Spam:</b> <code>{antispam}s</code>
-<b>• Mass Limit:</b> <code>{mlimit}</code>
+<b>• Mass Limit:</b> <code>{mlimit_display}</code>
 <b>• Badge:</b> {badge}
+<b>• Features:</b>
+{features_list or '  • As per plan'}
 
 🎉 Thank you for choosing our premium service.
 Use <code>/info</code> anytime to check your current status.

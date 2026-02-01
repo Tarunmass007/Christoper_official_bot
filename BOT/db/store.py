@@ -293,6 +293,78 @@ def deduct_credit_bulk(user_id: str, amount: int) -> tuple[bool, str]:
         return False, "Error during bulk deduction."
 
 
+def resolve_user_id(identifier: str) -> Optional[str]:
+    """
+    Resolve username or user_id to user_id. Returns user_id if found, else None.
+    identifier: numeric string (user_id), or @username, or username (no @).
+    """
+    if not identifier:
+        return None
+    identifier = str(identifier).strip().lstrip("@")
+    users = load_users()
+    if not users:
+        return None
+    if identifier.isdigit():
+        return identifier if identifier in users else None
+    want = identifier.lower()
+    for uid, doc in users.items():
+        uname = doc.get("username")
+        if uname is None:
+            continue
+        if str(uname).strip().lower() == want:
+            return uid
+    return None
+
+
+def add_credits(user_id: str, amount: int) -> tuple[bool, str]:
+    """
+    Add credits to a user's plan. Same storage as plans (MongoDB or JSON).
+    Returns (success, message). Does not reduce below 0; owner's ∞ stays ∞.
+    """
+    if amount <= 0:
+        return False, "Amount must be a positive number."
+    uid = str(user_id)
+    if _use_mongo():
+        c = _users_coll()
+        try:
+            doc = c.find_one({"_id": uid})
+            if not doc:
+                return False, "User not found."
+            credits = doc.get("plan", {}).get("credits", 0)
+            if isinstance(credits, str) and credits.strip() == "∞":
+                return True, "Owner has infinite credits; no change applied."
+            try:
+                n = int(credits)
+            except Exception:
+                n = 0
+            new_val = n + amount
+            c.update_one({"_id": uid}, {"$set": {"plan.credits": str(new_val)}})
+            return True, f"Added {amount} credits. New balance: {new_val}."
+        except Exception as e:
+            print(f"[add_credits error] {e}")
+            return False, "Failed to add credits."
+    try:
+        users = load_users()
+        u = users.get(uid)
+        if not u:
+            return False, "User not found."
+        credits = u.get("plan", {}).get("credits", 0)
+        if isinstance(credits, str) and credits.strip() == "∞":
+            return True, "Owner has infinite credits; no change applied."
+        try:
+            n = int(credits)
+        except Exception:
+            n = 0
+        new_val = n + amount
+        u["plan"]["credits"] = str(new_val)
+        users[uid] = u
+        save_users(users)
+        return True, f"Added {amount} credits. New balance: {new_val}."
+    except Exception as e:
+        print(f"[add_credits error] {e}")
+        return False, "Failed to add credits."
+
+
 # ---------------------------------------------------------------------------
 # Proxies
 # ---------------------------------------------------------------------------

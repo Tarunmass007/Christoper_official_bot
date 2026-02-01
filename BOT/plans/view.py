@@ -5,97 +5,10 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 from datetime import datetime
 import asyncio
 from BOT.helper.start import load_owner_id, get_ist_time
+from BOT.plans.plan_config import PLAN_DETAILS
 
 PLAN_REQUESTS_FILE = "DATA/plan_requests.json"
 request_lock = asyncio.Lock()
-
-# Plan details with pricing and features
-PLAN_DETAILS = {
-    "Plus": {
-        "price": "$1",
-        "badge": "💠",
-        "credits": 200,
-        "antispam": 13,
-        "mlimit": 5,
-        "duration": "1 Day",
-        "features": [
-            "200 Credits",
-            "13s Anti-Spam",
-            "5 Mass Limit",
-            "All Gates Access",
-            "Priority Support"
-        ]
-    },
-    "Pro": {
-        "price": "$6",
-        "badge": "🔰",
-        "credits": 500,
-        "antispam": 10,
-        "mlimit": 10,
-        "duration": "7 Days",
-        "features": [
-            "500 Credits",
-            "10s Anti-Spam",
-            "10 Mass Limit",
-            "All Gates Access",
-            "Premium Support",
-            "Private Mode"
-        ]
-    },
-    "Elite": {
-        "price": "$9",
-        "badge": "🔷",
-        "credits": 800,
-        "antispam": 8,
-        "mlimit": 15,
-        "duration": "15 Days",
-        "features": [
-            "800 Credits",
-            "8s Anti-Spam",
-            "15 Mass Limit",
-            "All Gates Access",
-            "VIP Support",
-            "Private Mode",
-            "Custom Requests"
-        ]
-    },
-    "VIP": {
-        "price": "$15",
-        "badge": "👑",
-        "credits": 1500,
-        "antispam": 5,
-        "mlimit": "Unlimited",
-        "duration": "30 Days",
-        "features": [
-            "1500 Credits",
-            "5s Anti-Spam",
-            "Unlimited Mass Limit",
-            "All Gates Access",
-            "24/7 VIP Support",
-            "Private Mode",
-            "Custom Gates",
-            "Priority Processing"
-        ]
-    },
-    "Ultimate": {
-        "price": "$25",
-        "badge": "👑",
-        "credits": "∞",
-        "antispam": 3,
-        "mlimit": 50,
-        "duration": "60 Days",
-        "features": [
-            "Unlimited Credits",
-            "3s Anti-Spam",
-            "50 Mass Limit",
-            "All Gates Access",
-            "Dedicated Support",
-            "Private Mode",
-            "Custom Everything",
-            "API Access"
-        ]
-    }
-}
 
 def load_plan_requests():
     """Load plan requests from JSON file"""
@@ -161,21 +74,90 @@ Use <code>/requestplan [plan_name]</code> to request a plan.
             InlineKeyboardButton("Request VIP", callback_data="request_VIP")
         ],
     ]
-    
-    # Only show Ultimate button to owner
     if is_owner:
         keyboard_buttons.append([
             InlineKeyboardButton("Request Ultimate", callback_data="request_Ultimate")
         ])
-    
     keyboard_buttons.append([
         InlineKeyboardButton("My Requests", callback_data="my_requests"),
         InlineKeyboardButton("Close", callback_data="close_plans")
     ])
-    
     keyboard = InlineKeyboardMarkup(keyboard_buttons)
-
     await message.reply(plans_text, reply_markup=keyboard)
+
+
+@Client.on_message(filters.command("addcredits", prefixes="/") & filters.private)
+async def addcredits_command(client: Client, message: Message):
+    """Admin only: add credits to a user. Format: /addcredits <username|userid> <amount>"""
+    from BOT.db.store import load_owner_id, resolve_user_id, add_credits, get_user
+
+    OWNER_ID = load_owner_id()
+    if not message.from_user or str(message.from_user.id) != str(OWNER_ID):
+        await message.reply(
+            "<pre>⛔ Access Denied</pre>\nThis command is only available to the owner.",
+            reply_to_message_id=message.id,
+            parse_mode="HTML",
+        )
+        return
+    parts = (message.text or "").strip().split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply(
+            "<pre>Add Credits (Admin)</pre>\n━━━━━━━━━━━━━━━\n"
+            "<b>Usage:</b> <code>/addcredits &lt;username|userid&gt; &lt;amount&gt;</code>\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/addcredits 123456789 100</code>\n"
+            "• <code>/addcredits @johndoe 50</code>\n\n"
+            "Credits are added to the user's plan and reflected in DB (same as plans).",
+            reply_to_message_id=message.id,
+            parse_mode="HTML",
+        )
+        return
+    identifier = parts[1].strip()
+    try:
+        amount = int(parts[2].strip())
+    except ValueError:
+        await message.reply(
+            "❌ <b>Invalid amount.</b> Use a positive integer (e.g. <code>100</code>).",
+            reply_to_message_id=message.id,
+            parse_mode="HTML",
+        )
+        return
+    if amount <= 0:
+        await message.reply(
+            "❌ <b>Amount must be positive.</b>",
+            reply_to_message_id=message.id,
+            parse_mode="HTML",
+        )
+        return
+    user_id = resolve_user_id(identifier)
+    if not user_id:
+        await message.reply(
+            f"❌ User not found for <code>{identifier}</code>. User must be registered; use user ID or @username.",
+            reply_to_message_id=message.id,
+            parse_mode="HTML",
+        )
+        return
+    success, msg = add_credits(user_id, amount)
+    user_data = get_user(user_id)
+    name = (user_data or {}).get("first_name", "N/A")
+    username = (user_data or {}).get("username")
+    username_str = f"@{username}" if username else "N/A"
+    if success:
+        await message.reply(
+            f"<pre>✅ Credits Added</pre>\n━━━━━━━━━━━━━━━\n"
+            f"<b>User:</b> <code>{name}</code> ({username_str})\n"
+            f"<b>User ID:</b> <code>{user_id}</code>\n"
+            f"<b>Result:</b> {msg}\n━━━━━━━━━━━━━━━",
+            reply_to_message_id=message.id,
+            parse_mode="HTML",
+        )
+    else:
+        await message.reply(
+            f"❌ <b>Failed</b>: {msg}",
+            reply_to_message_id=message.id,
+            parse_mode="HTML",
+        )
+
 
 @Client.on_message(filters.command("requestplan") & (filters.private | filters.group))
 async def request_plan_command(client: Client, message: Message):

@@ -3,17 +3,19 @@ import asyncio
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from BOT.helper.start import USERS_FILE, load_users, save_users, load_owner_id, user_lock
+from BOT.plans.plan_config import PLAN_DETAILS
 
 PLAN_NAME = "Pro"
-PLAN_PRICE = "$3"
-PLAN_BADGE = "🔰"
+_cfg = PLAN_DETAILS.get(PLAN_NAME, {})
+PLAN_PRICE = _cfg.get("price", "$6")
+PLAN_BADGE = _cfg.get("badge", "🔰")
 DEFAULT_BADGE = "🧿"
 DEFAULT_ANTISPAM = 15
 DEFAULT_MLIMIT = 5
-PRO_ANTISPAM = 7
-PRO_MLIMIT = 7
-PRO_CREDIT_BONUS = 500
-EXPIRY_SECONDS = 604800
+PRO_ANTISPAM = _cfg.get("antispam", 10)
+PRO_MLIMIT = _cfg.get("mlimit", 10)
+PRO_CREDIT_BONUS = _cfg.get("credits", 500)
+EXPIRY_SECONDS = 86400 * _cfg.get("duration_days", 7)
 
 OWNER_ID = load_owner_id()
 

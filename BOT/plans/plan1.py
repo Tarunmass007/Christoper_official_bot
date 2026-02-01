@@ -3,17 +3,19 @@ import asyncio
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from BOT.helper.start import USERS_FILE, load_users, save_users, load_owner_id, user_lock
+from BOT.plans.plan_config import PLAN_DETAILS
 
 PLAN_NAME = "Plus"
-PLAN_PRICE = "$1"
-PLAN_BADGE = "💠"
+_cfg = PLAN_DETAILS.get(PLAN_NAME, {})
+PLAN_PRICE = _cfg.get("price", "$1")
+PLAN_BADGE = _cfg.get("badge", "💠")
 DEFAULT_BADGE = "🧿"
 DEFAULT_ANTISPAM = 15
 DEFAULT_MLIMIT = 5
-PLUS_ANTISPAM = 13
-PLUS_CREDIT_BONUS = 200
-PLUS_MLIMIT = 5 # Assuming default mlimit for Plus if not specified, keeping usage consistent
-EXPIRY_SECONDS = 86400
+PLUS_ANTISPAM = _cfg.get("antispam", 13)
+PLUS_CREDIT_BONUS = _cfg.get("credits", 200)
+PLUS_MLIMIT = _cfg.get("mlimit", 5)
+EXPIRY_SECONDS = 86400 * _cfg.get("duration_days", 1)
 
 OWNER_ID = load_owner_id()
 
@@ -50,6 +52,7 @@ async def activate_plus_plan(user_id: str):
             "activated_at": now,
             "expires_at": expires_at,
             "antispam": PLUS_ANTISPAM,
+            "mlimit": PLUS_MLIMIT,
             "badge": PLAN_BADGE,
             "credits": new_credits,
             "private": "on"

@@ -46,6 +46,8 @@ from BOT.db.store import (
     deduct_credit,
     has_credits,
     deduct_credit_bulk,
+    add_credits,
+    resolve_user_id,
 )
 
 __all__ = [
@@ -89,4 +91,6 @@ __all__ = [
     "deduct_credit",
     "has_credits",
     "deduct_credit_bulk",
+    "add_credits",
+    "resolve_user_id",
 ]
