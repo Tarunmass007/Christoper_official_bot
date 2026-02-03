@@ -34,6 +34,9 @@ from BOT.Charge.Shopify.slf.api import autoshopify_with_captcha_retry
 from BOT.tools.proxy import get_rotating_proxy
 from BOT.helper.start import load_users
 
+# Railway low-product API (same as gate) - used first for addurl/txturl to support digital/low-price products
+LOW_PRODUCT_API_BASE = "https://shopify-api-new-production.up.railway.app"
+
 try:
     import cloudscraper
     HAS_CLOUDSCRAPER = True
@@ -301,6 +304,81 @@ def find_lowest_variant_from_products(products: List[Dict]) -> Optional[Dict]:
     return None
 
 
+def _fetch_low_product_api_sync(domain: str, proxy: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Sync fetch from Railway API https://shopify-api-new-production.up.railway.app/<domain>
+    Returns parsed dict with variant id, price, requires_shipping, etc. or None.
+    Used by addurl/txturl so digital/low-price products (e.g. $1) are accepted.
+    """
+    if not domain or not str(domain).strip():
+        return None
+    domain = str(domain).strip().lower()
+    if "://" in domain:
+        domain = urlparse(f"//{domain}").netloc or domain
+    domain = (domain or "").split("/")[0]
+    domains_to_try = [domain]
+    if domain.startswith("www."):
+        domains_to_try.append(domain[4:])
+    else:
+        domains_to_try.append("www." + domain)
+    for _domain in domains_to_try:
+        try:
+            api_url = f"{LOW_PRODUCT_API_BASE}/{_domain}"
+            if HAS_CLOUDSCRAPER:
+                scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+                proxies = {"http": proxy, "https": proxy} if proxy and str(proxy).strip() else None
+                r = scraper.get(api_url, timeout=20, proxies=proxies)
+            else:
+                import urllib.request
+                req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/80.0.3987.149 Safari/537.36"})
+                r = urllib.request.urlopen(req, timeout=20)
+                class R:
+                    status_code = r.status if hasattr(r, 'status') else 200
+                    text = r.read().decode("utf-8", errors="ignore")
+                r = R
+            if getattr(r, "status_code", 0) != 200:
+                continue
+            text = (getattr(r, "text", None) or "").strip()
+            if not text or text.startswith("<"):
+                continue
+            data = json.loads(text)
+            if not isinstance(data, dict) or not data.get("success"):
+                continue
+            variant = data.get("variant")
+            pricing = data.get("pricing")
+            product = data.get("product")
+            location = data.get("location")
+            if not isinstance(variant, dict) or variant.get("id") is None:
+                continue
+            variant_id = int(variant["id"]) if isinstance(variant.get("id"), (int, float)) else None
+            if variant_id is None:
+                try:
+                    variant_id = int(variant["id"])
+                except (TypeError, ValueError):
+                    continue
+            price_val = None
+            if isinstance(pricing, dict):
+                try:
+                    price_val = float(pricing.get("price", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+            price_val = price_val if price_val is not None else 0.0
+            if price_val > 25.0:
+                continue
+            return {
+                "variantid": variant_id,
+                "price": price_val,
+                "requires_shipping": variant.get("requires_shipping", False),
+                "formatted_price": (pricing or {}).get("formatted_price", f"${price_val:.2f}"),
+                "currency_code": (pricing or {}).get("currency_code", "USD"),
+                "country_code": (location or {}).get("country_code", "US"),
+                "product_title": (product or {}).get("title", "N/A")[:50] if isinstance(product, dict) else "N/A",
+            }
+        except Exception:
+            continue
+    return None
+
+
 async def validate_and_parse_site(
     url: str,
     session: TLSAsyncSession,
@@ -308,7 +386,8 @@ async def validate_and_parse_site(
 ) -> Dict[str, Any]:
     """
     Validate if a URL is a working Shopify store and parse lowest product.
-    Uses robust validation and cloudscraper fallback for stickerdad.com and protected stores.
+    Uses Railway API first (https://shopify-api-new-production.up.railway.app/<domain>) so digital
+    and low-price products (e.g. $1) work for stickerdad.com and similar. Fallback: products.json.
     """
     result = {
         "valid": False,
@@ -324,8 +403,24 @@ async def validate_and_parse_site(
     try:
         normalized_url = normalize_url(url)
         result["url"] = normalized_url
+        domain = urlparse(normalized_url).netloc or normalized_url.replace("https://", "").replace("http://", "").split("/")[0]
+        # 1) Try Railway low-product API first (supports digital/low-price products, stickerdad.com etc.)
+        try:
+            api_result = await asyncio.to_thread(_fetch_low_product_api_sync, domain, proxy)
+            if api_result and api_result.get("variantid") is not None:
+                price_val = api_result.get("price", 0) or 0
+                if price_val <= 25.0:
+                    result["valid"] = True
+                    result["product_id"] = api_result["variantid"]
+                    result["product_title"] = api_result.get("product_title", "N/A")
+                    result["price"] = f"{price_val:.2f}"
+                    result["formatted_price"] = api_result.get("formatted_price") or f"${price_val:.2f}"
+                    result["currency"] = api_result.get("currency_code") or "USD"
+                    return result
+        except Exception:
+            pass
+        # 2) Fallback: products.json
         products = await fetch_products_json(session, normalized_url, proxy)
-        # Enhanced: one more cloudscraper attempt when session fetch returned no products (stickerdad.com etc.)
         if not products and HAS_CLOUDSCRAPER:
             try:
                 products = await asyncio.to_thread(

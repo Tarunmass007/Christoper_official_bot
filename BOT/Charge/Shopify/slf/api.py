@@ -1025,6 +1025,14 @@ async def autoshopify(url, card, session, proxy=None):
                             logger.info(f"✅ Non-shipping checkout via GET /checkout fallback for {url} (len=%s)", len(checkout_text))
                     except Exception as e:
                         logger.debug(f"Non-shipping GET /checkout fallback failed: {e}")
+                if not checkout_text and checkout_url and HAS_CLOUDSCRAPER:
+                    try:
+                        cs_sc, cs_text = await asyncio.to_thread(_fetch_checkout_cloudscraper_sync, checkout_url, proxy)
+                        if cs_sc == 200 and cs_text and len(cs_text) > 1500:
+                            checkout_text = cs_text
+                            logger.info(f"✅ Non-shipping checkout via cloudscraper (no page) for {url} (len=%s)", len(checkout_text))
+                    except Exception as e:
+                        logger.debug(f"Cloudscraper for checkout_url (no page) failed: {e}")
                 if not checkout_text:
                     # Include diagnostic: GET after redirect status and body length
                     diag = f"post_sc={post_sc}"
@@ -1036,6 +1044,15 @@ async def autoshopify(url, card, session, proxy=None):
                     output.update({"Response": f"CHECKOUT_NON_SHIPPING_NO_PAGE ({diag})", "Status": False})
                     _log_output_to_terminal(output)
                     return output
+                # If checkout page has no tokens (e.g. stickerdad.com loading/captcha), try cloudscraper once
+                if checkout_text and "serialized-sessionToken" not in checkout_text and "serialized-sourceToken" not in checkout_text and HAS_CLOUDSCRAPER and checkout_url:
+                    try:
+                        cs_sc, cs_text = await asyncio.to_thread(_fetch_checkout_cloudscraper_sync, checkout_url, proxy)
+                        if cs_sc == 200 and cs_text and len(cs_text) > 2000 and ("serialized-sessionToken" in cs_text or "serialized-sourceToken" in cs_text):
+                            checkout_text = cs_text
+                            logger.info(f"✅ Non-shipping checkout page via cloudscraper for {url} (len=%s)", len(checkout_text))
+                    except Exception as e:
+                        logger.debug(f"Non-shipping cloudscraper fallback failed: {e}")
                 # Define for rest of function (trace, retries, token extraction)
                 checkout_headers = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": getua}
                 get_params = {"skip_shop_pay": "true"} if (checkout_url and "skip_shop_pay" not in checkout_url) else None
