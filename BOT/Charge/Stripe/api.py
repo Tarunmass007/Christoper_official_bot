@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 executor = ThreadPoolExecutor(max_workers=10)
 
+# Balliante store API only. Worker gate is in worker_api.py.
+
 DELAY_BETWEEN_REQUESTS = 2
 DELAY_RANDOM_RANGE = 1
 

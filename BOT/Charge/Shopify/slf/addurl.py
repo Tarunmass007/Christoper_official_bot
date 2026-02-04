@@ -622,11 +622,20 @@ async def add_site_handler(client: Client, message: Message):
             px = str(user_proxy).strip()
             proxy_url = px if px.startswith(("http://", "https://")) else f"http://{px}"
 
+        product_preview = []
+        for s in valid_sites[:3]:
+            name = (s.get("product_title") or "Product")[:40]
+            price = s.get("formatted_price") or f"${s.get('price', 'N/A')}"
+            product_preview.append(f"• {name} — {price}")
+        product_preview_text = "\n".join(product_preview) if product_preview else "—"
         await status_msg.edit_text(
             f"""<pre>🔍 Testing Sites...</pre>
 ━━━━━━━━━━━━━
+<b>📦 Parsed product(s):</b>
+{product_preview_text}
+
 <b>Valid Sites:</b> <code>{len(valid_sites)}</code>
-<b>Status:</b> <i>Running test checkout with bill generation...</i>""",
+<b>Status:</b> <i>Running test checkout (bill generation)...</i>""",
             parse_mode=ParseMode.HTML
         )
 
@@ -657,6 +666,13 @@ async def add_site_handler(client: Client, message: Message):
 
         if not sites_with_receipt:
             time_taken = round(time.time() - start_time, 2)
+            # Build parsed product line(s) for each validated site
+            product_lines = []
+            for s in valid_sites[:5]:
+                name = (s.get("product_title") or "Product")[:45]
+                price = s.get("formatted_price") or f"${s.get('price', 'N/A')}"
+                product_lines.append(f"• <b>{name}</b> — <code>{price}</code>")
+            parsed_block = "\n".join(product_lines) if product_lines else "• <i>No product details</i>"
             error_lines = []
             for s in valid_sites[:5]:
                 err = (s.get("test_error") or "NO_RECEIPT").strip()[:50]
@@ -666,7 +682,10 @@ async def add_site_handler(client: Client, message: Message):
             return await status_msg.edit_text(
                 f"""<pre>No Sites Verified ❌</pre>
 ━━━━━━━━━━━━━
-<b>Gate test did not return receipt/bill.</b>
+<b>📦 Parsed product(s):</b>
+{parsed_block}
+
+<b>💳 Gate test:</b> Did not return receipt/bill.
 (Site has products; test checkout failed.)
 
 <b>Gate Errors:</b>
