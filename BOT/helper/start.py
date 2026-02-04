@@ -35,9 +35,8 @@ async def start_command(client: Client, message: Message):
         return
 
     # Loading animation: "Hello !!"
-    animated_texts = ["[", "[H", "[He", "[Hel", "[Hell", "[Hello", "[Hello !", "[Hello !!]"]
-
-    sent = await message.reply("<pre>[</pre>", quote=True)
+    animated_texts = ["〔", "〔H", "〔He", "〔Hel", "〔Hell", "〔Hello", "〔Hello !", "〔Hello !!〕"]
+    sent = await message.reply("<pre>〔</pre>", quote=True)
 
     for text in animated_texts[1:]:
         await asyncio.sleep(0.12)
