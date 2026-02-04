@@ -84,6 +84,7 @@ async def run_bot():
         BotCommand("mst", "Stripe $20 mass (reply)"),
         BotCommand("sc", "Stripe Worker single check"),
         BotCommand("msc", "Stripe Worker mass (reply / .txt)"),
+        BotCommand("yo", "Sam's Club Plus check (8 runners)"),
         BotCommand("br", "Braintree charge check"),
         BotCommand("bt", "Braintree CVV check"),
         BotCommand("mbt", "Braintree CVV mass"),

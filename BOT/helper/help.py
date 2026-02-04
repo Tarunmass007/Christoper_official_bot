@@ -225,6 +225,11 @@ async def help_callback(client: Client, callback_query: CallbackQuery):
 
 <b>/mbt</b> - <i>Mass Braintree CVV</i>
 
+<b>═══ Sam's Club Plus ═══</b>
+
+<b>/yo</b> - <i>Sam's Club Plus $110 membership check (8 concurrent runners)</i>
+<code>Usage: /yo cc|mm|yyyy|cvv</code>
+
 <b>═══ URL Management ═══</b>
 
 <b>/addurl</b> - <i>Add custom Shopify URL to bot (private)</i>
