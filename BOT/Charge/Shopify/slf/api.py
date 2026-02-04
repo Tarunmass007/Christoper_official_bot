@@ -928,80 +928,83 @@ async def autoshopify(url, card, session, proxy=None):
                     if add_resp and getattr(add_resp, "status_code", 0) in (200, 302):
                         logger.info(f"✅ Cart add via POST cart/add for {url}")
                 await asyncio.sleep(0.6)
+                # POST /checkout with browser-like headers and form data; follow redirects to get real checkout URL
+                base_url = url.rstrip("/")
+                checkout_post_headers = {
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                    "accept-language": "en-US,en;q=0.9",
+                    "priority": "u=0, i",
+                    "referer": f"{base_url}/cart",
+                    "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "same-origin",
+                    "sec-fetch-user": "?1",
+                    "upgrade-insecure-requests": "1",
+                    "user-agent": getua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+                }
+                checkout_post_data = {"updates[]": "1", "note": "", "checkout": ""}
                 ch_post = await session.post(
-                    f"{url.rstrip('/')}/checkout",
-                    headers={"User-Agent": getua, "Content-Type": "application/x-www-form-urlencoded", "Origin": url.rstrip("/"), "Referer": url.rstrip("/") + "/", "Accept": "*/*"},
-                    data="",
-                    timeout=18,
-                    follow_redirects=False,
+                    f"{base_url}/checkout",
+                    headers=checkout_post_headers,
+                    data=checkout_post_data,
+                    timeout=22,
+                    follow_redirects=True,
                 )
                 post_sc = getattr(ch_post, "status_code", 0)
-                get_sc_after_redirect = None
-                get_len_after_redirect = 0
-                if post_sc in (301, 302, 303, 307, 308):
-                    loc = (getattr(ch_post, "headers", None) or {}).get("location") or (getattr(ch_post, "headers", None) or {}).get("Location") or ""
-                    if loc:
-                        if not loc.startswith("http"):
-                            loc = urljoin(url.rstrip("/") + "/", loc)
-                        checkout_url = loc
-                        get_params = {"skip_shop_pay": "true"} if "skip_shop_pay" not in (loc or "") else None
-                        get_final = await session.get(
-                            checkout_url,
-                            headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": getua},
-                            params=get_params,
-                            follow_redirects=True,
-                            timeout=22,
-                        )
-                        _sc = getattr(get_final, "status_code", 0)
-                        _text = (getattr(get_final, "text", None) or "").strip()
-                        get_sc_after_redirect = _sc
-                        get_len_after_redirect = len(_text)
-                        # Accept any 200 that looks like checkout HTML (lenient: short loading pages or token in any format)
-                        looks_like_checkout = (
-                            _sc == 200
-                            and _text
-                            and (
-                                len(_text) > 1500
-                                or "sessionToken" in _text
-                                or "session_token" in _text
-                                or "serialized-sessionToken" in _text
-                                or ("checkout" in _text.lower() and ("<" in _text or "<!" in _text))
-                            )
-                            and (_text.strip().startswith("<") or "sessionToken" in _text or "checkout" in _text.lower())
-                        )
-                        if looks_like_checkout:
-                            checkout_text = _text
-                            request = get_final
-                            checkout_sc = 200
-                            logger.info(f"✅ Non-shipping checkout page for {url} (len=%s)", len(checkout_text))
-                        if not checkout_text and _sc == 200 and len(_text) > 200:
-                            # Accept any 200 with minimal HTML so downstream can try token extraction / cloudscraper
-                            checkout_text = _text
-                            request = get_final
-                            checkout_sc = 200
-                            logger.info(f"✅ Non-shipping checkout page (lenient) for {url} (len=%s)", len(checkout_text))
-                        if not checkout_text and _sc == 200 and _text and len(_text) > 50:
-                            # Last resort: use any 200 with any body so downstream can try (e.g. loading page -> cloudscraper retry)
-                            checkout_text = _text
-                            request = get_final
-                            checkout_sc = 200
-                            logger.info(f"✅ Non-shipping checkout page (any 200) for {url} (len=%s)", len(checkout_text))
-                        if not checkout_text and _sc == 200 and _text:
-                            # Retry same URL in case first response was intermediate redirect
-                            get_final2 = await session.get(
-                                checkout_url,
-                                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": getua},
-                                params=get_params,
-                                follow_redirects=True,
-                                timeout=22,
-                            )
-                            _text2 = (getattr(get_final2, "text", None) or "").strip()
-                            _sc2 = getattr(get_final2, "status_code", 0)
-                            if _sc2 == 200 and (len(_text2) > 200 or "sessionToken" in _text2 or "checkout" in _text2.lower()):
-                                checkout_text = _text2
-                                request = get_final2
-                                checkout_sc = 200
-                                logger.info(f"✅ Non-shipping checkout page (retry) for {url} (len=%s)", len(checkout_text))
+                # Final URL after all redirects (same-origin or Shopify checkout host)
+                checkout_url = (getattr(ch_post, "url", None) or "").strip() or f"{base_url}/checkout"
+                if isinstance(checkout_url, str) and not checkout_url.startswith("http"):
+                    checkout_url = urljoin(base_url + "/", checkout_url)
+                _text = (getattr(ch_post, "text", None) or "").strip()
+                get_sc_after_redirect = post_sc
+                get_len_after_redirect = len(_text)
+                get_params = {"skip_shop_pay": "true"} if (checkout_url and "skip_shop_pay" not in checkout_url) else None
+                # Use POST response body as checkout page when 200
+                if post_sc == 200 and _text:
+                    looks_like_checkout = (
+                        len(_text) > 500
+                        or "sessionToken" in _text
+                        or "session_token" in _text
+                        or "serialized-sessionToken" in _text
+                        or ("checkout" in _text.lower() and ("<" in _text or "<!" in _text))
+                    )
+                    if looks_like_checkout or len(_text) > 200:
+                        checkout_text = _text
+                        request = ch_post
+                        checkout_sc = 200
+                        logger.info(f"✅ Non-shipping checkout page (POST follow_redirects) for {url} (len=%s)", len(checkout_text))
+                        logger.info(f"✅ Auto-redirected final URL: {checkout_url[:80]}...")
+                if not checkout_text and post_sc == 200 and _text:
+                    checkout_text = _text
+                    request = ch_post
+                    checkout_sc = 200
+                    logger.info(f"✅ Non-shipping checkout page (any 200) for {url} (len=%s)", len(checkout_text))
+                # If POST returned redirect but we didn't get body, GET the final URL
+                if not checkout_text and checkout_url and post_sc in (301, 302, 303, 307, 308):
+                    get_final = await session.get(
+                        checkout_url,
+                        headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "User-Agent": getua},
+                        params=get_params,
+                        follow_redirects=True,
+                        timeout=22,
+                    )
+                    _sc = getattr(get_final, "status_code", 0)
+                    _text = (getattr(get_final, "text", None) or "").strip()
+                    get_sc_after_redirect = _sc
+                    get_len_after_redirect = len(_text)
+                    if _sc == 200 and _text and (len(_text) > 500 or "sessionToken" in _text or "checkout" in _text.lower()):
+                        checkout_text = _text
+                        request = get_final
+                        checkout_sc = 200
+                        logger.info(f"✅ Non-shipping checkout page (GET after redirect) for {url} (len=%s)", len(checkout_text))
+                    if not checkout_text and _sc == 200 and len(_text) > 50:
+                        checkout_text = _text
+                        request = get_final
+                        checkout_sc = 200
+                        logger.info(f"✅ Non-shipping checkout page (any 200) for {url} (len=%s)", len(checkout_text))
                 if not checkout_text:
                     # Fallback: POST may have returned 200 or GET failed; try GET store /checkout (cart already added)
                     fallback_checkout_url = f"{url.rstrip('/')}/checkout"

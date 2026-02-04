@@ -1,11 +1,13 @@
 """
 Mass Stripe $20 Charge Handler
-Handles /mst command for mass Stripe checking.
+Handles /mst and /msc commands. /msc: Stripe Worker gate, accepts reply text or .txt file; sends charged/approved as separate messages.
 """
 
+import os
 import re
 import time
 import asyncio
+from datetime import datetime
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
 from BOT.helper.start import load_users
@@ -79,13 +81,33 @@ async def handle_mass_stripe_worker(client, message):
         else:
             mlimit = int(mlimit)
         target_text = None
-        if message.reply_to_message and message.reply_to_message.text:
-            target_text = message.reply_to_message.text
-        elif len(message.text.split(maxsplit=1)) > 1:
+        if message.reply_to_message:
+            if message.reply_to_message.text:
+                target_text = message.reply_to_message.text
+            elif message.reply_to_message.document:
+                doc = message.reply_to_message.document
+                fname = (doc.file_name or "").lower()
+                if fname.endswith(".txt") or (doc.mime_type and "text" in (doc.mime_type or "")):
+                    path = None
+                    try:
+                        path = await client.download_media(message.reply_to_message)
+                        if path and os.path.isfile(path):
+                            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                                target_text = f.read()
+                    except Exception:
+                        pass
+                    finally:
+                        if path and os.path.isfile(path):
+                            try:
+                                os.remove(path)
+                            except Exception:
+                                pass
+        if not target_text and message.text and len(message.text.split(maxsplit=1)) > 1:
             target_text = message.text.split(maxsplit=1)[1]
         if not target_text:
             return await message.reply(
-                "❌ <b>Send cards!</b>\n1 per line:\n<code>4242424242424242|08|28|690</code>",
+                "<pre>No cards ❌</pre>\n"
+                "Reply to a <b>message</b> or <b>.txt file</b> with cards (cc|mm|yy|cvv), or paste after <code>/msc</code>",
                 reply_to_message_id=message.id,
                 parse_mode=ParseMode.HTML
             )
@@ -120,6 +142,39 @@ async def handle_mass_stripe_worker(client, message):
                 pass
         gateway = "Stripe Worker"
         checked_by = f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>"
+
+        def build_worker_hit_message(fullcc: str, status: str, response: str) -> str:
+            header = "CHARGED" if status == "charged" else "CCN LIVE"
+            status_text = "Charged 💎" if status == "charged" else "Approved ✅"
+            card = fullcc.split("|")[0] if "|" in fullcc else fullcc
+            try:
+                bin_data = get_bin_details(card[:6]) if get_bin_details else None
+                if bin_data:
+                    vendor = bin_data.get("vendor", "N/A")
+                    card_type = bin_data.get("type", "N/A")
+                    bank = bin_data.get("bank", "N/A")
+                    country = f"{bin_data.get('country', 'N/A')} {bin_data.get('flag', '')}"
+                else:
+                    vendor = card_type = bank = country = "N/A"
+            except Exception:
+                vendor = card_type = bank = country = "N/A"
+            resp_display = (response or "")[:60] if response else "OK"
+            return f"""<b>[#Stripe Worker] | {header}</b> ✦
+━━━━━━━━━━━━━━━
+<b>[•] Card:</b> <code>{fullcc}</code>
+<b>[•] Gateway:</b> <code>Stripe Worker</code>
+<b>[•] Status:</b> <code>{status_text}</code>
+<b>[•] Response:</b> <code>{resp_display}</code>
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
+<b>[+] BIN:</b> <code>{card[:6]}</code>
+<b>[+] Info:</b> <code>{vendor} - {card_type}</code>
+<b>[+] Bank:</b> <code>{bank}</code> 🏦
+<b>[+] Country:</b> <code>{country}</code>
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
+<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
+<b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
+━━━━━━━━━━━━━━━"""
+
         loader_msg = await message.reply(
             f"""<pre>✦ Mass Stripe Worker Check</pre>
 <b>[⚬] Gateway:</b> <code>{gateway}</code>
@@ -152,6 +207,12 @@ async def handle_mass_stripe_worker(client, message):
             else:
                 error_count += 1
             processed_count += 1
+            if status in ("charged", "approved"):
+                try:
+                    hit_message = build_worker_hit_message(fullcc, status, response)
+                    await message.reply(hit_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                except Exception:
+                    pass
             try:
                 bin_data = get_bin_details(card[:6])
                 if bin_data:
@@ -176,6 +237,7 @@ async def handle_mass_stripe_worker(client, message):
                     f"<pre>✦ Mass Stripe Worker Check</pre>\n"
                     f"{ongoing_result}\n"
                     f"<b>💬 Progress:</b> <code>{processed_count}/{total_cc}</code>\n"
+                    f"<b>💎 Charged:</b> <code>{charged_count}</code> <b>✅ Approved:</b> <code>{approved_count}</code>\n"
                     f"<b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]",
                     disable_web_page_preview=True,
                     parse_mode=ParseMode.HTML
@@ -187,7 +249,6 @@ async def handle_mass_stripe_worker(client, message):
         if user_data["plan"].get("credits") != "∞":
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, deduct_credit_bulk, user_id, card_count)
-        from datetime import datetime
         current_time = datetime.now().strftime("%I:%M %p")
         completion_message = f"""<b>[#Stripe Worker] | MASS CHECK ✦</b>
 ━━━━━━━━━━━━━━━

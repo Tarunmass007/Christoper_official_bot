@@ -232,12 +232,12 @@ class TLSAsyncSession:
                         json_data = await resp.json()
                     except:
                         pass
-                    
                     return TLSResponse(
                         status_code=resp.status,
                         text=text,
                         json_data=json_data,
-                        headers=dict(resp.headers)
+                        headers=dict(resp.headers),
+                        url=str(resp.url) if getattr(resp, "url", None) else None,
                     )
             except (aiohttp.ClientConnectorError, aiohttp.ServerConnectionError, asyncio.TimeoutError) as e:
                 last_exception = e
@@ -343,12 +343,12 @@ class TLSAsyncSession:
                         json_data = await resp.json()
                     except:
                         pass
-                    
                     return TLSResponse(
                         status_code=resp.status,
                         text=text,
                         json_data=json_data,
-                        headers=dict(resp.headers)
+                        headers=dict(resp.headers),
+                        url=str(resp.url) if getattr(resp, "url", None) else None,
                     )
             except (aiohttp.ClientConnectorError, aiohttp.ServerConnectionError, asyncio.TimeoutError) as e:
                 last_exception = e
@@ -394,6 +394,7 @@ class TLSResponse:
         text: Optional[str] = None,
         json_data: Optional[Any] = None,
         headers: Optional[Dict[str, str]] = None,
+        url: Optional[str] = None,
     ):
         """
         Initialize TLSResponse.
@@ -404,6 +405,7 @@ class TLSResponse:
             text: Response text (if using aiohttp)
             json_data: Parsed JSON data (if using aiohttp)
             headers: Response headers (if using aiohttp)
+            url: Final URL after redirects (if using aiohttp)
         """
         if response is not None:
             # curl_cffi response
@@ -412,6 +414,7 @@ class TLSResponse:
             self._text = None
             self._json = None
             self._headers = response.headers
+            self._url = None
         else:
             # aiohttp response (fallback)
             self._response = None
@@ -419,6 +422,7 @@ class TLSResponse:
             self._text = text
             self._json = json_data
             self._headers = headers or {}
+            self._url = url or ""
     
     @property
     def text(self) -> str:
@@ -451,4 +455,4 @@ class TLSResponse:
         """Get final URL (after redirects)."""
         if self._response:
             return str(self._response.url)
-        return ""
+        return self._url if getattr(self, "_url", None) else ""
