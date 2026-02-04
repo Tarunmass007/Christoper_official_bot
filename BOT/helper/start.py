@@ -253,51 +253,51 @@ async def handle_callbacks(client, callback_query):
             pass
 
     elif data == "home":
-        home_text = """<pre>📋 #Christopher — Commands Menu</pre>
-━━━━━━━━━━━━━━━
-<b>🔐 Auth:</b> <code>/au</code> <code>/mau</code> <code>/starr</code> <code>/mstarr</code> <code>/b3</code>
-<b>💳 Charge:</b> <code>/sh</code> <code>/msh</code> <code>/st</code> <code>/mst</code> <code>/sc</code> <code>/msc</code> <code>/br</code>
-<b>📌 Sites:</b> <code>/addurl</code> <code>/txturl</code> <code>/mysite</code> <code>/tsh</code>
-<b>🔧 Tools:</b> <code>/bin</code> <code>/vbv</code> <code>/setpx</code> <code>/plans</code> <code>/help</code>
-━━━━━━━━━━━━━━━
-<b>~ Main:</b> <a href="https://t.me/+IIHrr_9bwBM3NTA1">Join Now</a>
-<b>~ Note:</b> <code>Report bugs → @Chr1shtopher</code>
-<pre>Choose category below:</pre>"""
+        # Home text jab home button click kare
+        home_text = """<pre>JOIN BEFORE USING. ✔️</pre>
+<b>~ Main :</b> <b><a href="https://t.me/+IIHrr_9bwBM3NTA1">Join Now</a></b>
+<b>~ Chat Group :</b> <b><a href="https://t.me/+IIHrr_9bwBM3NTA1">Join Now</a></b>
+<b>~ Note :</b> <code>Report Bugs To @Chr1shtopher</code>
+<b>~ Proxy :</b> <code>Live 💎</code>
+<pre>Choose Your Gate Type :</pre>"""
+
         home_buttons = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("🔐 Auth Gates", callback_data="auth"),
-                InlineKeyboardButton("💳 Charge Gates", callback_data="charge")
+                InlineKeyboardButton("Gates", callback_data="gates"),
+                InlineKeyboardButton("Tools", callback_data="tools")
             ],
             [
-                InlineKeyboardButton("🔧 Tools & More", callback_data="tools"),
-                InlineKeyboardButton("📋 All Commands", callback_data="allcmds")
-            ],
-            [InlineKeyboardButton("❌ Close", callback_data="exit")]
+                InlineKeyboardButton("Close", callback_data="exit")
+            ]
         ])
+
         try:
             await callback_query.message.edit_text(
                 home_text,
                 reply_markup=home_buttons,
-                disable_web_page_preview=True,
-                parse_mode="HTML"
+                disable_web_page_preview=True
             )
         except MessageNotModified:
             pass
 
     elif data == "gates":
+        # Gates ke andar jaake buttons dikhao
         gates_buttons = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("🔐 Auth", callback_data="auth"),
-                InlineKeyboardButton("💳 Charge", callback_data="charge")
+                InlineKeyboardButton("Auth", callback_data="auth"),
+                InlineKeyboardButton("Charge", callback_data="charge")
             ],
-            [InlineKeyboardButton("🔙 Back", callback_data="home")]
+            [
+                InlineKeyboardButton("Back", callback_data="home")  # yaha se home jaayega
+            ]
         ])
-        gates_text = "<pre>#Christopher — Gate Type</pre>\n\nChoose a gate category:"
+
+        gates_text = "<pre>Choose Gate Type:</pre>"
+
         try:
             await callback_query.message.edit_text(
                 gates_text,
-                reply_markup=gates_buttons,
-                parse_mode="HTML"
+                reply_markup=gates_buttons
             )
         except MessageNotModified:
             pass
@@ -331,25 +331,23 @@ async def handle_callbacks(client, callback_query):
             pass
 
     elif data == "charge":
-        charge_text = """<pre>#Christopher 〔 CHARGE GATES 〕</pre>
-━━━━━━━━━━━━━━━
-Choose charge gate type below."""
         charge_buttons = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("🛒 Shopify Self", callback_data="auto"),
-                InlineKeyboardButton("💎 Stripe $20", callback_data="stripe")
+                InlineKeyboardButton("Shopify Self", callback_data="auto"),
+                InlineKeyboardButton("Stripe $20", callback_data="stripe")
             ],
-            [InlineKeyboardButton("⚡ Stripe Worker", callback_data="stripeworker")],
             [
-                InlineKeyboardButton("🔙 Back", callback_data="gates"),
-                InlineKeyboardButton("❌ Close", callback_data="exit")
+                InlineKeyboardButton("Back", callback_data="gates"),
+                InlineKeyboardButton("Close", callback_data="exit")
             ]
         ])
+
+        charge_text = "<pre>#Christopher 〔 Charge 〕</pre>"
+
         try:
             await callback_query.message.edit_text(
                 charge_text,
-                reply_markup=charge_buttons,
-                parse_mode="HTML"
+                reply_markup=charge_buttons
             )
         except MessageNotModified:
             pass
