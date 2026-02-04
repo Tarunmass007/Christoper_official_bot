@@ -66,16 +66,11 @@ async def start_command(client: Client, message: Message):
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔐 Auth Gates", callback_data="auth"),
-            InlineKeyboardButton("💳 Charge Gates", callback_data="charge")
+            InlineKeyboardButton("Register", callback_data="register"),
+            InlineKeyboardButton("Commands", callback_data="home")
         ],
         [
-            InlineKeyboardButton("🔧 Tools", callback_data="tools"),
-            InlineKeyboardButton("📋 Commands", callback_data="allcmds")
-        ],
-        [
-            InlineKeyboardButton("👤 Register", callback_data="register"),
-            InlineKeyboardButton("❌ Close", callback_data="close")
+            InlineKeyboardButton("Close", callback_data="close")
         ]
     ])
 
@@ -100,11 +95,11 @@ async def register_callback(client, callback_query):
             profile = f"<a href='tg://user?id={user_id}'>{first_name}</a> ({user_data['role']})"
 
             buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 Commands", callback_data="home"),
-                 InlineKeyboardButton("❌ Close", callback_data="exit")]
+                [InlineKeyboardButton("Home", callback_data="home"),
+                 InlineKeyboardButton("Exit", callback_data="exit")]
             ])
 
-            await callback_query.message.edit_text(f"<pre>User {profile} You Are Already Registered</pre>", reply_markup=buttons)
+            await callback_query.message.reply_text(f"<pre>User {profile} You Are Already Registered</pre>", reply_markup=buttons)
             return
 
         first_name = callback_query.from_user.first_name
@@ -127,8 +122,8 @@ async def register_callback(client, callback_query):
     users = load_users()
     user_data = users[user_id]
     buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Commands", callback_data="home"),
-         InlineKeyboardButton("❌ Close", callback_data="exit")]
+        [InlineKeyboardButton("Home", callback_data="home"),
+         InlineKeyboardButton("Exit", callback_data="exit")]
     ])
 
     try:
@@ -163,8 +158,8 @@ async def register_command(client, message):
             profile = f"<a href='tg://user?id={user_id}'>{first_name}</a> ({user_data['role']})"
 
             buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 Commands", callback_data="home"),
-                 InlineKeyboardButton("❌ Close", callback_data="exit")]
+                [InlineKeyboardButton("Home", callback_data="home"),
+                 InlineKeyboardButton("Exit", callback_data="exit")]
             ])
 
             await client.send_message(
@@ -195,8 +190,8 @@ async def register_command(client, message):
     users = load_users()
     user_data = users[user_id]
     buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Commands", callback_data="home"),
-         InlineKeyboardButton("❌ Close", callback_data="exit")]
+        [InlineKeyboardButton("Home", callback_data="home"),
+         InlineKeyboardButton("Exit", callback_data="exit")]
     ])
 
     # Reply to the original message for successful registration
@@ -246,16 +241,16 @@ async def show_cmds(client, message):
         parse_mode="HTML"
     )
 
-@Client.on_callback_query(filters.regex("^(exit|home|close|auth|charge|tools|allcmds|auto|stripe|stripeworker|braintree)$"))
+
+@Client.on_callback_query(filters.regex("^(exit|home|gates|tools|auth|charge|shopify|auto|braintree|stripe|stripeworker|allcmds)$"))
 async def handle_callbacks(client, callback_query):
     data = callback_query.data
 
-    if data in ["exit", "close"]:
+    if data == "exit":
         try:
-            await callback_query.message.edit_text("<pre>Thanks For Using #Christopher 👋</pre>")
+            await callback_query.message.edit_text("<pre>Thanks For Using #Christopher</pre>")
         except MessageNotModified:
             pass
-        return
 
     elif data == "home":
         home_text = """<pre>📋 #Christopher — Commands Menu</pre>
@@ -268,7 +263,6 @@ async def handle_callbacks(client, callback_query):
 <b>~ Main:</b> <a href="https://t.me/+IIHrr_9bwBM3NTA1">Join Now</a>
 <b>~ Note:</b> <code>Report bugs → @Chr1shtopher</code>
 <pre>Choose category below:</pre>"""
-        
         home_buttons = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🔐 Auth Gates", callback_data="auth"),
@@ -280,7 +274,6 @@ async def handle_callbacks(client, callback_query):
             ],
             [InlineKeyboardButton("❌ Close", callback_data="exit")]
         ])
-        
         try:
             await callback_query.message.edit_text(
                 home_text,
@@ -290,7 +283,24 @@ async def handle_callbacks(client, callback_query):
             )
         except MessageNotModified:
             pass
-        return
+
+    elif data == "gates":
+        gates_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔐 Auth", callback_data="auth"),
+                InlineKeyboardButton("💳 Charge", callback_data="charge")
+            ],
+            [InlineKeyboardButton("🔙 Back", callback_data="home")]
+        ])
+        gates_text = "<pre>#Christopher — Gate Type</pre>\n\nChoose a gate category:"
+        try:
+            await callback_query.message.edit_text(
+                gates_text,
+                reply_markup=gates_buttons,
+                parse_mode="HTML"
+            )
+        except MessageNotModified:
+            pass
 
     elif data == "auth":
         auth_text = """<pre>#Christopher 〔AUTH GATES〕</pre>
@@ -304,20 +314,18 @@ async def handle_callbacks(client, callback_query):
 ⟐ <code>/mau</code> - Mass (Reply)
 ⟐ <b>Status:</b> <code>Active ✅</code>
 ━━━━━━━━━━━━━━━
-<b>Note:</b> Works in groups & private"""
-        
+<b>Note:</b> Works in groups & private
+"""
         auth_buttons = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📋 Main Menu", callback_data="home"),
-                InlineKeyboardButton("❌ Close", callback_data="exit")
+                InlineKeyboardButton("Back", callback_data="gates"),
+                InlineKeyboardButton("Close", callback_data="exit")
             ]
         ])
-        
         try:
             await callback_query.message.edit_text(
                 auth_text,
-                reply_markup=auth_buttons,
-                parse_mode="HTML"
+                reply_markup=auth_buttons
             )
         except MessageNotModified:
             pass
@@ -326,7 +334,6 @@ async def handle_callbacks(client, callback_query):
         charge_text = """<pre>#Christopher 〔 CHARGE GATES 〕</pre>
 ━━━━━━━━━━━━━━━
 Choose charge gate type below."""
-        
         charge_buttons = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🛒 Shopify Self", callback_data="auto"),
@@ -334,16 +341,123 @@ Choose charge gate type below."""
             ],
             [InlineKeyboardButton("⚡ Stripe Worker", callback_data="stripeworker")],
             [
-                InlineKeyboardButton("📋 Main Menu", callback_data="home"),
+                InlineKeyboardButton("🔙 Back", callback_data="gates"),
                 InlineKeyboardButton("❌ Close", callback_data="exit")
             ]
         ])
-        
         try:
             await callback_query.message.edit_text(
                 charge_text,
                 reply_markup=charge_buttons,
                 parse_mode="HTML"
+            )
+        except MessageNotModified:
+            pass
+
+    elif data == "shopify":
+        # Redirect to auto (self shopify) since we removed fixed shopify gates
+        shopify_text = """<pre>#Christopher 〔Self Shopify〕</pre>
+━ ━ ━ ━ ━━━ ━ ━ ━ ━
+⟐ <b>Setup</b>: <code>/addurl https://store.com</code>
+⟐ <b>Check</b>: <code>/sh cc|mes|ano|cvv</code>
+⟐ <b>Mass</b>: <code>/msh cc|mes|ano|cvv</code>
+⟐ <b>TXT</b>: <code>/tsh cc|mes|ano|cvv</code>
+⟐ <b>Status: Active ✅</b>
+"""
+        shopify_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Back", callback_data="charge"),
+                InlineKeyboardButton("Close", callback_data="exit")
+            ]
+        ])
+        try:
+            await callback_query.message.edit_text(
+                shopify_text,
+                reply_markup=shopify_buttons
+            )
+        except MessageNotModified:
+            pass
+
+    elif data == "auto":
+        auto_text = """<pre>#Christopher 〔Self Shopify〕</pre>
+━━━━━━━━━━━━━━━
+<b>📋 Site Management:</b>
+⟐ <code>/addurl site.com</code> - Add Site (Private)
+⟐ <code>/txturl site.com</code> - Add TXT Site (Private)
+⟐ <code>/txtls</code> - View TXT Sites
+⟐ <code>/mysite</code> - View Current Site
+⟐ <code>/remurl</code> - Remove Site
+━━━━━━━━━━━━━━━
+<b>⚡ Check Commands:</b>
+⟐ <code>/sh cc|mm|yy|cvv</code> - Single Check
+⟐ <code>/msh</code> - Mass Check (Reply)
+⟐ <code>/tsh</code> - TXT Sites Check (Reply)
+━━━━━━━━━━━━━━━
+<b>🔧 Proxy:</b>
+⟐ <code>/setpx proxy</code> - Set Proxy (Private)
+⟐ <code>/getpx</code> - View Proxy
+⟐ <code>/delpx</code> - Delete Proxy
+━━━━━━━━━━━━━━━
+<b>Status: Active ✅</b>
+"""
+        auto_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Back", callback_data="charge"),
+                InlineKeyboardButton("Close", callback_data="exit")
+            ]
+        ])
+        try:
+            await callback_query.message.edit_text(
+                auto_text,
+                reply_markup=auto_buttons
+            )
+        except MessageNotModified:
+            pass
+
+    elif data == "stripe":
+        stripe_text = """<pre>#Christopher 〔Stripe $20 Charge〕</pre>
+━━━━━━━━━━━━━━━
+<b>⚡ Stripe $20 Charge:</b>
+⟐ <code>/st cc|mm|yy|cvv</code> - Single
+⟐ <code>/mst</code> - Mass (Reply)
+━━━━━━━━━━━━━━━
+<b>Limit:</b> <code>As Per Plan</code>
+<b>Status:</b> <code>Active ✅</code>
+━━━━━━━━━━━━━━━
+<b>Note:</b> Works in groups & private
+"""
+        stripe_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Back", callback_data="charge"),
+                InlineKeyboardButton("Close", callback_data="exit")
+            ]
+        ])
+        try:
+            await callback_query.message.edit_text(
+                stripe_text,
+                reply_markup=stripe_buttons
+            )
+        except MessageNotModified:
+            pass
+
+    elif data in ["braintree"]:
+        braintree_text = """<pre>#Christopher 〔Braintree Auth〕</pre>
+━ ━ ━ ━ ━━━ ━ ━ ━ ━
+⟐ <b>Name</b>: <code>Braintree Auth</code>
+⟐ <b>Command</b>: <code>/b3 cc|mes|ano|cvv</code>
+⟐ <b>Status: Active ✅</b>
+"""
+
+        braintree_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Back", callback_data="gates"),
+                InlineKeyboardButton("Close", callback_data="exit")
+            ]
+        ])
+        try:
+            await callback_query.message.edit_text(
+                braintree_text,
+                reply_markup=braintree_buttons
             )
         except MessageNotModified:
             pass
@@ -358,164 +472,29 @@ Choose charge gate type below."""
 ━━━━━━━━━━━━━━━
 <b>🔍 Lookup Tools:</b>
 ⟐ <code>/bin 543210</code> - BIN Lookup
-⟐ <code>/vbv</code> <code>/mvbv</code> — VBV/MBV
+⟐ <code>/mbin bin1 bin2</code> - Mass BIN
 ━━━━━━━━━━━━━━━
-<b>📊 Other Tools:</b>
+<b>🎲 Generators:</b>
+⟐ <code>/gen bin|mm|yy|cvv|amt</code> - Card Gen
+⟐ <code>/fake [country]</code> - Fake Identity
+━━━━━━━━━━━━━━━
+<b>📊 Other:</b>
+⟐ <code>/ping</code> - Bot Latency
+⟐ <code>/info</code> - Your Info
 ⟐ <code>/plans</code> - View Plans
-⟐ <code>/ping</code> - Bot Status
-⟐ <code>/info</code> - User Info
 ━━━━━━━━━━━━━━━
-<b>Status:</b> <code>Active ✅</code>"""
-        
+<b>Status: Active ✅</b>
+"""
         tools_buttons = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("📋 Main Menu", callback_data="home"),
-                InlineKeyboardButton("❌ Close", callback_data="exit")
+                InlineKeyboardButton("Back", callback_data="home"),
+                InlineKeyboardButton("Close", callback_data="exit")
             ]
         ])
-        
         try:
             await callback_query.message.edit_text(
                 tools_text,
-                reply_markup=tools_buttons,
-                parse_mode="HTML"
-            )
-        except MessageNotModified:
-            pass
-
-    elif data == "allcmds":
-        allcmds_text = """<pre>#Christopher — All Commands</pre>
-━━━━━━━━━━━━━━━
-<b>🔐 AUTH</b>
-<code>/au</code> <code>/mau</code> — Stripe Auth | <code>/b3</code> — Braintree
-━━━━━━━━━━━━━━━
-<b>💳 CHARGE</b>
-<code>/sh</code> <code>/msh</code> — Shopify Self | <code>/st</code> <code>/mst</code> — Stripe $20 | <code>/sc</code> <code>/msc</code> — Stripe Worker
-━━━━━━━━━━━━━━━
-<b>📌 SITES</b>
-<code>/addurl</code> <code>/txturl</code> <code>/mysite</code> <code>/tsh</code>
-━━━━━━━━━━━━━━━
-<b>🔧 TOOLS</b>
-<code>/bin</code> <code>/vbv</code> <code>/setpx</code> <code>/plans</code> <code>/ping</code>
-━━━━━━━━━━━━━━━
-<b>📋 OTHER</b>
-<code>/start</code> <code>/register</code> <code>/cmds</code> <code>/help</code>"""
-        
-        allcmds_buttons = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📋 Main Menu", callback_data="home"),
-                InlineKeyboardButton("❌ Close", callback_data="exit")
-            ]
-        ])
-        
-        try:
-            await callback_query.message.edit_text(
-                allcmds_text,
-                reply_markup=allcmds_buttons,
-                parse_mode="HTML"
-            )
-        except MessageNotModified:
-            pass
-
-    elif data == "auto":
-        auto_text = """<pre>#Christopher 〔Self Shopify〕</pre>
-━━━━━━━━━━━━━━━
-<b>📋 Site Management:</b>
-⟐ <code>/addurl site.com</code> - Add Site
-⟐ <code>/txturl site.com</code> - Add TXT Site
-⟐ <code>/mysite</code> - View Current Site
-⟐ <code>/remurl</code> - Remove Site
-━━━━━━━━━━━━━━━
-<b>⚡ Check Commands:</b>
-⟐ <code>/sh cc|mm|yy|cvv</code> - Single
-⟐ <code>/msh</code> - Mass Check (Reply)
-⟐ <code>/tsh</code> - TXT Sites Check
-━━━━━━━━━━━━━━━
-<b>Status: Active ✅</b>"""
-        
-        auto_buttons = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📋 Main Menu", callback_data="home"),
-                InlineKeyboardButton("❌ Close", callback_data="exit")
-            ]
-        ])
-        
-        try:
-            await callback_query.message.edit_text(
-                auto_text,
-                reply_markup=auto_buttons,
-                parse_mode="HTML"
-            )
-        except MessageNotModified:
-            pass
-
-    elif data == "stripe":
-        stripe_text = """<pre>#Christopher 〔Stripe $20 Charge〕</pre>
-━━━━━━━━━━━━━━━
-<b>⚡ Stripe $20 Charge:</b>
-⟐ <code>/st cc|mm|yy|cvv</code> - Single
-⟐ <code>/mst</code> - Mass (Reply)
-━━━━━━━━━━━━━━━
-<b>Status:</b> <code>Active ✅</code>"""
-        
-        stripe_buttons = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📋 Main Menu", callback_data="home"),
-                InlineKeyboardButton("❌ Close", callback_data="exit")
-            ]
-        ])
-        
-        try:
-            await callback_query.message.edit_text(
-                stripe_text,
-                reply_markup=stripe_buttons,
-                parse_mode="HTML"
-            )
-        except MessageNotModified:
-            pass
-
-    elif data == "stripeworker":
-        stripeworker_text = """<pre>#Christopher 〔 Stripe Worker Charge 〕</pre>
-━━━━━━━━━━━━━━━
-<b>⚡ Stripe Worker Gate:</b>
-⟐ <code>/sc cc|mm|yy|cvv</code> — Single check
-⟐ <code>/msc</code> — Mass check (reply or .txt file)
-⟐ <b>Status:</b> <code>Active ✅</code>"""
-        
-        stripeworker_buttons = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📋 Main Menu", callback_data="home"),
-                InlineKeyboardButton("❌ Close", callback_data="exit")
-            ]
-        ])
-        
-        try:
-            await callback_query.message.edit_text(
-                stripeworker_text,
-                reply_markup=stripeworker_buttons,
-                parse_mode="HTML"
-            )
-        except MessageNotModified:
-            pass
-
-    elif data == "braintree":
-        braintree_text = """<pre>#Christopher 〔Braintree Auth〕</pre>
-━━━━━━━━━━━━━━━
-⟐ <b>Command</b>: <code>/b3 cc|mm|yy|cvv</code>
-⟐ <b>Status: Active ✅</b>"""
-
-        braintree_buttons = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📋 Main Menu", callback_data="home"),
-                InlineKeyboardButton("❌ Close", callback_data="exit")
-            ]
-        ])
-        
-        try:
-            await callback_query.message.edit_text(
-                braintree_text,
-                reply_markup=braintree_buttons,
-                parse_mode="HTML"
+                reply_markup=tools_buttons
             )
         except MessageNotModified:
             pass
