@@ -79,7 +79,7 @@ async def handle_mstripeauth_command(client: Client, message: Message):
         badge = plan_info.get("badge", "🎟️")
         
         if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
+            mlimit = None
         else:
             mlimit = int(mlimit)
         
@@ -100,7 +100,7 @@ async def handle_mstripeauth_command(client: Client, message: Message):
         if not all_cards:
             return await message.reply("❌ No valid cards found!", reply_to_message_id=message.id)
         
-        if len(all_cards) > mlimit:
+        if mlimit is not None and len(all_cards) > mlimit:
             return await message.reply(
                 f"❌ You can check max {mlimit} cards as per your plan!",
                 reply_to_message_id=message.id

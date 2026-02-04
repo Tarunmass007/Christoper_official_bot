@@ -429,16 +429,12 @@ async def tsh_handler(client: Client, m: Message):
     user_data = users.get(user_id, {})
     plan_info = user_data.get("plan", {})
     plan = plan_info.get("plan", "Free")
-    is_vip = plan == "VIP"
-    
-    # VIP has unlimited, other plans check mlimit
-    if not is_vip:
-        mlimit = plan_info.get("mlimit")
-        if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
-        else:
-            mlimit = int(mlimit)
-        
+    mlimit = plan_info.get("mlimit")
+    is_unlimited = plan in ["VIP", "Owner"] or mlimit is None or str(mlimit).lower() in ["null", "none"]
+
+    # Unlimited plans skip mlimit checks
+    if not is_unlimited:
+        mlimit = int(mlimit)
         if total_cards > mlimit:
             return await m.reply(
                 f"<pre>Card Limit Exceeded ❌</pre>\n"

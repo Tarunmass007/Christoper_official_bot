@@ -138,6 +138,44 @@ def default_plan(user_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Owner overrides
+# ---------------------------------------------------------------------------
+
+def _owner_plan_defaults(plan: dict, registered_at: Optional[str]) -> dict:
+    activated_at = plan.get("activated_at") or registered_at or get_ist_time()
+    return {
+        "plan": "Owner",
+        "activated_at": activated_at,
+        "expires_at": None,
+        "antispam": None,
+        "mlimit": None,
+        "credits": "∞",
+        "badge": "🎭",
+        "private": "on",
+        "keyredeem": plan.get("keyredeem", 0),
+    }
+
+
+def _apply_owner_overrides(users: dict) -> bool:
+    owner_id = load_owner_id()
+    if not owner_id:
+        return False
+    uid = str(owner_id)
+    user = users.get(uid)
+    if not user:
+        return False
+    plan = user.get("plan", {})
+    owner_defaults = _owner_plan_defaults(plan, user.get("registered_at"))
+    updated_plan = {**plan, **owner_defaults}
+    if updated_plan == plan and user.get("role") == "Owner":
+        return False
+    user["plan"] = updated_plan
+    user["role"] = "Owner"
+    users[uid] = user
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Users
 # ---------------------------------------------------------------------------
 
@@ -149,18 +187,29 @@ def load_users() -> dict:
             uid = str(doc["_id"])
             d = {k: v for k, v in doc.items() if k != "_id"}
             out[uid] = d
+        if _apply_owner_overrides(out):
+            owner_id = load_owner_id()
+            if owner_id and str(owner_id) in out:
+                c.update_one(
+                    {"_id": str(owner_id)},
+                    {"$set": {"plan": out[str(owner_id)]["plan"], "role": "Owner"}},
+                )
         return out
     _ensure_data()
     if not os.path.exists(USERS_FILE):
         return {}
     try:
         with open(USERS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            users = json.load(f)
+        if _apply_owner_overrides(users):
+            save_users(users)
+        return users
     except Exception:
         return {}
 
 
 def save_users(users: dict) -> None:
+    _apply_owner_overrides(users)
     if _use_mongo():
         c = _users_coll()
         for uid, doc in users.items():

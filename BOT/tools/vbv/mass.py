@@ -53,9 +53,9 @@ async def handle_mvbv_command(client, message):
         plan = user_data.get("plan", {}).get("plan", "Free")
         badge = user_data.get("plan", {}).get("badge", "🎟️")
 
-        # Default fallback if mlimit is None
+        # Default fallback if mlimit is None (unlimited)
         if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000  # effectively unlimited
+            mlimit = None
         else:
             mlimit = int(mlimit)
 
@@ -82,7 +82,7 @@ async def handle_mvbv_command(client, message):
                 reply_to_message_id=message.id
             )
 
-        if len(all_cards) > mlimit:
+        if mlimit is not None and len(all_cards) > mlimit:
             return await message.reply(
                 f"❌ You can check max {mlimit} cards as per your plan!",
                 reply_to_message_id=message.id

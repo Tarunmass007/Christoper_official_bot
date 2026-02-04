@@ -77,7 +77,7 @@ async def handle_mass_stripe_worker(client, message):
         plan = plan_info.get("plan", "Free")
         badge = plan_info.get("badge", "🎟️")
         if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
+            mlimit = None
         else:
             mlimit = int(mlimit)
         target_text = None
@@ -118,7 +118,7 @@ async def handle_mass_stripe_worker(client, message):
                 reply_to_message_id=message.id,
                 parse_mode=ParseMode.HTML
             )
-        if len(all_cards) > mlimit:
+        if mlimit is not None and len(all_cards) > mlimit:
             return await message.reply(
                 f"❌ You can check max {mlimit} cards as per your plan!",
                 reply_to_message_id=message.id,
@@ -328,9 +328,9 @@ async def handle_mass_stripe(client, message):
         plan = plan_info.get("plan", "Free")
         badge = plan_info.get("badge", "🎟️")
         
-        # Default limit if None
+        # Default limit if None (unlimited)
         if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
+            mlimit = None
         else:
             mlimit = int(mlimit)
         
@@ -356,7 +356,7 @@ async def handle_mass_stripe(client, message):
                 parse_mode=ParseMode.HTML
             )
         
-        if len(all_cards) > mlimit:
+        if mlimit is not None and len(all_cards) > mlimit:
             return await message.reply(
                 f"❌ You can check max {mlimit} cards as per your plan!",
                 reply_to_message_id=message.id,

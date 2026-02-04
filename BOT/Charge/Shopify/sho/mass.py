@@ -58,9 +58,9 @@ async def handle_msho_command(client, message):
         plan = user_data.get("plan", {}).get("plan", "Free")
         badge = user_data.get("plan", {}).get("badge", "🎟️")
 
-        # Default fallback if mlimit is None (like for Owner or custom plans)
+        # Default fallback if mlimit is None (unlimited)
         if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000  # effectively unlimited
+            mlimit = None
         else:
             mlimit = int(mlimit)
 
@@ -80,7 +80,7 @@ async def handle_msho_command(client, message):
         if not all_cards:
             return await message.reply("❌ No valid cards found!", reply_to_message_id=message.id)
 
-        if len(all_cards) > mlimit:
+        if mlimit is not None and len(all_cards) > mlimit:
             return await message.reply(f"❌ You can check max {mlimit} cards as per your plan!", reply_to_message_id=message.id)
 
         available_credits = user_data["plan"].get("credits", 0)

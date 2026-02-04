@@ -134,13 +134,13 @@ async def handle_mau_command(client, message):
         plan = plan_info.get("plan", "Free")
         badge = plan_info.get("badge", "🧿")
         
-        # VIP plan has unlimited mass limit
-        is_vip = plan == "VIP"
+        # VIP/Owner plan has unlimited mass limit
+        is_vip = plan in ["VIP", "Owner"]
         
         if is_vip:
-            mlimit = None  # Unlimited for VIP
+            mlimit = None  # Unlimited for VIP/Owner
         elif mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
+            mlimit = None
         else:
             mlimit = int(mlimit)
         
@@ -188,7 +188,7 @@ async def handle_mau_command(client, message):
             )
         
         # VIP has unlimited, other plans check limit
-        if not is_vip and mlimit and len(all_cards) > mlimit:
+        if not is_vip and mlimit is not None and len(all_cards) > mlimit:
             return await message.reply(
                 f"❌ You can check max {mlimit} cards as per your plan!",
                 reply_to_message_id=message.id

@@ -274,13 +274,11 @@ async def mslf_handler(client, message):
         plan = plan_info.get("plan", "Free")
         badge = plan_info.get("badge", "🎟️")
 
-        # VIP plan has unlimited mass limit
-        is_vip = plan == "VIP"
-        
-        if is_vip:
-            mlimit = None  # Unlimited for VIP
-        elif mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
+        # VIP/Owner plan has unlimited mass limit
+        is_unlimited = plan in ["VIP", "Owner"] or mlimit is None or str(mlimit).lower() in ["null", "none"]
+
+        if is_unlimited:
+            mlimit = None  # Unlimited for VIP/Owner
         else:
             mlimit = int(mlimit)
 
@@ -303,8 +301,8 @@ async def mslf_handler(client, message):
         if not all_cards:
             return await message.reply("❌ No valid cards found!", reply_to_message_id=message.id)
 
-        # VIP has unlimited, other plans check limit
-        if not is_vip and mlimit and len(all_cards) > mlimit:
+        # Unlimited plans skip limit checks
+        if mlimit is not None and len(all_cards) > mlimit:
             return await message.reply(
                 f"❌ You can check max {mlimit} cards as per your plan!",
                 reply_to_message_id=message.id
