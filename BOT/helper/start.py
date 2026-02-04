@@ -210,39 +210,32 @@ async def register_command(client, message):
 
 @Client.on_message(filters.command("cmds"))
 async def show_cmds(client, message):
-    home_text = """<pre>📋 #Christopher — Commands Menu</pre>
-━━━━━━━━━━━━━━━
-<b>🔐 Auth:</b> <code>/au</code> <code>/mau</code> <code>/starr</code> <code>/mstarr</code> <code>/b3</code>
-<b>💳 Charge:</b> <code>/sh</code> <code>/msh</code> <code>/st</code> <code>/mst</code> <code>/sc</code> <code>/msc</code> <code>/br</code>
-<b>📌 Sites:</b> <code>/addurl</code> <code>/txturl</code> <code>/mysite</code> <code>/tsh</code>
-<b>🔧 Tools:</b> <code>/bin</code> <code>/vbv</code> <code>/setpx</code> <code>/plans</code> <code>/help</code>
-━━━━━━━━━━━━━━━
-<b>~ Main:</b> <a href="https://t.me/+IIHrr_9bwBM3NTA1">Join Now</a>
-<b>~ Note:</b> <code>Report bugs → @Chr1shtopher</code>
-<pre>Choose category below:</pre>"""
+    home_text = """<pre>JOIN BEFORE USING. ✔️</pre>
+<b>~ Main :</b> <b><a href="https://t.me/+IIHrr_9bwBM3NTA1">Join Now</a></b>
+<b>~ Chat Group :</b> <b><a href="https://t.me/+IIHrr_9bwBM3NTA1">Join Now</a></b>
+<b>~ Note :</b> <code>Report Bugs To @Chr1shtopher</code>
+<b>~ Proxy :</b> <code>Live 💎</code>
+<pre>Choose Your Gate Type :</pre>"""
 
     home_buttons = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔐 Auth Gates", callback_data="auth"),
-            InlineKeyboardButton("💳 Charge Gates", callback_data="charge")
+            InlineKeyboardButton("Gates", callback_data="gates"),
+            InlineKeyboardButton("Tools", callback_data="tools")
         ],
         [
-            InlineKeyboardButton("🔧 Tools & More", callback_data="tools"),
-            InlineKeyboardButton("📋 All Commands", callback_data="allcmds")
-        ],
-        [InlineKeyboardButton("❌ Close", callback_data="exit")]
+            InlineKeyboardButton("Close", callback_data="exit")
+        ]
     ])
 
     await message.reply(
         home_text,
         reply_to_message_id=message.id,
         reply_markup=home_buttons,
-        disable_web_page_preview=True,
-        parse_mode="HTML"
+        disable_web_page_preview=True
     )
 
 
-@Client.on_callback_query(filters.regex("^(exit|home|gates|tools|auth|charge|shopify|auto|braintree|stripe|stripeworker|allcmds)$"))
+@Client.on_callback_query(filters.regex("^(exit|home|gates|tools|auth|charge|shopify|auto|braintree|stripe)$"))
 async def handle_callbacks(client, callback_query):
     data = callback_query.data
 
