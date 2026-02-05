@@ -1,514 +1,61 @@
-"""
-Mass Stripe $20 Charge Handler
-Handles /mst and /msc commands. /msc: Stripe Worker gate, accepts reply text or .txt file; sends charged/approved as separate messages.
-"""
-
-import os
-import re
-import time
 import asyncio
-from datetime import datetime
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
-from BOT.helper.start import load_users
-from BOT.helper.permissions import check_private_access, is_premium_user
-from BOT.Charge.Stripe.api import async_stripe_charge
-from BOT.Charge.Stripe.worker_api import async_stripe_worker_charge
-from BOT.gc.credit import deduct_credit_bulk
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from BOT.db.store import get_user_id
+from BOT.tools.bin import get_bin_details
+from BOT.Auth.StripeAuth.worker_api import async_stripe_auth
+from .charge_api import async_stripe_charge
 
-# Try to import BIN lookup
-try:
-    from TOOLS.getbin import get_bin_details
-except ImportError:
-    def get_bin_details(bin_number):
-        return None
+temp_cards = {}  # Temporary storage; use MongoDB in production
 
-user_locks = {}
-
-
-def extract_cards(text):
-    """Extract all cards from text."""
-    return re.findall(r'(\d{12,19}\|\d{1,2}\|\d{2,4}\|\d{3,4})', text)
-
-
-def get_status_flag(status, response):
-    """Determine status flag from result."""
-    if status == "charged":
-        return "Charged 💎"
-    elif status == "approved":
-        return "Approved ✅"
-    elif status == "declined":
-        return "Declined ❌"
-    else:
-        return "Error ⚠️"
-
-
-@Client.on_message(filters.command(["msc"]) | filters.regex(r"^\$msc(\s|$)"))
-async def handle_mass_stripe_worker(client, message):
-    """
-    Handle /msc command for mass Stripe Worker gate (mohsinop worker API).
-    Usage: /msc (reply to list of cards)
-    """
-    if not message.from_user:
-        return
-    user_id = str(message.from_user.id)
-    if user_id in user_locks:
-        return await message.reply(
-            "<pre>⚠️ Wait!</pre>\n"
-            "<b>Your previous</b> <code>/msc</code> <b>request is still processing.</b>",
-            reply_to_message_id=message.id,
-            parse_mode=ParseMode.HTML
-        )
-    user_locks[user_id] = True
-    try:
-        users = load_users()
-        if user_id not in users:
-            return await message.reply(
-                """<pre>Access Denied 🚫</pre>
-<b>You have to register first using</b> <code>/register</code> <b>command.</b>""",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        if not await check_private_access(message):
-            return
-        user_data = users[user_id]
-        plan_info = user_data.get("plan", {})
-        mlimit = plan_info.get("mlimit")
-        plan = plan_info.get("plan", "Free")
-        badge = plan_info.get("badge", "🎟️")
-        if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
-        else:
-            mlimit = int(mlimit)
-        target_text = None
-        if message.reply_to_message:
-            if message.reply_to_message.text:
-                target_text = message.reply_to_message.text
-            elif message.reply_to_message.document:
-                doc = message.reply_to_message.document
-                fname = (doc.file_name or "").lower()
-                if fname.endswith(".txt") or (doc.mime_type and "text" in (doc.mime_type or "")):
-                    path = None
-                    try:
-                        path = await client.download_media(message.reply_to_message)
-                        if path and os.path.isfile(path):
-                            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                                target_text = f.read()
-                    except Exception:
-                        pass
-                    finally:
-                        if path and os.path.isfile(path):
-                            try:
-                                os.remove(path)
-                            except Exception:
-                                pass
-        if not target_text and message.text and len(message.text.split(maxsplit=1)) > 1:
-            target_text = message.text.split(maxsplit=1)[1]
-        if not target_text:
-            return await message.reply(
-                "<pre>No cards ❌</pre>\n"
-                "Reply to a <b>message</b> or <b>.txt file</b> with cards (cc|mm|yy|cvv), or paste after <code>/msc</code>",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        all_cards = extract_cards(target_text)
-        if not all_cards:
-            return await message.reply(
-                "❌ No valid cards found!",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        if len(all_cards) > mlimit:
-            return await message.reply(
-                f"❌ You can check max {mlimit} cards as per your plan!",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        available_credits = user_data["plan"].get("credits", 0)
-        card_count = len(all_cards)
-        if available_credits != "∞":
-            try:
-                available_credits = int(available_credits)
-                if card_count > available_credits:
-                    return await message.reply(
-                        """<pre>Notification ❗️</pre>
-<b>Message :</b> <code>You Have Insufficient Credits</code>
-━━━━━━━━━━━━━
-<b>Type <code>/buy</code> to get Credits.</b>""",
-                        reply_to_message_id=message.id,
-                        parse_mode=ParseMode.HTML
-                    )
-            except:
-                pass
-        gateway = "Stripe Worker"
-        checked_by = f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>"
-
-        def build_worker_hit_message(fullcc: str, status: str, response: str) -> str:
-            header = "CHARGED" if status == "charged" else "CCN LIVE"
-            status_text = "Charged 💎" if status == "charged" else "Approved ✅"
-            card = fullcc.split("|")[0] if "|" in fullcc else fullcc
-            try:
-                bin_data = get_bin_details(card[:6]) if get_bin_details else None
-                if bin_data:
-                    vendor = bin_data.get("vendor", "N/A")
-                    card_type = bin_data.get("type", "N/A")
-                    bank = bin_data.get("bank", "N/A")
-                    country = f"{bin_data.get('country', 'N/A')} {bin_data.get('flag', '')}"
-                else:
-                    vendor = card_type = bank = country = "N/A"
-            except Exception:
-                vendor = card_type = bank = country = "N/A"
-            resp_display = (response or "")[:60] if response else "OK"
-            return f"""<b>[#Stripe Worker] | {header}</b> ✦
-━━━━━━━━━━━━━━━
-<b>[•] Card:</b> <code>{fullcc}</code>
-<b>[•] Gateway:</b> <code>Stripe Worker</code>
-<b>[•] Status:</b> <code>{status_text}</code>
-<b>[•] Response:</b> <code>{resp_display}</code>
-━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-<b>[+] BIN:</b> <code>{card[:6]}</code>
-<b>[+] Info:</b> <code>{vendor} - {card_type}</code>
-<b>[+] Bank:</b> <code>{bank}</code> 🏦
-<b>[+] Country:</b> <code>{country}</code>
-━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
-<b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
-━━━━━━━━━━━━━━━"""
-
-        loader_msg = await message.reply(
-            f"""<pre>✦ Mass Stripe Worker Check</pre>
-<b>[⚬] Gateway:</b> <code>{gateway}</code>
-<b>[⚬] CC Amount:</b> <code>{card_count}</code>
-<b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
-<b>[⚬] Status:</b> <code>Processing...</code>""",
-            reply_to_message_id=message.id,
-            parse_mode=ParseMode.HTML
-        )
-        start_time = time.time()
-        final_results = []
-        total_cc = len(all_cards)
-        charged_count = 0
-        approved_count = 0
-        declined_count = 0
-        error_count = 0
-        processed_count = 0
-        for fullcc in all_cards:
-            card, mes, ano, cvv = fullcc.split("|")
-            result = await async_stripe_worker_charge(card, mes, ano, cvv)
-            status = result.get("status", "error")
-            response = result.get("response", "Unknown error")
-            status_flag = get_status_flag(status, response)
-            if status == "charged":
-                charged_count += 1
-            elif status == "approved":
-                approved_count += 1
-            elif status == "declined":
-                declined_count += 1
-            else:
-                error_count += 1
-            processed_count += 1
-            if status in ("charged", "approved"):
-                try:
-                    hit_message = build_worker_hit_message(fullcc, status, response)
-                    await message.reply(hit_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                except Exception:
-                    pass
-            try:
-                bin_data = get_bin_details(card[:6])
-                if bin_data:
-                    bin_info = f"{bin_data.get('vendor', 'N/A')} - {bin_data.get('type', 'N/A')}"
-                    country_info = f"{bin_data.get('country', 'N/A')} {bin_data.get('flag', '')}"
-                else:
-                    bin_info = "N/A"
-                    country_info = "N/A"
-            except:
-                bin_info = "N/A"
-                country_info = "N/A"
-            final_results.append(
-                f"<b>[•] Card:</b> <code>{fullcc}</code>\n"
-                f"<b>[•] Status:</b> <code>{status_flag}</code>\n"
-                f"<b>[•] Response:</b> <code>{response[:50]}</code>\n"
-                f"<b>[+] BIN:</b> <code>{card[:6]}</code> | <code>{bin_info}</code> | <code>{country_info}</code>\n"
-                "━ ━ ━ ━ ━ ━━━ ━ ━ ━ ━ ━"
-            )
-            ongoing_result = "\n".join(final_results[-5:])
-            try:
-                await loader_msg.edit(
-                    f"<pre>✦ Mass Stripe Worker Check</pre>\n"
-                    f"{ongoing_result}\n"
-                    f"<b>💬 Progress:</b> <code>{processed_count}/{total_cc}</code>\n"
-                    f"<b>💎 Charged:</b> <code>{charged_count}</code> <b>✅ Approved:</b> <code>{approved_count}</code>\n"
-                    f"<b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]",
-                    disable_web_page_preview=True,
-                    parse_mode=ParseMode.HTML
-                )
-            except:
-                pass
-        end_time = time.time()
-        timetaken = round(end_time - start_time, 2)
-        if user_data["plan"].get("credits") != "∞":
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, deduct_credit_bulk, user_id, card_count)
-        current_time = datetime.now().strftime("%I:%M %p")
-        completion_message = f"""<b>[#Stripe Worker] | MASS CHECK ✦</b>
-━━━━━━━━━━━━━━━
-🟢 <b>Total CC</b>     : <code>{total_cc}</code>
-💬 <b>Progress</b>    : <code>{processed_count}/{total_cc}</code>
-💎 <b>Charged</b>     : <code>{charged_count}</code>
-✅ <b>Approved</b>    : <code>{approved_count}</code>
-❌ <b>Declined</b>    : <code>{declined_count}</code>
-⚠️ <b>Errors</b>      : <code>{error_count}</code>
-━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
-<b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
-━━━━━━━━━━━━━━━
-<b>[ﾒ] Time:</b> <code>{timetaken}s</code> | <code>{current_time}</code>"""
-        await loader_msg.edit(
-            completion_message,
-            disable_web_page_preview=True,
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        print(f"Error in /msc: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            await message.reply(
-                f"<b>⚠️ An error occurred:</b>\n<code>{str(e)}</code>",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        except:
-            pass
-    finally:
-        user_locks.pop(user_id, None)
-
-
-@Client.on_message(filters.command(["mst", "mstripe"]) | filters.regex(r"^\$mst(\s|$)"))
+@Client.on_message(filters.command("msc"))
 async def handle_mass_stripe(client, message):
-    """
-    Handle /mst command for mass Stripe $20 Charge checking.
-    
-    Usage: /mst (reply to list of cards)
-    """
-    if not message.from_user:
+    user_id = get_user_id(message.from_user.id)
+    cards_text = message.text.split(" ", 1)[1] if len(message.text.split()) > 1 else None
+    if not cards_text:
+        await message.reply("Usage: /msc cc|mm|yy|cvc\ncc|mm|yy|cvc\n...")
         return
-    
-    user_id = str(message.from_user.id)
-    
-    # Check if user has ongoing request
-    if user_id in user_locks:
-        return await message.reply(
-            "<pre>⚠️ Wait!</pre>\n"
-            "<b>Your previous</b> <code>/mst</code> <b>request is still processing.</b>",
-            reply_to_message_id=message.id,
-            parse_mode=ParseMode.HTML
-        )
-    
-    user_locks[user_id] = True
-    
-    try:
-        users = load_users()
-        
-        if user_id not in users:
-            return await message.reply(
-                """<pre>Access Denied 🚫</pre>
-<b>You have to register first using</b> <code>/register</code> <b>command.</b>""",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        
-        # Check private access
-        if not await check_private_access(message):
-            return
-        
-        user_data = users[user_id]
-        plan_info = user_data.get("plan", {})
-        mlimit = plan_info.get("mlimit")
-        plan = plan_info.get("plan", "Free")
-        badge = plan_info.get("badge", "🎟️")
-        
-        # Default limit if None
-        if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
-        else:
-            mlimit = int(mlimit)
-        
-        # Extract cards
-        target_text = None
-        if message.reply_to_message and message.reply_to_message.text:
-            target_text = message.reply_to_message.text
-        elif len(message.text.split(maxsplit=1)) > 1:
-            target_text = message.text.split(maxsplit=1)[1]
-        
-        if not target_text:
-            return await message.reply(
-                "❌ <b>Send cards!</b>\n1 per line:\n<code>4242424242424242|08|28|690</code>",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        
-        all_cards = extract_cards(target_text)
-        if not all_cards:
-            return await message.reply(
-                "❌ No valid cards found!",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        
-        if len(all_cards) > mlimit:
-            return await message.reply(
-                f"❌ You can check max {mlimit} cards as per your plan!",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        
-        # Check credits
-        available_credits = user_data["plan"].get("credits", 0)
-        card_count = len(all_cards)
-        
-        if available_credits != "∞":
-            try:
-                available_credits = int(available_credits)
-                if card_count > available_credits:
-                    return await message.reply(
-                        """<pre>Notification ❗️</pre>
-<b>Message :</b> <code>You Have Insufficient Credits</code>
-━━━━━━━━━━━━━
-<b>Type <code>/buy</code> to get Credits.</b>""",
-                        reply_to_message_id=message.id,
-                        parse_mode=ParseMode.HTML
-                    )
-            except:
-                pass
-        
-        gateway = "Stripe $20 Balliante"
-        checked_by = f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>"
-        
-        # Send loading message
-        loader_msg = await message.reply(
-            f"""<pre>✦ Mass Stripe $20 Check</pre>
-<b>[⚬] Gateway:</b> <code>{gateway}</code>
-<b>[⚬] CC Amount:</b> <code>{card_count}</code>
-<b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
-<b>[⚬] Status:</b> <code>Processing...</code>""",
-            reply_to_message_id=message.id,
-            parse_mode=ParseMode.HTML
-        )
-        
-        start_time = time.time()
-        final_results = []
-        
-        # Statistics
-        total_cc = len(all_cards)
-        charged_count = 0
-        approved_count = 0
-        declined_count = 0
-        error_count = 0
-        processed_count = 0
-        
-        for fullcc in all_cards:
-            card, mes, ano, cvv = fullcc.split("|")
-            
-            # Check card
-            result = await async_stripe_charge(card, mes, ano, cvv)
-            
-            status = result.get("status", "error")
-            response = result.get("response", "Unknown error")
-            
-            status_flag = get_status_flag(status, response)
-            
-            # Count statistics
-            if status == "charged":
-                charged_count += 1
-            elif status == "approved":
-                approved_count += 1
-            elif status == "declined":
-                declined_count += 1
-            else:
-                error_count += 1
-            
-            processed_count += 1
-            
-            # Get BIN info
-            try:
-                bin_data = get_bin_details(card[:6])
-                if bin_data:
-                    bin_info = f"{bin_data.get('vendor', 'N/A')} - {bin_data.get('type', 'N/A')}"
-                    country_info = f"{bin_data.get('country', 'N/A')} {bin_data.get('flag', '')}"
-                else:
-                    bin_info = "N/A"
-                    country_info = "N/A"
-            except:
-                bin_info = "N/A"
-                country_info = "N/A"
-            
-            final_results.append(
-                f"<b>[•] Card:</b> <code>{fullcc}</code>\n"
-                f"<b>[•] Status:</b> <code>{status_flag}</code>\n"
-                f"<b>[•] Response:</b> <code>{response[:50]}</code>\n"
-                f"<b>[+] BIN:</b> <code>{card[:6]}</code> | <code>{bin_info}</code> | <code>{country_info}</code>\n"
-                "━ ━ ━ ━ ━ ━━━ ━ ━ ━ ━ ━"
-            )
-            
-            # Update progress (show last 5 cards)
-            ongoing_result = "\n".join(final_results[-5:])
-            try:
-                await loader_msg.edit(
-                    f"<pre>✦ Mass Stripe $20 Check</pre>\n"
-                    f"{ongoing_result}\n"
-                    f"<b>💬 Progress:</b> <code>{processed_count}/{total_cc}</code>\n"
-                    f"<b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]",
-                    disable_web_page_preview=True,
-                    parse_mode=ParseMode.HTML
-                )
-            except:
-                pass
-        
-        end_time = time.time()
-        timetaken = round(end_time - start_time, 2)
-        
-        # Deduct credits
-        if user_data["plan"].get("credits") != "∞":
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, deduct_credit_bulk, user_id, card_count)
-        
-        # Final completion message
-        from datetime import datetime
-        current_time = datetime.now().strftime("%I:%M %p")
-        
-        completion_message = f"""<b>[#Stripe] | MASS CHECK ✦</b>
-━━━━━━━━━━━━━━━
-🟢 <b>Total CC</b>     : <code>{total_cc}</code>
-💬 <b>Progress</b>    : <code>{processed_count}/{total_cc}</code>
-💎 <b>Charged</b>     : <code>{charged_count}</code>
-✅ <b>Approved</b>    : <code>{approved_count}</code>
-❌ <b>Declined</b>    : <code>{declined_count}</code>
-⚠️ <b>Errors</b>      : <code>{error_count}</code>
-━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
-<b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
-━━━━━━━━━━━━━━━
-<b>[ﾒ] Time:</b> <code>{timetaken}s</code> | <code>{current_time}</code>"""
-        
-        await loader_msg.edit(
-            completion_message,
-            disable_web_page_preview=True,
-            parse_mode=ParseMode.HTML
-        )
-    
-    except Exception as e:
-        print(f"Error in /mst: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            await message.reply(
-                f"<b>⚠️ An error occurred:</b>\n<code>{str(e)}</code>",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        except:
-            pass
-    
-    finally:
-        user_locks.pop(user_id, None)
+    cards = cards_text.strip().split("\n")
+
+    # Prompt gate selection
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Stripe Auth", callback_data=f"mass_auth:{user_id}"),
+         InlineKeyboardButton("Stripe Charge", callback_data=f"mass_charge:{user_id}")],
+        [InlineKeyboardButton("Stop", callback_data=f"stop_mass:{user_id}")]
+    ])
+    msg = await message.reply("Select which gate:", reply_markup=keyboard)
+
+    temp_cards[user_id] = cards
+
+@Client.on_callback_query(filters.regex(r"^(mass_auth|mass_charge|stop_mass):"))
+async def handle_mass_gate(client, callback: CallbackQuery):
+    data = callback.data.split(":")
+    action = data[0]
+    user_id = int(data[1])
+
+    if action == "stop_mass":
+        temp_cards.pop(user_id, None)
+        await callback.message.edit_text("Mass check stopped.")
+        return
+
+    gate = action.split("_")[1]
+    cards = temp_cards.pop(user_id, [])
+    if not cards:
+        await callback.answer("No cards found.")
+        return
+
+    results = await asyncio.gather(*[process_card(card, gate) for card in cards])
+
+    response = "\n\n".join([format_mass_result(res, card, gate) for res, card in zip(results, cards)])
+    await callback.message.edit_text(response)
+    await callback.answer("Mass check completed!")
+
+async def process_card(card, gate):
+    if gate == "auth":
+        return await async_stripe_auth(card)
+    elif gate == "charge":
+        return await async_stripe_charge(card)
+
+def format_mass_result(result, card, gate):
+    bin_details = get_bin_details(card[:6])  # Sync for simplicity
+    return format_response(result, card, bin_details, gate)  # Reuse from single.py
