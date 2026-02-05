@@ -9,11 +9,13 @@ import time
 import asyncio
 from datetime import datetime
 from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ParseMode
 from BOT.helper.start import load_users
 from BOT.helper.permissions import check_private_access, is_premium_user
 from BOT.Charge.Stripe.api import async_stripe_charge
 from BOT.Charge.Stripe.worker_api import async_stripe_worker_charge
+from BOT.Charge.Stripe.charge_api import async_stripe_charge_gate
 from BOT.gc.credit import deduct_credit_bulk
 
 # Try to import BIN lookup
@@ -24,6 +26,8 @@ except ImportError:
         return None
 
 user_locks = {}
+# Store msc gate selection context: {user_id: {"cards": [...], "loader_msg_id": int, "chat_id": int, ...}}
+msc_pending = {}
 
 
 def extract_cards(text):
@@ -140,10 +144,70 @@ async def handle_mass_stripe_worker(client, message):
                     )
             except:
                 pass
-        gateway = "Stripe Worker"
-        checked_by = f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>"
+        # Gate selector for /msc
+        msc_pending[user_id] = {
+            "cards": all_cards,
+            "user_data": user_data,
+            "plan": plan,
+            "badge": badge,
+            "mlimit": mlimit,
+            "checked_by": f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>",
+        }
+        gate_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Stripe Auth", callback_data="msc_auth"),
+                InlineKeyboardButton("Stripe Charge", callback_data="msc_charge"),
+            ]
+        ])
+        await message.reply(
+            f"""<pre>Select which gate</pre>
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
+<b>• CC Amount -</b> <code>{len(all_cards)}</code>
+<b>• Choose gate below:</b>""",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML,
+            reply_markup=gate_buttons
+        )
+        user_locks.pop(user_id, None)
+    except Exception as e:
+        print(f"Error in /msc: {e}")
+        import traceback
+        traceback.print_exc()
+        user_locks.pop(user_id, None)
+        try:
+            await message.reply(
+                f"<b>⚠️ An error occurred:</b>\n<code>{str(e)}</code>",
+                reply_to_message_id=message.id,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
 
-        def build_worker_hit_message(fullcc: str, status: str, response: str) -> str:
+
+@Client.on_callback_query(filters.regex(r"^msc_(auth|charge)$"))
+async def msc_gate_callback(client, callback: CallbackQuery):
+    """Handle /msc gate selection - run mass check with chosen gate."""
+    try:
+        if not callback.data or not callback.from_user:
+            return
+        gate_type = "auth" if "auth" in callback.data else "charge"
+        user_id = str(callback.from_user.id)
+        if user_id not in msc_pending:
+            await callback.answer("Session expired. Use /msc again.", show_alert=True)
+            return
+        ctx = msc_pending.pop(user_id)
+        all_cards = ctx["cards"]
+        user_data = ctx["user_data"]
+        plan = ctx["plan"]
+        badge = ctx["badge"]
+        checked_by = ctx["checked_by"]
+        gateway = "Stripe Worker" if gate_type == "auth" else "Stripe Charge"
+        if user_id in user_locks:
+            await callback.answer("Another check in progress", show_alert=True)
+            return
+        user_locks[user_id] = True
+
+        def build_hit_message(fullcc: str, status: str, response: str) -> str:
             header = "CHARGED" if status == "charged" else "CCN LIVE"
             status_text = "Charged 💎" if status == "charged" else "Approved ✅"
             card = fullcc.split("|")[0] if "|" in fullcc else fullcc
@@ -159,10 +223,10 @@ async def handle_mass_stripe_worker(client, message):
             except Exception:
                 vendor = card_type = bank = country = "N/A"
             resp_display = (response or "")[:60] if response else "OK"
-            return f"""<b>[#Stripe Worker] | {header}</b> ✦
+            return f"""<b>[#Stripe] | {header}</b> ✦
 ━━━━━━━━━━━━━━━
 <b>[•] Card:</b> <code>{fullcc}</code>
-<b>[•] Gateway:</b> <code>Stripe Worker</code>
+<b>[•] Gateway:</b> <code>{gateway}</code>
 <b>[•] Status:</b> <code>{status_text}</code>
 <b>[•] Response:</b> <code>{resp_display}</code>
 ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
@@ -175,18 +239,19 @@ async def handle_mass_stripe_worker(client, message):
 <b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
 ━━━━━━━━━━━━━━━"""
 
-        loader_msg = await message.reply(
-            f"""<pre>✦ Mass Stripe Worker Check</pre>
+        await callback.answer("Processing...")
+        loader_msg = callback.message
+        total_cc = len(all_cards)
+        await loader_msg.edit(
+            f"""<pre>✦ Mass Stripe Check</pre>
 <b>[⚬] Gateway:</b> <code>{gateway}</code>
-<b>[⚬] CC Amount:</b> <code>{card_count}</code>
+<b>[⚬] CC Amount:</b> <code>{total_cc}</code>
 <b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
 <b>[⚬] Status:</b> <code>Processing...</code>""",
-            reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML
         )
         start_time = time.time()
         final_results = []
-        total_cc = len(all_cards)
         charged_count = 0
         approved_count = 0
         declined_count = 0
@@ -194,7 +259,10 @@ async def handle_mass_stripe_worker(client, message):
         processed_count = 0
         for fullcc in all_cards:
             card, mes, ano, cvv = fullcc.split("|")
-            result = await async_stripe_worker_charge(card, mes, ano, cvv)
+            if gate_type == "auth":
+                result = await async_stripe_worker_charge(card, mes, ano, cvv)
+            else:
+                result = await async_stripe_charge_gate(card, mes, ano, cvv)
             status = result.get("status", "error")
             response = result.get("response", "Unknown error")
             status_flag = get_status_flag(status, response)
@@ -209,8 +277,8 @@ async def handle_mass_stripe_worker(client, message):
             processed_count += 1
             if status in ("charged", "approved"):
                 try:
-                    hit_message = build_worker_hit_message(fullcc, status, response)
-                    await message.reply(hit_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    hit_message = build_hit_message(fullcc, status, response)
+                    await loader_msg.reply(hit_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
                 except Exception:
                     pass
             try:
@@ -248,9 +316,9 @@ async def handle_mass_stripe_worker(client, message):
         timetaken = round(end_time - start_time, 2)
         if user_data["plan"].get("credits") != "∞":
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, deduct_credit_bulk, user_id, card_count)
+            await loop.run_in_executor(None, deduct_credit_bulk, user_id, total_cc)
         current_time = datetime.now().strftime("%I:%M %p")
-        completion_message = f"""<b>[#Stripe Worker] | MASS CHECK ✦</b>
+        completion_message = f"""<b>[#Stripe] | MASS CHECK ✦</b>
 ━━━━━━━━━━━━━━━
 🟢 <b>Total CC</b>     : <code>{total_cc}</code>
 💬 <b>Progress</b>    : <code>{processed_count}/{total_cc}</code>
@@ -269,16 +337,12 @@ async def handle_mass_stripe_worker(client, message):
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
-        print(f"Error in /msc: {e}")
+        print(f"Error in msc_gate_callback: {e}")
         import traceback
         traceback.print_exc()
         try:
-            await message.reply(
-                f"<b>⚠️ An error occurred:</b>\n<code>{str(e)}</code>",
-                reply_to_message_id=message.id,
-                parse_mode=ParseMode.HTML
-            )
-        except:
+            await callback.answer("Error occurred", show_alert=True)
+        except Exception:
             pass
     finally:
         user_locks.pop(user_id, None)

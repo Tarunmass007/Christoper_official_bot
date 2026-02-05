@@ -8,7 +8,7 @@ from time import time
 from datetime import datetime
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode, ChatType
 
 from BOT.helper.start import load_users
@@ -16,6 +16,7 @@ from BOT.helper.antispam import can_run_command
 from BOT.helper.permissions import check_private_access, is_premium_user
 from BOT.Charge.Stripe.api import async_stripe_charge
 from BOT.Charge.Stripe.worker_api import async_stripe_worker_charge
+from BOT.Charge.Stripe.charge_api import async_stripe_charge_gate
 from BOT.gc.credit import has_credits, deduct_credit
 
 # Try to import BIN lookup
@@ -102,22 +103,82 @@ async def handle_stripe_worker_charge(client, message):
             )
         card, mes, ano, cvv = extracted
         fullcc = f"{card}|{mes}|{ano}|{cvv}"
-        start_time = time()
+        # Gate selector - max 64 chars for callback_data
+        cb_auth = f"sc_auth|{fullcc}"[:64]
+        cb_charge = f"sc_charge|{fullcc}"[:64]
+        gate_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Stripe Auth", callback_data=cb_auth),
+                InlineKeyboardButton("Stripe Charge", callback_data=cb_charge),
+            ]
+        ])
+        await message.reply(
+            f"""<pre>Select which gate</pre>
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
+<b>• Card -</b> <code>{fullcc}</code>
+<b>• Choose gate below:</b>""",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML,
+            reply_markup=gate_buttons
+        )
+    except Exception as e:
+        print(f"Error in /sc: {e}")
+        import traceback
+        traceback.print_exc()
+        await message.reply(
+            "<code>Internal Error Occurred. Try again later.</code>",
+            reply_to_message_id=message.id,
+            parse_mode=ParseMode.HTML
+        )
+
+
+@Client.on_callback_query(filters.regex(r"^sc_(auth|charge)\|"))
+async def sc_gate_callback(client, callback: CallbackQuery):
+    """Handle /sc gate selection: Stripe Auth (worker) or Stripe Charge."""
+    try:
+        if not callback.data or not callback.from_user:
+            return
+        parts = callback.data.split("|", 1)
+        if len(parts) != 2:
+            await callback.answer("Invalid data", show_alert=True)
+            return
+        gate_type, card_data = parts[0], parts[1]
+        gate_type = gate_type.replace("sc_", "")
+        extracted = extract_card(card_data)
+        if not extracted:
+            await callback.answer("Invalid card format", show_alert=True)
+            return
+        card, mes, ano, cvv = extracted
+        fullcc = f"{card}|{mes}|{ano}|{cvv}"
+        user_id = str(callback.from_user.id)
+        users = load_users()
+        if user_id not in users:
+            await callback.answer("Register first", show_alert=True)
+            return
+        if not has_credits(user_id):
+            await callback.answer("Insufficient credits", show_alert=True)
+            return
         user_data = users[user_id]
         plan_info = user_data.get("plan", {})
         plan = plan_info.get("plan", "Free")
         badge = plan_info.get("badge", "🎟️")
-        checked_by = f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>"
-        loading_msg = await message.reply(
-            f"""<pre>Processing Stripe Worker Check..!</pre>
+        checked_by = f"<a href='tg://user?id={callback.from_user.id}'>{callback.from_user.first_name}</a>"
+        await callback.answer("Processing...")
+        msg_to_edit = callback.message
+        gate_name = "Stripe Worker" if gate_type == "auth" else "Stripe Charge"
+        await msg_to_edit.edit(
+            f"""<pre>Processing {gate_name}..!</pre>
 ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
 <b>• Card -</b> <code>{fullcc}</code>
-<b>• Gate -</b> <code>Stripe Worker</code>
+<b>• Gate -</b> <code>{gate_name}</code>
 <b>• Status -</b> <code>Checking...</code>""",
-            reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML
         )
-        result = await async_stripe_worker_charge(card, mes, ano, cvv)
+        start_time = time()
+        if gate_type == "auth":
+            result = await async_stripe_worker_charge(card, mes, ano, cvv)
+        else:
+            result = await async_stripe_charge_gate(card, mes, ano, cvv)
         time_taken = round(time() - start_time, 2)
         status = result.get("status", "error")
         response_msg = result.get("response", "UNKNOWN_ERROR")
@@ -148,10 +209,10 @@ async def handle_stripe_worker_charge(client, message):
             bank = "N/A"
             country = "N/A"
             country_flag = "🏳️"
-        final_msg = f"""<b>[#Stripe Worker] | {header}</b> ✦
+        final_msg = f"""<b>[#Stripe] | {header}</b> ✦
 ━━━━━━━━━━━━━━━
 <b>[•] Card:</b> <code>{fullcc}</code>
-<b>[•] Gateway:</b> <code>Stripe Worker</code>
+<b>[•] Gateway:</b> <code>{gate_name}</code>
 <b>[•] Status:</b> <code>{status_text}</code>
 <b>[•] Response:</b> <code>{response_msg}</code>
 ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
@@ -170,24 +231,21 @@ async def handle_stripe_worker_charge(client, message):
                 InlineKeyboardButton("Plans", callback_data="plans_info")
             ]
         ])
-        await loading_msg.edit(
+        await msg_to_edit.edit(
             final_msg,
             reply_markup=buttons,
             disable_web_page_preview=True,
             parse_mode=ParseMode.HTML
         )
-        success, msg = deduct_credit(user_id)
-        if not success:
-            print(f"Credit deduction failed for user {user_id}")
+        deduct_credit(user_id)
     except Exception as e:
-        print(f"Error in /sc: {e}")
+        print(f"Error in sc_gate_callback: {e}")
         import traceback
         traceback.print_exc()
-        await message.reply(
-            "<code>Internal Error Occurred. Try again later.</code>",
-            reply_to_message_id=message.id,
-            parse_mode=ParseMode.HTML
-        )
+        try:
+            await callback.answer("Error occurred", show_alert=True)
+        except Exception:
+            pass
 
 
 @Client.on_message(filters.command(["st", "stripe"]) | filters.regex(r"^\$st(\s|$)"))
