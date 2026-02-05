@@ -1,6 +1,7 @@
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from BOT.helper.start import load_users
+from BOT.db.store import is_owner, get_checked_by_plan_display, get_effective_mlimit
 from datetime import datetime
 from pyrogram.enums import ChatMemberStatus
 
@@ -62,10 +63,13 @@ async def info_command(client, message: Message):
     mlimit = plan_data.get("mlimit", "N/A")
     keyredeemed = plan_data.get("keyredeem", 0)
 
-    if plan.lower() == "free":
+    plan_name = plan_data.get("plan", "Free")
+    if plan_name.lower() == "free":
         stats = "Free"
-    elif plan.lower() == "redeem code":
+    elif plan_name.lower() == "redeem code":
         stats = "Premium"
+    elif is_owner(uid):
+        stats = "Owner"
     else:
         stats = "Paid"
 
@@ -79,7 +83,7 @@ async def info_command(client, message: Message):
 ━ ━ ━ ━ ━ ━━━ ━ ━ ━ ━ ━
 [ﾒ] <b>Status :</b> <code>{stats}</code>
 ⚬ <b>Credits :</b> <code>{credits}</code>
-⚬ <b>Plan :</b> <code>{plan}</code>
+⚬ <b>Plan :</b> <code>{plan_display}</code>
 ⚬ <b>Plan Expiry :</b> <code>{expiry}</code>
 ⚬ <b>Mass Limit :</b> <code>{mlimit}</code>
 ⚬ <b>Key Redeemed :</b> <code>{keyredeemed}</code>

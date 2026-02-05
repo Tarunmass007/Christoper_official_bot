@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import pytz
 from datetime import datetime
@@ -44,6 +44,40 @@ def _load_config() -> dict:
 
 def load_owner_id():
     return _load_config().get("OWNER")
+
+
+def is_owner(user_id) -> bool:
+    """Check if user_id is the configured owner (full admin access)."""
+    own = load_owner_id()
+    return own is not None and str(user_id) == str(own)
+
+
+def get_checked_by_plan_display(user_id: str, user_data: dict) -> str:
+    """
+    Get plan display for check results. Owner shows "Owner 🎭", others show "Plan Badge".
+    """
+    if is_owner(user_id):
+        return "Owner 🎭"
+    plan_info = user_data.get("plan", {})
+    plan = plan_info.get("plan", "Free")
+    badge = plan_info.get("badge", "🎟️")
+    return f"{plan} {badge}"
+
+
+def get_effective_mlimit(user_id: str, plan_info: dict) -> Optional[int]:
+    """
+    Get effective mass limit. Owner = unlimited (None), others use plan mlimit.
+    Returns None for unlimited, int for limit.
+    """
+    if is_owner(user_id):
+        return None  # Unlimited
+    mlimit = plan_info.get("mlimit")
+    if mlimit is None or str(mlimit).lower() in ["null", "none"]:
+        return 10_000  # Fallback for VIP etc
+    try:
+        return int(mlimit)
+    except (TypeError, ValueError):
+        return 10_000
 
 
 def get_ist_time() -> str:
@@ -192,6 +226,8 @@ def update_user(user_id: str, data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def has_credits(user_id: str) -> bool:
+    if is_owner(str(user_id)):
+        return True
     u = get_user(str(user_id))
     if not u:
         return False
@@ -205,6 +241,8 @@ def has_credits(user_id: str) -> bool:
 
 
 def deduct_credit(user_id: str) -> tuple[bool, str]:
+    if is_owner(str(user_id)):
+        return True, "Owner has infinite credits, no deduction necessary."
     if _use_mongo():
         c = _users_coll()
         try:
@@ -248,6 +286,8 @@ def deduct_credit(user_id: str) -> tuple[bool, str]:
 
 
 def deduct_credit_bulk(user_id: str, amount: int) -> tuple[bool, str]:
+    if is_owner(str(user_id)):
+        return True, "Owner has infinite credits, no deduction needed."
     if _use_mongo():
         c = _users_coll()
         try:

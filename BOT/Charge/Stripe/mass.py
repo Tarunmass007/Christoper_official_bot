@@ -13,6 +13,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 from pyrogram.enums import ParseMode
 from BOT.helper.start import load_users
 from BOT.helper.permissions import check_private_access, is_premium_user
+from BOT.db.store import is_owner, get_checked_by_plan_display, get_effective_mlimit
 from BOT.Charge.Stripe.api import async_stripe_charge
 from BOT.Charge.Stripe.worker_api import async_stripe_worker_charge
 from BOT.Charge.Stripe.charge_api import async_stripe_charge_gate
@@ -77,13 +78,10 @@ async def handle_mass_stripe_worker(client, message):
             return
         user_data = users[user_id]
         plan_info = user_data.get("plan", {})
-        mlimit = plan_info.get("mlimit")
+        mlimit = get_effective_mlimit(user_id, plan_info)
         plan = plan_info.get("plan", "Free")
         badge = plan_info.get("badge", "🎟️")
-        if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
-        else:
-            mlimit = int(mlimit)
+        plan_display = get_checked_by_plan_display(user_id, user_data)
         target_text = None
         if message.reply_to_message:
             if message.reply_to_message.text:
@@ -122,7 +120,7 @@ async def handle_mass_stripe_worker(client, message):
                 reply_to_message_id=message.id,
                 parse_mode=ParseMode.HTML
             )
-        if len(all_cards) > mlimit:
+        if mlimit is not None and len(all_cards) > mlimit:
             return await message.reply(
                 f"❌ You can check max {mlimit} cards as per your plan!",
                 reply_to_message_id=message.id,
@@ -150,6 +148,7 @@ async def handle_mass_stripe_worker(client, message):
             "user_data": user_data,
             "plan": plan,
             "badge": badge,
+            "plan_display": plan_display,
             "mlimit": mlimit,
             "checked_by": f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>",
         }
@@ -198,8 +197,7 @@ async def msc_gate_callback(client, callback: CallbackQuery):
         ctx = msc_pending.pop(user_id)
         all_cards = ctx["cards"]
         user_data = ctx["user_data"]
-        plan = ctx["plan"]
-        badge = ctx["badge"]
+        plan_display = ctx.get("plan_display") or f"{ctx.get('plan', 'Free')} {ctx.get('badge', '🎟️')}"
         checked_by = ctx["checked_by"]
         gateway = "Stripe Worker" if gate_type == "auth" else "Stripe Charge"
         if user_id in user_locks:
@@ -235,7 +233,7 @@ async def msc_gate_callback(client, callback: CallbackQuery):
 <b>[+] Bank:</b> <code>{bank}</code> 🏦
 <b>[+] Country:</b> <code>{country}</code>
 ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
+<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan_display}</code>]
 <b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
 ━━━━━━━━━━━━━━━"""
 
@@ -246,7 +244,7 @@ async def msc_gate_callback(client, callback: CallbackQuery):
             f"""<pre>✦ Mass Stripe Check</pre>
 <b>[⚬] Gateway:</b> <code>{gateway}</code>
 <b>[⚬] CC Amount:</b> <code>{total_cc}</code>
-<b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
+<b>[⚬] Checked By:</b> {checked_by} [<code>{plan_display}</code>]
 <b>[⚬] Status:</b> <code>Processing...</code>""",
             parse_mode=ParseMode.HTML
         )
@@ -306,7 +304,7 @@ async def msc_gate_callback(client, callback: CallbackQuery):
                     f"{ongoing_result}\n"
                     f"<b>💬 Progress:</b> <code>{processed_count}/{total_cc}</code>\n"
                     f"<b>💎 Charged:</b> <code>{charged_count}</code> <b>✅ Approved:</b> <code>{approved_count}</code>\n"
-                    f"<b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]",
+                    f"<b>[⚬] Checked By:</b> {checked_by} [<code>{plan_display}</code>]",
                     disable_web_page_preview=True,
                     parse_mode=ParseMode.HTML
                 )
@@ -327,7 +325,7 @@ async def msc_gate_callback(client, callback: CallbackQuery):
 ❌ <b>Declined</b>    : <code>{declined_count}</code>
 ⚠️ <b>Errors</b>      : <code>{error_count}</code>
 ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
+<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan_display}</code>]
 <b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
 ━━━━━━━━━━━━━━━
 <b>[ﾒ] Time:</b> <code>{timetaken}s</code> | <code>{current_time}</code>"""
@@ -388,15 +386,8 @@ async def handle_mass_stripe(client, message):
         
         user_data = users[user_id]
         plan_info = user_data.get("plan", {})
-        mlimit = plan_info.get("mlimit")
-        plan = plan_info.get("plan", "Free")
-        badge = plan_info.get("badge", "🎟️")
-        
-        # Default limit if None
-        if mlimit is None or str(mlimit).lower() in ["null", "none"]:
-            mlimit = 10_000
-        else:
-            mlimit = int(mlimit)
+        mlimit = get_effective_mlimit(user_id, plan_info)
+        plan_display = get_checked_by_plan_display(user_id, user_data)
         
         # Extract cards
         target_text = None
@@ -420,7 +411,7 @@ async def handle_mass_stripe(client, message):
                 parse_mode=ParseMode.HTML
             )
         
-        if len(all_cards) > mlimit:
+        if mlimit is not None and len(all_cards) > mlimit:
             return await message.reply(
                 f"❌ You can check max {mlimit} cards as per your plan!",
                 reply_to_message_id=message.id,
@@ -454,7 +445,7 @@ async def handle_mass_stripe(client, message):
             f"""<pre>✦ Mass Stripe $20 Check</pre>
 <b>[⚬] Gateway:</b> <code>{gateway}</code>
 <b>[⚬] CC Amount:</b> <code>{card_count}</code>
-<b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
+<b>[⚬] Checked By:</b> {checked_by} [<code>{plan_display}</code>]
 <b>[⚬] Status:</b> <code>Processing...</code>""",
             reply_to_message_id=message.id,
             parse_mode=ParseMode.HTML
@@ -522,7 +513,7 @@ async def handle_mass_stripe(client, message):
                     f"<pre>✦ Mass Stripe $20 Check</pre>\n"
                     f"{ongoing_result}\n"
                     f"<b>💬 Progress:</b> <code>{processed_count}/{total_cc}</code>\n"
-                    f"<b>[⚬] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]",
+                    f"<b>[⚬] Checked By:</b> {checked_by} [<code>{plan_display}</code>]",
                     disable_web_page_preview=True,
                     parse_mode=ParseMode.HTML
                 )
@@ -550,7 +541,7 @@ async def handle_mass_stripe(client, message):
 ❌ <b>Declined</b>    : <code>{declined_count}</code>
 ⚠️ <b>Errors</b>      : <code>{error_count}</code>
 ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
+<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan_display}</code>]
 <b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
 ━━━━━━━━━━━━━━━
 <b>[ﾒ] Time:</b> <code>{timetaken}s</code> | <code>{current_time}</code>"""

@@ -14,6 +14,7 @@ from pyrogram.enums import ParseMode, ChatType
 from BOT.helper.start import load_users
 from BOT.helper.antispam import can_run_command
 from BOT.helper.permissions import check_private_access, is_premium_user
+from BOT.db.store import get_checked_by_plan_display
 from BOT.Charge.Stripe.api import async_stripe_charge
 from BOT.Charge.Stripe.worker_api import async_stripe_worker_charge
 from BOT.Charge.Stripe.charge_api import async_stripe_charge_gate
@@ -159,9 +160,7 @@ async def sc_gate_callback(client, callback: CallbackQuery):
             await callback.answer("Insufficient credits", show_alert=True)
             return
         user_data = users[user_id]
-        plan_info = user_data.get("plan", {})
-        plan = plan_info.get("plan", "Free")
-        badge = plan_info.get("badge", "🎟️")
+        plan_display = get_checked_by_plan_display(user_id, user_data)
         checked_by = f"<a href='tg://user?id={callback.from_user.id}'>{callback.from_user.first_name}</a>"
         await callback.answer("Processing...")
         msg_to_edit = callback.message
@@ -221,7 +220,7 @@ async def sc_gate_callback(client, callback: CallbackQuery):
 <b>[+] Bank:</b> <code>{bank}</code> 🏦
 <b>[+] Country:</b> <code>{country}</code> {country_flag}
 ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
+<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan_display}</code>]
 <b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
 ━━━━━━━━━━━━━━━
 <b>[ﾒ] Time:</b> <code>{time_taken}s</code> | <b>Proxy:</b> <code>Live ⚡️</code>"""
@@ -339,9 +338,7 @@ async def handle_stripe_charge(client, message):
 
         # Get user info
         user_data = users[user_id]
-        plan_info = user_data.get("plan", {})
-        plan = plan_info.get("plan", "Free")
-        badge = plan_info.get("badge", "🎟️")
+        plan_display = get_checked_by_plan_display(user_id, user_data)
         checked_by = f"<a href='tg://user?id={message.from_user.id}'>{message.from_user.first_name}</a>"
 
         # Show processing message
@@ -407,7 +404,7 @@ async def handle_stripe_charge(client, message):
 <b>[+] Bank:</b> <code>{bank}</code> 🏦
 <b>[+] Country:</b> <code>{country}</code> {country_flag}
 ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
-<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan} {badge}</code>]
+<b>[ﾒ] Checked By:</b> {checked_by} [<code>{plan_display}</code>]
 <b>[ϟ] Dev:</b> <a href="https://t.me/Chr1shtopher">Chr1shtopher</a>
 ━━━━━━━━━━━━━━━
 <b>[ﾒ] Time:</b> <code>{time_taken}s</code> | <b>Proxy:</b> <code>Live ⚡️</code>"""
