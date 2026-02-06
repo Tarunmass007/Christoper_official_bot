@@ -628,14 +628,36 @@ async def add_site_handler(client: Client, message: Message):
             price = s.get("formatted_price") or f"${s.get('price', 'N/A')}"
             product_preview.append(f"• {name} — {price}")
         product_preview_text = "\n".join(product_preview) if product_preview else "—"
-        await status_msg.edit_text(
-            f"""<pre>🔍 Testing Sites...</pre>
+        spinners = ("◐", "◓", "◑", "◒")
+
+        async def spinner_loop():
+            i = 0
+            while True:
+                try:
+                    s = spinners[i % 4]
+                    await status_msg.edit_text(
+                        f"""<pre>{s} Testing Sites...</pre>
 ━━━━━━━━━━━━━
 <b>📦 Parsed product(s):</b>
 {product_preview_text}
 
 <b>Valid Sites:</b> <code>{len(valid_sites)}</code>
-<b>Status:</b> <i>Running test checkout (bill generation)...</i>""",
+<b>Status:</b> <i>{s} Running test checkout...</i>""",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+                i += 1
+                await asyncio.sleep(1.0)
+
+        await status_msg.edit_text(
+            f"""<pre>◐ Testing Sites...</pre>
+━━━━━━━━━━━━━
+<b>📦 Parsed product(s):</b>
+{product_preview_text}
+
+<b>Valid Sites:</b> <code>{len(valid_sites)}</code>
+<b>Status:</b> <i>◐ Running test checkout...</i>""",
             parse_mode=ParseMode.HTML
         )
 
@@ -657,7 +679,15 @@ async def add_site_handler(client: Client, message: Message):
             return None
 
         test_tasks = [test_and_save(v) for v in valid_sites]
-        test_results = await asyncio.gather(*test_tasks, return_exceptions=True)
+        spinner_task = asyncio.create_task(spinner_loop())
+        try:
+            test_results = await asyncio.gather(*test_tasks, return_exceptions=True)
+        finally:
+            spinner_task.cancel()
+            try:
+                await spinner_task
+            except asyncio.CancelledError:
+                pass
 
         sites_with_receipt = []
         for result in test_results:

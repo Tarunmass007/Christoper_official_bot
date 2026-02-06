@@ -117,29 +117,44 @@ def capture(data, first, last):
       return None
 
 
-# ========== SESSION TOKEN PARSING (multi-pattern for stickerdad.com and similar) ==========
-# Canonical format: <meta name="serialized-sessionToken" content="&quot;TOKEN&quot;"/>
-# Variable name used everywhere: x_checkout_one_session_token (headers + GraphQL sessionToken).
+# ========== SESSION TOKEN PARSING (old working api.py patterns first) ==========
+# Old api.py: capture(text, 'serialized-session-token" content="&quot;', '&quot')
+# User format: <meta name="serialized-sessionToken" content="&quot;TOKEN&quot;"/>
 SESSION_TOKEN_PREFIX = '<meta name="serialized-sessionToken" content="&quot;'
 SESSION_TOKEN_SUFFIX = '&quot;"/>'
 
+# Old working capture patterns (try first - matches tiefossi.com and similar)
+SESSION_TOKEN_CAPTURE_PAIRS = [
+    ('serialized-session-token" content="&quot;', '&quot'),       # old api.py
+    ('serialized-sessionToken" content="&quot;', '&quot;"/>'),     # user format
+    ('<meta name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+    ('<meta name="serialized-session-token" content="&quot;', '&quot;"/>'),
+]
+
 SESSION_TOKEN_PATTERNS = [
+    (r'<meta\s+name="serialized-session-token"\s+content="&quot;([^&]+)&quot;"', 'meta_hyphen'),  # old api
     (r'<meta\s+name="serialized-sessionToken"\s+content="&quot;([^&]+)&quot;"\s*/>', 'meta_standard'),
     (r'<meta\s+content="&quot;([^&]+)&quot;"\s+name="serialized-sessionToken"\s*/>', 'meta_reversed'),
     (r'"serializedSessionToken"\s*:\s*"([^"]+)"', 'json_script'),
     (r"name='serialized-sessionToken'\s+content='&quot;([^&]+)&quot;'", 'meta_single_quote'),
     (r'name="serialized-sessionToken"\s+content="([^"]+)"', 'meta_plain'),
-    (r'<meta\s+name="serialized-session-token"\s+content="&quot;([^&]+)&quot;"', 'meta_hyphen'),
 ]
 
 def _extract_session_token(checkout_text: str) -> Optional[str]:
     """
-    Extract x_checkout_one_session_token using multiple patterns for maximum compatibility.
-    Enhanced for stickerdad.com and similar sites; fallback to canonical prefix/suffix.
+    Extract x_checkout_one_session_token. Old api.py patterns first for tiefossi.com compatibility.
     """
     if not checkout_text or not isinstance(checkout_text, str):
         return None
-    # Try regex patterns first
+    # Old working capture patterns first (same as api.py)
+    for prefix, suffix in SESSION_TOKEN_CAPTURE_PAIRS:
+        try:
+            v = capture(checkout_text, prefix, suffix)
+            if v and isinstance(v, str) and len(v.strip()) > 10:
+                return v.strip()
+        except Exception:
+            continue
+    # Regex patterns
     for pattern, name in SESSION_TOKEN_PATTERNS:
         try:
             match = re.search(pattern, checkout_text, re.IGNORECASE | re.DOTALL)
@@ -480,8 +495,14 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
     # Session token: enhanced multi-pattern parser
     out["session_token"] = _extract_session_token(text)
 
-    # Source token: canonical meta format first (same as session token)
-    out["source_token"] = capture(text, '<meta name="serialized-sourceToken" content="&quot;', '&quot;"/>') or capture(text, 'name="serialized-sourceToken" content="&quot;', '&quot;"/>')
+    # Source token: old api.py pattern first - capture(text, 'serialized-source-token" content="&quot;', '&quot')
+    out["source_token"] = _capture_multi(
+        text,
+        ('serialized-source-token" content="&quot;', '&quot'),       # old api.py
+        ('serialized-sourceToken" content="&quot;', '&quot;"/>'),
+        ('<meta name="serialized-sourceToken" content="&quot;', '&quot;"/>'),
+        ('name="serialized-sourceToken" content="&quot;', '&quot;"/>'),
+    )
     if not out["source_token"] and ("serialized-sourceToken" in text or "serialized-source-token" in text):
         for pat in [
             r'name\s*=\s*["\']serialized-sourceToken["\'][^>]*?content\s*=\s*["\']&quot;(.+?)&quot;\s*"\s*/\s*>',
@@ -540,14 +561,15 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
     if out["source_token"] and len(out["source_token"]) < 10:
         out["source_token"] = None
 
-    # Queue token (often in JSON blob); suffix &quot; (with semicolon) per script
+    # Queue token: old api.py uses capture(text, "queueToken&quot;:&quot;", "&quot")
     if not out["queue_token"]:
         out["queue_token"] = _capture_multi(
             text,
+            ('queueToken&quot;:&quot;', '&quot'),   # old api.py
             ('queueToken&quot;:&quot;', '&quot;'),
             ('queueToken":"', '"'),
             ('"queueToken":"', '"'),
-        ) or capture(text, "queueToken&quot;:&quot;", "&quot;")
+        ) or capture(text, "queueToken&quot;:&quot;", "&quot")
     if not out["queue_token"]:
         m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', text)
         if m:
@@ -563,14 +585,15 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
     if out["queue_token"] and isinstance(out["queue_token"], str):
         out["queue_token"] = out["queue_token"].strip() or None
 
-    # Stable ID; suffix &quot; (with semicolon) per script
+    # Stable ID: old api.py uses capture(text, "stableId&quot;:&quot;", "&quot")
     if not out["stable_id"]:
         out["stable_id"] = _capture_multi(
             text,
+            ('stableId&quot;:&quot;', '&quot'),   # old api.py
             ('stableId&quot;:&quot;', '&quot;'),
             ('stableId":"', '"'),
             ('"stableId":"', '"'),
-        ) or capture(text, "stableId&quot;:&quot;", "&quot;")
+        ) or capture(text, "stableId&quot;:&quot;", "&quot")
     if not out["stable_id"]:
         m = re.search(r'"stableId"\s*:\s*"([^"]+)"', text)
         if m:
@@ -1686,10 +1709,11 @@ async def autoshopify(url, card, session, proxy=None):
         try:
             stable_id = _capture_multi(
                 checkout_text,
+                ('stableId&quot;:&quot;', '&quot'),   # old api.py
                 ('stableId&quot;:&quot;', '&quot;'),
                 ('stableId":"', '"'),
                 ('"stableId":"', '"'),
-            ) or capture(checkout_text, "stableId&quot;:&quot;", "&quot;")
+            ) or capture(checkout_text, "stableId&quot;:&quot;", "&quot")
             if not stable_id:
                 m = re.search(r'"stableId"\s*:\s*"([^"]+)"', checkout_text)
                 if m:
@@ -1699,10 +1723,11 @@ async def autoshopify(url, card, session, proxy=None):
         try:
             queue_token = _capture_multi(
                 checkout_text,
+                ('queueToken&quot;:&quot;', '&quot'),   # old api.py
                 ('queueToken&quot;:&quot;', '&quot;'),
                 ('queueToken":"', '"'),
                 ('"queueToken":"', '"'),
-            ) or capture(checkout_text, "queueToken&quot;:&quot;", "&quot;")
+            ) or capture(checkout_text, "queueToken&quot;:&quot;", "&quot")
             if not queue_token:
                 m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', checkout_text)
                 if m:
@@ -1725,9 +1750,19 @@ async def autoshopify(url, card, session, proxy=None):
 
         # Session token: single canonical parser only — variable x_checkout_one_session_token used everywhere
         x_checkout_one_session_token = _extract_session_token(checkout_text)
-        # Source token: same format <meta name="serialized-sourceToken" content="&quot;TOKEN&quot;"/>
-        token = None
-        if "serialized-sourceToken" in checkout_text or "serialized-source-token" in checkout_text:
+        # Source token: old api.py first - capture(text, 'serialized-source-token" content="&quot;', '&quot')
+        token = _capture_multi(
+            checkout_text,
+            ('serialized-source-token" content="&quot;', '&quot'),   # old api.py
+            ('serialized-sourceToken" content="&quot;', '&quot;"/>'),
+            ('name="serialized-sourceToken" content="&quot;', '&quot;"/>'),
+            ('name="serialized-sourceToken" content="&quot;', '&quot;" />'),
+            ('serialized-source-token" content="&quot;', '&quot;"/>'),
+            ('serialized-source-token" content="', '"'),
+            ('name="serialized-source-token" content="', '"'),
+            ("name='serialized-source-token' content='", "'"),
+        )
+        if not token and ("serialized-sourceToken" in checkout_text or "serialized-source-token" in checkout_text):
             for pat in [
                 r'name\s*=\s*["\']serialized-sourceToken["\'][^>]*?content\s*=\s*["\']&quot;(.+?)&quot;\s*"\s*/\s*>',
                 r'name\s*=\s*["\']serialized-sourceToken["\'][^>]*?content\s*=\s*&quot;(.+?)&quot;\s*"\s*/\s*>',
@@ -1738,19 +1773,6 @@ async def autoshopify(url, card, session, proxy=None):
                     if v and len(v) > 10:
                         token = v
                         break
-        if not token:
-            token = _capture_multi(
-                checkout_text,
-                ('name="serialized-sourceToken" content="&quot;', '&quot;"/>'),
-                ('name="serialized-sourceToken" content="&quot;', '&quot;" />'),
-                ('serialized-sourceToken" content="&quot;', '&quot;"/>'),
-                ('serialized-source-token" content="&quot;', '&quot'),
-                ('serialized-source-token" content="', '"'),
-                ('serialized-source-token&quot; content=&quot;&quot;', '&quot;'),
-                ('name="serialized-source-token" content="', '"'),
-                ("name='serialized-source-token' content='", "'"),
-                ('serialized-source-token" content=\'', "'"),
-            )
         if not token and 'serializedSourceToken' in checkout_text:
             m = re.search(r'"serializedSourceToken"\s*:\s*"([^"]+)"', checkout_text)
             if m:

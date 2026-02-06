@@ -528,7 +528,7 @@ Use <code>/txturl site1.com site2.com</code> for multiple sites.""",
         )
 
         spinners = ("◐", "◓", "◑", "◒")
-        SPINNER_INTERVAL = 2.0
+        SPINNER_INTERVAL = 1.0
 
         async def spinner_loop():
             i = 0

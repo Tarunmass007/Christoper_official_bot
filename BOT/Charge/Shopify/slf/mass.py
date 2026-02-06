@@ -461,7 +461,7 @@ async def mslf_handler(client, message):
                     return
                 elapsed = now - start_time
                 rate = (processed_count / elapsed) if elapsed > 0 else 0
-                sp = SPINNERS[processed_count % 4]
+                sp = SPINNERS[int(now) % 4]  # Rotate every 1 second
                 progress_text = f"""<pre>{sp} [#MSH] | Mass Shopify Check</pre>
 ━━━━━━━━━━━━━━━
 <b>[⚬] Check ID:</b> <code>{check_id}</code>
