@@ -118,26 +118,33 @@ def capture(data, first, last):
 
 
 # ========== SESSION TOKEN PARSING (old working api.py patterns first) ==========
-# Old api.py: capture(text, 'serialized-session-token" content="&quot;', '&quot')
+# Old api.py: capture(text, 'serialized-session-token" content="&quot;', '&quot') - tiefossi.com
 # User format: <meta name="serialized-sessionToken" content="&quot;TOKEN&quot;"/>
+# stickerdad.com may use shop.app or store checkout with different encoding
 SESSION_TOKEN_PREFIX = '<meta name="serialized-sessionToken" content="&quot;'
 SESSION_TOKEN_SUFFIX = '&quot;"/>'
 
 # Old working capture patterns (try first - matches tiefossi.com and similar)
 SESSION_TOKEN_CAPTURE_PAIRS = [
-    ('serialized-session-token" content="&quot;', '&quot'),       # old api.py
+    ('serialized-session-token" content="&quot;', '&quot'),       # old api.py - tiefossi
+    ('serialized-session-token" content="&quot;', '&quot;'),       # variant
     ('serialized-sessionToken" content="&quot;', '&quot;"/>'),     # user format
+    ('serialized-sessionToken" content="&quot;', '&quot;'),        # stickerdad/shop.app
     ('<meta name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
     ('<meta name="serialized-session-token" content="&quot;', '&quot;"/>'),
+    ('name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+    ('name="serialized-session-token" content="&quot;', '&quot'),  # old hyphen
 ]
 
 SESSION_TOKEN_PATTERNS = [
     (r'<meta\s+name="serialized-session-token"\s+content="&quot;([^&]+)&quot;"', 'meta_hyphen'),  # old api
-    (r'<meta\s+name="serialized-sessionToken"\s+content="&quot;([^&]+)&quot;"\s*/>', 'meta_standard'),
-    (r'<meta\s+content="&quot;([^&]+)&quot;"\s+name="serialized-sessionToken"\s*/>', 'meta_reversed'),
-    (r'"serializedSessionToken"\s*:\s*"([^"]+)"', 'json_script'),
+    (r'<meta\s+name="serialized-sessionToken"\s+content="&quot;([^&]+)&quot;"\s*/?>', 'meta_standard'),
+    (r'<meta\s+content="&quot;([^&]+)&quot;"\s+name="serialized-sessionToken"\s*/?>', 'meta_reversed'),
+    (r'"serializedSessionToken"\s*:\s*"((?:[^"\\]|\\.)*)"', 'json_script'),
     (r"name='serialized-sessionToken'\s+content='&quot;([^&]+)&quot;'", 'meta_single_quote'),
     (r'name="serialized-sessionToken"\s+content="([^"]+)"', 'meta_plain'),
+    (r'serialized-session-token["\']?\s*content\s*=\s*["\']&quot;([^&]+)&quot;', 'inline_hyphen'),
+    (r'serializedSessionToken["\']?\s*:\s*["\']((?:[^"\\]|\\.)*)["\']', 'json_camel'),
 ]
 
 def _extract_session_token(checkout_text: str) -> Optional[str]:
@@ -498,10 +505,13 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
     # Source token: old api.py pattern first - capture(text, 'serialized-source-token" content="&quot;', '&quot')
     out["source_token"] = _capture_multi(
         text,
-        ('serialized-source-token" content="&quot;', '&quot'),       # old api.py
+        ('serialized-source-token" content="&quot;', '&quot'),       # old api.py - tiefossi
+        ('serialized-source-token" content="&quot;', '&quot;'),       # variant
         ('serialized-sourceToken" content="&quot;', '&quot;"/>'),
+        ('serialized-sourceToken" content="&quot;', '&quot;'),        # stickerdad/shop.app
         ('<meta name="serialized-sourceToken" content="&quot;', '&quot;"/>'),
         ('name="serialized-sourceToken" content="&quot;', '&quot;"/>'),
+        ('name="serialized-source-token" content="&quot;', '&quot'),  # old hyphen
     )
     if not out["source_token"] and ("serialized-sourceToken" in text or "serialized-source-token" in text):
         for pat in [
@@ -556,6 +566,13 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
         m = re.search(r"'sourceToken'\s*:\s*'([^']+)'", text)
         if m:
             out["source_token"] = m.group(1).strip()
+    # Source token from URL path in page (e.g. /checkouts/cn/TOKEN/ or redirect URL)
+    if not out["source_token"]:
+        m = re.search(r'/cn/([a-zA-Z0-9_-]{20,})', text)
+        if m:
+            v = m.group(1).strip()
+            if v and len(v) > 15:
+                out["source_token"] = v
     if out["source_token"] and isinstance(out["source_token"], str):
         out["source_token"] = out["source_token"].strip() or None
     if out["source_token"] and len(out["source_token"]) < 10:
@@ -609,6 +626,49 @@ def _extract_checkout_tokens_robust(checkout_text: str) -> dict:
     if out["stable_id"] and isinstance(out["stable_id"], str):
         out["stable_id"] = out["stable_id"].strip() or None
 
+    # Deep fallback: extract from JSON blobs anywhere in page (stickerdad.com, shop.app)
+    if not all([out["session_token"], out["source_token"], out["queue_token"], out["stable_id"]]):
+        deep = _extract_tokens_from_page_json(checkout_text)
+        if not out["session_token"] and deep.get("session_token"):
+            out["session_token"] = deep["session_token"]
+        if not out["source_token"] and deep.get("source_token"):
+            out["source_token"] = deep["source_token"]
+        if not out["queue_token"] and deep.get("queue_token"):
+            out["queue_token"] = deep["queue_token"]
+        if not out["stable_id"] and deep.get("stable_id"):
+            out["stable_id"] = deep["stable_id"]
+
+    return out
+
+
+def _extract_tokens_from_page_json(text: str) -> dict:
+    """
+    Extract tokens from JSON blobs embedded in checkout page (stickerdad, tiefossi, shop.app).
+    Searches for script tags, inline JSON, and HTML-entity encoded structures.
+    """
+    out = {"session_token": None, "source_token": None, "queue_token": None, "stable_id": None}
+    if not text or len(text) < 100:
+        return out
+    # Patterns for JSON-embedded tokens (handle escaped quotes in values)
+    json_patterns = [
+        (r'"serializedSessionToken"\s*:\s*"((?:[^"\\]|\\.)*)"', "session_token", 10),
+        (r'"sessionToken"\s*:\s*"((?:[^"\\]|\\.)*)"', "session_token", 10),
+        (r'"serializedSourceToken"\s*:\s*"((?:[^"\\]|\\.)*)"', "source_token", 8),
+        (r'"sourceToken"\s*:\s*"((?:[^"\\]|\\.)*)"', "source_token", 8),
+        (r'"queueToken"\s*:\s*"((?:[^"\\]|\\.)*)"', "queue_token", 3),
+        (r'"stableId"\s*:\s*"((?:[^"\\]|\\.)*)"', "stable_id", 3),
+        (r'queueToken&quot;:&quot;([^&]+)&quot;', "queue_token", 3),
+        (r'stableId&quot;:&quot;([^&]+)&quot;', "stable_id", 3),
+    ]
+    for pattern, key, min_len in json_patterns:
+        try:
+            m = re.search(pattern, text, re.DOTALL)
+            if m:
+                v = (m.group(1) or "").replace('\\"', '"').strip()
+                if v and len(v) >= min_len and not out.get(key):
+                    out[key] = v
+        except Exception:
+            pass
     return out
 
 
@@ -1560,7 +1620,22 @@ async def autoshopify(url, card, session, proxy=None):
             get_params = None
             if checkout_url and "skip_shop_pay" not in (checkout_url or ""):
                 get_params = {"skip_shop_pay": "true"}
-            if checkout_url and "/checkouts/" in (urlparse(checkout_url).path or ""):
+            # When redirect goes to shop.app, try store's /checkout first - may get tokens without shop.app
+            if checkout_url and "shop.app" in (checkout_url or ""):
+                try:
+                    store_checkout = f"{url.rstrip('/')}/checkout"
+                    req_store = await session.get(store_checkout, headers=checkout_headers, params={"skip_shop_pay": "true"}, follow_redirects=True, timeout=22)
+                    st_sc = getattr(req_store, "status_code", 0)
+                    st_text = (getattr(req_store, "text", None) or "").strip()
+                    if st_sc == 200 and len(st_text) > 5000 and ("serialized-sessionToken" in st_text or "serialized-session-token" in st_text or "serialized-sourceToken" in st_text or "serialized-source-token" in st_text or "serializedSessionToken" in st_text):
+                        checkout_text = st_text
+                        request = req_store
+                        checkout_sc = 200
+                        checkout_url = store_checkout
+                        logger.info("Checkout from store (skip shop.app) for %s len=%s", url, len(checkout_text))
+                except Exception as e:
+                    logger.debug("Store checkout try: %s", e)
+            if not checkout_text and checkout_url and "/checkouts/" in (urlparse(checkout_url).path or ""):
                 try:
                     get_immediate = await session.get(
                         checkout_url,
@@ -1571,7 +1646,7 @@ async def autoshopify(url, card, session, proxy=None):
                     )
                     imm_sc = getattr(get_immediate, "status_code", 0)
                     imm_text = (getattr(get_immediate, "text", None) or "").strip()
-                    if imm_sc == 200 and len(imm_text) > 5000 and "serialized-sessionToken" in imm_text:
+                    if imm_sc == 200 and len(imm_text) > 5000 and ("serialized-sessionToken" in imm_text or "serialized-session-token" in imm_text or "serializedSessionToken" in imm_text):
                         checkout_text = imm_text
                         request = get_immediate
                         checkout_sc = 200
@@ -1638,12 +1713,12 @@ async def autoshopify(url, card, session, proxy=None):
             return output
         # If we got 200 but page has no tokens (e.g. intermediate/loading page), retry with follow_redirects=True
         # so we get the same final HTML as the diagnostic (which always follows redirects).
-        if checkout_sc == 200 and checkout_text and "serialized-sessionToken" not in checkout_text and "serialized-sourceToken" not in checkout_text:
+        if checkout_sc == 200 and checkout_text and "serialized-sessionToken" not in checkout_text and "serialized-session-token" not in checkout_text and "serialized-sourceToken" not in checkout_text and "serialized-source-token" not in checkout_text:
             try:
                 req_follow = await session.get(checkout_url, headers=checkout_headers, params=get_params, follow_redirects=True, timeout=22)
                 if getattr(req_follow, "status_code", 0) == 200 and getattr(req_follow, "text", None):
                     follow_text = (req_follow.text or "").strip()
-                    if len(follow_text) > 5000 and ("serialized-sessionToken" in follow_text or "serialized-sourceToken" in follow_text):
+                    if len(follow_text) > 5000 and ("serialized-sessionToken" in follow_text or "serialized-session-token" in follow_text or "serialized-sourceToken" in follow_text or "serialized-source-token" in follow_text or "serializedSessionToken" in follow_text):
                         checkout_text = follow_text
                         checkout_lower = checkout_text.lower()
                         logger.info("Checkout page refreshed with follow_redirects=True for %s (len=%s)", url, len(checkout_text))
@@ -1656,15 +1731,17 @@ async def autoshopify(url, card, session, proxy=None):
             except Exception as e:
                 logger.debug("Checkout no-token retry failed: %s", e)
         checkout_lower = checkout_text.lower()
+        has_tokens_in_page = ("serialized-session-token" in checkout_text or "serialized-sessionToken" in checkout_text) and ("serialized-source-token" in checkout_text or "serialized-sourceToken" in checkout_text or "serializedSourceToken" in checkout_text)
 
         if checkout_text.strip().startswith("<"):
-            if any(x in checkout_lower for x in ["captcha", "hcaptcha", "recaptcha", "challenge", "verify"]):
+            # Only treat as captcha block when we DON'T already have tokens (page may mention hcaptcha in scripts but still have tokens)
+            if not has_tokens_in_page and any(x in checkout_lower for x in ["captcha", "hcaptcha", "recaptcha", "challenge", "verify"]):
                 if HAS_CLOUDSCRAPER:
                     try:
                         cs_sc, cs_text = await asyncio.to_thread(
                             _fetch_checkout_cloudscraper_sync, checkout_url, proxy
                         )
-                        if cs_sc == 200 and cs_text and ("serialized-session-token" in cs_text or "serialized-sessionToken" in cs_text) and ("serialized-source-token" in cs_text or "serializedSourceToken" in cs_text):
+                        if cs_sc == 200 and cs_text and ("serialized-session-token" in cs_text or "serialized-sessionToken" in cs_text) and ("serialized-source-token" in cs_text or "serialized-sourceToken" in cs_text or "serializedSourceToken" in cs_text):
                             checkout_text = cs_text
                             checkout_lower = checkout_text.lower()
                         else:
@@ -1748,6 +1825,18 @@ async def autoshopify(url, card, session, proxy=None):
         except Exception:
             countryCode = currencyCode
 
+        # Extract presentmentCurrency from page to avoid BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH
+        presentment_currency_page = None
+        try:
+            presentment_currency_page = _capture_multi(
+                checkout_text,
+                ('presentmentCurrency&quot;:&quot;', '&quot'),
+                ('presentmentCurrency":"', '"'),
+                ('"presentmentCurrency":"', '"'),
+            ) or capture(checkout_text, "presentmentCurrency&quot;:&quot;", "&quot")
+        except Exception:
+            pass
+
         # Session token: single canonical parser only — variable x_checkout_one_session_token used everywhere
         x_checkout_one_session_token = _extract_session_token(checkout_text)
         # Source token: old api.py first - capture(text, 'serialized-source-token" content="&quot;', '&quot')
@@ -1788,6 +1877,12 @@ async def autoshopify(url, card, session, proxy=None):
             queue_token = robust_tokens["queue_token"]
         if not stable_id and robust_tokens.get("stable_id"):
             stable_id = robust_tokens["stable_id"]
+        # Source token from checkout URL path (e.g. /checkouts/cn/TOKEN/ or shop.app/.../cn/TOKEN/)
+        if not token and checkout_url:
+            m = re.search(r'/cn/([a-zA-Z0-9_-]{20,})', str(checkout_url))
+            if m:
+                token = m.group(1).strip()
+                logger.debug("Source token from checkout URL path")
 
         web_build = None
         try:
@@ -1914,7 +2009,7 @@ async def autoshopify(url, card, session, proxy=None):
                         if getattr(diag_req, "status_code", 0) != 200 or not getattr(diag_req, "text", None):
                             continue
                         diag_text = (diag_req.text or "").strip()
-                        if len(diag_text) > 5000 and "serialized-sessionToken" in diag_text:
+                        if len(diag_text) > 5000 and ("serialized-sessionToken" in diag_text or "serialized-session-token" in diag_text or "serializedSessionToken" in diag_text):
                             checkout_text = diag_text
                             checkout_lower = checkout_text.lower()
                             x_checkout_one_session_token = _extract_session_token(checkout_text) or x_checkout_one_session_token
@@ -1979,7 +2074,7 @@ async def autoshopify(url, card, session, proxy=None):
                                     "[last-resort] GET %.80s status=%s len=%s has_session_meta=%s",
                                     loc or "", _final_sc, len(final_text), "serialized-sessionToken" in final_text,
                                 )
-                                if _final_sc == 200 and final_text and len(final_text) > 5000 and "serialized-sessionToken" in final_text:
+                                if _final_sc == 200 and final_text and len(final_text) > 5000 and ("serialized-sessionToken" in final_text or "serialized-session-token" in final_text or "serializedSessionToken" in final_text):
                                         checkout_text = final_text
                                         checkout_lower = checkout_text.lower()
                                         x_checkout_one_session_token = _extract_session_token(checkout_text) or x_checkout_one_session_token
@@ -2019,6 +2114,19 @@ async def autoshopify(url, card, session, proxy=None):
             tax1 = capture(checkout_text, "totalTaxAndDutyAmount&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;", "&quot")
         except Exception:
             tax1 = None
+        # Extract checkout total from page for payment amount (avoids PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT)
+        checkout_total_str = None
+        try:
+            checkout_total_str = _capture_multi(
+                checkout_text,
+                ('checkoutTotal&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot'),
+                ('"checkoutTotal":{"value":{"amount":"', '"'),
+                ('totalAmountToPay&quot;:{&quot;amount&quot;:&quot;', '&quot'),
+                ('"totalAmountToPay":{"amount":"', '"'),
+                ('runningTotal&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot'),
+            )
+        except Exception:
+            pass
         try:
             gateway = _capture_multi(checkout_text, ('extensibilityDisplayName&quot;:&quot;', '&quot'), ('extensibilityDisplayName":"', '"')) or capture(checkout_text, 'extensibilityDisplayName&quot;:&quot;', '&quot')
         except Exception:
@@ -2109,6 +2217,24 @@ async def autoshopify(url, card, session, proxy=None):
                 price1_str = price1_str.replace("$", "").strip()
         curr_code = (currencyCode or (low_product.get("currency_code") if low_product else None) or "USD").strip()
         country_code_val = (countryCode or (low_product.get("country_code") if low_product else None) or "US").strip()
+        # Use page presentment currency for buyerIdentity to avoid BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH
+        buyer_presentment = (presentment_currency_page or curr_code).strip()
+        # Payment amount: prefer checkout total from page (includes shipping/tax) to avoid PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT
+        payment_amount_str = price1_str
+        if checkout_total_str:
+            try:
+                v = float(str(checkout_total_str).replace(",", ".").strip())
+                if v > 0:
+                    payment_amount_str = f"{v:.2f}"
+            except Exception:
+                pass
+        # For shipping products, if no total from page, add buffer for shipping (product + ~$5)
+        if not checkout_total_str and not non_shipping_flow:
+            try:
+                pv = float(str(price1_str).replace(",", "."))
+                payment_amount_str = f"{max(pv + 5.0, pv * 1.5):.2f}"
+            except Exception:
+                pass
         variant_id_submit = product_id
         if isinstance(variant_id_submit, str) and variant_id_submit.isdigit():
             variant_id_submit = int(variant_id_submit)
@@ -2136,8 +2262,21 @@ async def autoshopify(url, card, session, proxy=None):
             }
         else:
             dmt_list = [DMT] if (DMT and isinstance(DMT, str)) else ["SHIPPING", "LOCAL"]
+            dest_addr = {
+                "streetAddress": {
+                    "address1": addr.get("address1", "123 Main St"),
+                    "city": addr.get("city", "New York"),
+                    "countryCode": addr.get("countryCode", "US"),
+                    "postalCode": addr.get("postalCode", "10080"),
+                    "firstName": "Test",
+                    "lastName": "Buyer",
+                    "zoneCode": addr.get("zoneCode", "NY"),
+                    "phone": addr.get("phone", "12195551234"),
+                },
+            }
             delivery_payload = {
                 "deliveryLines": [{
+                    "destination": dest_addr,
                     "selectedDeliveryStrategy": {"deliveryStrategyMatchingConditions": {"estimatedTimeInTransit": {"any": True}, "shipments": {"any": True}}, "options": {}},
                     "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
                     "deliveryMethodTypes": dmt_list,
@@ -2149,6 +2288,15 @@ async def autoshopify(url, card, session, proxy=None):
                 "prefetchShippingRatesStrategy": None,
                 "supportsSplitShipping": True,
             }
+
+        # Captcha token: try bypass first; retry with solver on CAPTCHA_TOKEN_MISSING
+        captcha_token = None
+        if CAPTCHA_SOLVER_AVAILABLE:
+            try:
+                bypass = generate_bypass_data(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "")
+                captcha_token = (bypass.get("token") or "").strip() if isinstance(bypass, dict) else None
+            except Exception:
+                pass
 
         submit_vars = {
             "input": {
@@ -2164,7 +2312,7 @@ async def autoshopify(url, card, session, proxy=None):
                             "productVariantReference": {"id": f"gid://shopify/ProductVariantMerchandise/{variant_id_submit}", "variantId": f"gid://shopify/ProductVariant/{variant_id_submit}", "properties": [], "sellingPlanId": None, "sellingPlanDigest": None},
                         },
                         "quantity": {"items": {"value": 1}},
-                        "expectedTotalPrice": {"value": {"amount": price1_str, "currencyCode": curr_code}},
+                        "expectedTotalPrice": {"any": True},
                         "lineComponentsSource": None,
                         "lineComponents": [],
                     }],
@@ -2198,11 +2346,10 @@ async def autoshopify(url, card, session, proxy=None):
                             "paypalBillingAgreementPaymentMethod": None,
                             "remotePaymentInstrument": None,
                         },
-                        "amount": {"value": {"amount": price1_str, "currencyCode": curr_code}},
+                        "amount": {"value": {"amount": payment_amount_str, "currencyCode": curr_code}},
                     }],
                 },
-                "billingAddress": {"streetAddress": {"address1": addr.get("address1", "7 street"), "city": addr.get("city", "california"), "countryCode": "US", "postalCode": "90001", "firstName": "Tarun", "lastName": "S", "zoneCode": "CA", "phone": "16125626619"}},
-                "buyerIdentity": {"customer": {"presentmentCurrency": curr_code, "countryCode": country_code_val}, "email": "mass652004@gmail.com", "emailChanged": False, "phoneCountryCode": "IN", "marketingConsent": [], "shopPayOptInPhone": {"number": "16125626619", "countryCode": "IN"}, "rememberMe": False},
+                "buyerIdentity": {"customer": {"presentmentCurrency": buyer_presentment, "countryCode": country_code_val}, "email": "mass652004@gmail.com", "emailChanged": False, "phoneCountryCode": country_code_val, "marketingConsent": [], "shopPayOptInPhone": {"number": "16125626619", "countryCode": country_code_val}, "rememberMe": False},
                 "tip": {"tipLines": []},
                 "taxes": {"proposedAllocations": None, "proposedTotalAmount": {"value": {"amount": "0", "currencyCode": curr_code}}, "proposedTotalIncludedAmount": None, "proposedMixedStateTotalAmount": None},
                 "note": {"message": None, "customAttributes": [{"key": "__route_cart_id", "value": "7b0327c1-b18b-4490-9850-d4f3e6ee555a"}]},
@@ -2210,7 +2357,7 @@ async def autoshopify(url, card, session, proxy=None):
                 "nonNegotiableTerms": None,
                 "scriptFingerprint": {"signature": None, "signatureUuid": None, "lineItemScriptChanges": [], "paymentScriptChanges": [], "shippingScriptChanges": []},
                 "optionalDuties": {"buyerRefusesDuties": False},
-                "captcha": {"provider": "hcaptcha", "challenge": "comparison_challenge_type", "token": ""},
+                "captcha": {"provider": "hcaptcha", "challenge": "comparison_challenge_type", "token": captcha_token or ""},
                 "cartMetafields": [],
             },
             "attemptToken": token or "",
@@ -2218,11 +2365,12 @@ async def autoshopify(url, card, session, proxy=None):
             "analytics": {"requestUrl": checkout_url or f"{url.rstrip('/')}/checkout", "pageId": "97cf2a68-FFBC-4F9E-A74F-EA7F7448727E"},
         }
 
+        # receipt is a union - must use inline fragments, cannot select directly
         SUBMIT_QUERY = (
             'mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$metafields:[MetafieldInput!],$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken metafields:$metafields analytics:$analytics){'
-            '...on SubmitSuccess{receipt{id __typename}__typename}'
-            '...on SubmitAlreadyAccepted{receipt{id __typename}__typename}'
-            '...on SubmittedForCompletion{receipt{id __typename}__typename}'
+            '...on SubmitSuccess{receipt{...on ProcessedReceipt{id __typename}...on ProcessingReceipt{id __typename}...on WaitingReceipt{id __typename}...on FailedReceipt{id __typename}__typename}__typename}'
+            '...on SubmitAlreadyAccepted{receipt{...on ProcessedReceipt{id __typename}...on ProcessingReceipt{id __typename}...on WaitingReceipt{id __typename}...on FailedReceipt{id __typename}__typename}__typename}'
+            '...on SubmittedForCompletion{receipt{...on ProcessedReceipt{id __typename}...on ProcessingReceipt{id __typename}...on WaitingReceipt{id __typename}...on FailedReceipt{id __typename}__typename}__typename}'
             '...on SubmitFailed{reason __typename}'
             '...on SubmitRejected{errors{...on NegotiationError{code localizedMessage __typename}__typename}__typename}'
             '...on Throttled{pollAfter pollUrl __typename}'
@@ -2241,48 +2389,102 @@ async def autoshopify(url, card, session, proxy=None):
             "x-checkout-web-server-rendering": "no",
             "x-checkout-web-source-id": token or "",
         }
+        # GraphQL always uses store domain (url) - shop.app is only for page fetch; API lives on store
         submit_url = f"{url.rstrip('/')}/checkouts/unstable/graphql?operationName=SubmitForCompletion"
-        try:
-            submit_resp = await session.post(submit_url, json={"query": SUBMIT_QUERY, "variables": submit_vars, "operationName": "SubmitForCompletion"}, headers=submit_headers, timeout=25)
-        except Exception as e:
-            output.update({"Response": f"SUBMIT_REQUEST_ERROR: {str(e)[:50]}", "Status": False})
-            _log_output_to_terminal(output)
-            return output
-        submit_sc = getattr(submit_resp, "status_code", 0)
-        submit_text = (getattr(submit_resp, "text", None) or "").strip()
+        poll_url = f"{url.rstrip('/')}/checkouts/unstable/graphql?operationName=PollForReceipt"
+        submit_resp = None
+        submit_sc = 0
+        submit_text = ""
         bill = None
         submit_typename = None
-        if submit_sc == 200 and submit_text and submit_text.startswith("{"):
+        payment_amount_retry = payment_amount_str
+        for submit_attempt in range(3):
+            # Update payment amount for retries (PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT)
+            pl = (submit_vars.get("input") or {}).get("payment") or {}
+            plines = pl.get("paymentLines") or []
+            if plines and isinstance(plines[0], dict):
+                plines[0]["amount"] = {"value": {"amount": payment_amount_retry, "currencyCode": curr_code}}
             try:
-                submit_data = json.loads(submit_text)
-                data_node = submit_data.get("data") or {}
-                sfc = data_node.get("submitForCompletion") or {}
-                submit_typename = (sfc.get("__typename") or "")
-                if submit_typename in ("SubmitSuccess", "SubmitAlreadyAccepted", "SubmittedForCompletion"):
-                    rec = sfc.get("receipt")
-                    if isinstance(rec, dict):
-                        bill = (rec.get("id") or "").strip()
-                elif submit_typename == "SubmitFailed":
-                    reason = (sfc.get("reason") or "").strip() or "SUBMIT_FAILED"
-                    output.update({"Response": reason[:80], "Status": False, "Price": price1_str, "Gateway": gateway or "Shopify"})
-                    _log_output_to_terminal(output)
-                    return output
-                elif submit_typename == "SubmitRejected":
-                    errs = sfc.get("errors") or []
-                    code = "CARD_DECLINED"
-                    if errs and isinstance(errs[0], dict):
-                        code = (errs[0].get("code") or errs[0].get("localizedMessage") or code)[:60]
-                    output.update({"Response": code, "Status": False, "Price": price1_str, "Gateway": gateway or "Shopify"})
-                    _log_output_to_terminal(output)
-                    return output
-                if not bill and submit_data.get("errors"):
-                    err_list = submit_data.get("errors", [])
-                    first_msg = (err_list[0].get("message") or str(err_list[0]))[:80] if err_list else ""
-                    output.update({"Response": first_msg or "SUBMIT_GRAPHQL_ERROR", "Status": False})
-                    _log_output_to_terminal(output)
-                    return output
+                submit_resp = await session.post(submit_url, json={"query": SUBMIT_QUERY, "variables": submit_vars, "operationName": "SubmitForCompletion"}, headers=submit_headers, timeout=25)
             except Exception as e:
-                logger.debug(f"Submit parse error: {e}")
+                output.update({"Response": f"SUBMIT_REQUEST_ERROR: {str(e)[:50]}", "Status": False})
+                _log_output_to_terminal(output)
+                return output
+            submit_sc = getattr(submit_resp, "status_code", 0)
+            submit_text = (getattr(submit_resp, "text", None) or "").strip()
+            if submit_sc == 200 and submit_text and submit_text.startswith("{"):
+                try:
+                    submit_data = json.loads(submit_text)
+                    data_node = submit_data.get("data") or {}
+                    sfc = data_node.get("submitForCompletion") or {}
+                    submit_typename = (sfc.get("__typename") or "")
+                    if submit_typename in ("SubmitSuccess", "SubmitAlreadyAccepted", "SubmittedForCompletion"):
+                        rec = sfc.get("receipt")
+                        if isinstance(rec, dict):
+                            bill = (rec.get("id") or "").strip()
+                    elif submit_typename == "SubmitFailed":
+                        reason = (sfc.get("reason") or "").strip() or "SUBMIT_FAILED"
+                        output.update({"Response": reason[:80], "Status": False, "Price": price1_str, "Gateway": gateway or "Shopify"})
+                        _log_output_to_terminal(output)
+                        return output
+                    elif submit_typename == "SubmitRejected":
+                        errs = sfc.get("errors") or []
+                        code = "CARD_DECLINED"
+                        if errs and isinstance(errs[0], dict):
+                            code = (errs[0].get("code") or errs[0].get("localizedMessage") or code)[:60]
+                        # Retry with higher amount on PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT
+                        if "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in (code or "") and submit_attempt < 2:
+                            try:
+                                pv = float(str(payment_amount_retry).replace(",", "."))
+                                payment_amount_retry = f"{max(pv * 2, pv + 10.0):.2f}"
+                                await asyncio.sleep(0.3)
+                                continue
+                            except Exception:
+                                pass
+                        output.update({"Response": code, "Status": False, "Price": price1_str, "Gateway": gateway or "Shopify"})
+                        _log_output_to_terminal(output)
+                        return output
+                    if not bill and submit_data.get("errors"):
+                        err_list = submit_data.get("errors", [])
+                        first_msg = (err_list[0].get("message") or str(err_list[0]))[:80] if err_list else ""
+                        if "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in first_msg and submit_attempt < 2:
+                            try:
+                                pv = float(str(payment_amount_retry).replace(",", "."))
+                                payment_amount_retry = f"{max(pv * 2, pv + 10.0):.2f}"
+                                await asyncio.sleep(0.3)
+                                continue
+                            except Exception:
+                                pass
+                        if "CAPTCHA_TOKEN_MISSING" in first_msg and submit_attempt == 0 and CAPTCHA_SOLVER_AVAILABLE:
+                            try:
+                                from BOT.helper.shopify_captcha_solver import solve_shopify_captcha
+                                result = await solve_shopify_captcha(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "", "shopify", timeout=15)
+                                if result and getattr(result, "token", None):
+                                    captcha_token = result.token
+                                    submit_vars["input"]["captcha"]["token"] = captcha_token or ""
+                                    await asyncio.sleep(0.5)
+                                    continue
+                            except Exception as e:
+                                logger.debug(f"Captcha solver retry: {e}")
+                        output.update({"Response": first_msg or "SUBMIT_GRAPHQL_ERROR", "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+                except Exception as e:
+                    logger.debug(f"Submit parse error: {e}")
+            if bill:
+                break
+            if submit_attempt == 0 and "CAPTCHA_TOKEN_MISSING" in (submit_text or "") and CAPTCHA_SOLVER_AVAILABLE:
+                try:
+                    from BOT.helper.shopify_captcha_solver import solve_shopify_captcha
+                    result = await solve_shopify_captcha(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "", "shopify", timeout=15)
+                    if result and getattr(result, "token", None):
+                        captcha_token = result.token
+                        submit_vars["input"]["captcha"]["token"] = captcha_token or ""
+                        await asyncio.sleep(0.5)
+                        continue
+                except Exception as e:
+                    logger.debug(f"Captcha solver: {e}")
+            break
         if not bill:
             if "CAPTCHA" in (submit_text or "").upper() or "Just a moment" in (submit_text or ""):
                 output.update({"Response": "CAPTCHA_REQUIRED", "Status": False})
@@ -2308,7 +2510,6 @@ async def autoshopify(url, card, session, proxy=None):
             "x-checkout-web-server-rendering": "no",
             "x-checkout-web-source-id": token or "",
         }
-        poll_url = f"{url.rstrip('/')}/checkouts/unstable/graphql?operationName=PollForReceipt"
         for _ in range(3):
             try:
                 poll_resp = await session.post(poll_url, json={"query": POLL_QUERY, "variables": poll_vars, "operationName": "PollForReceipt"}, headers=poll_headers, timeout=20)
@@ -2470,6 +2671,7 @@ async def run_shopify_checkout_diagnostic(
         k: {"len": len(v) if v else 0, "first_80": (v or "")[:80], "value": v}
         for k, v in robust.items()
     }
+    data["checkout_text_full"] = checkout_text or ""  # For test script capture debugging
     for i, (pat, name) in enumerate(SESSION_TOKEN_PATTERNS):
         m = re.search(pat, checkout_text or "", re.I | re.DOTALL) if pat else None
         data["step8_regex_session_tests"].append({
@@ -2478,16 +2680,24 @@ async def run_shopify_checkout_diagnostic(
             "group1_len": len(m.group(1)) if m and m.lastindex else 0,
             "group1_first80": (m.group(1)[:80] if m and m.lastindex and m.group(1) else None),
         })
-    for prefix, suffix in [('<meta name="serialized-sessionToken" content="&quot;', '&quot;"/>'), ('name="serialized-sessionToken" content="&quot;', '&quot;" />')]:
+    for prefix, suffix in [
+        ('serialized-session-token" content="&quot;', '&quot'),  # old api.py
+        ('<meta name="serialized-sessionToken" content="&quot;', '&quot;"/>'),
+        ('name="serialized-sessionToken" content="&quot;', '&quot;" />'),
+    ]:
         v = capture(checkout_text or "", prefix, suffix)
         data["step9_capture_session_tests"].append({
-            "prefix": prefix[:40], "suffix": suffix[:20],
+            "prefix": prefix[:45], "suffix": suffix[:20],
             "result_len": len(v) if v else 0, "result_first80": (v or "")[:80],
         })
-    for prefix, suffix in [('<meta name="serialized-sourceToken" content="&quot;', '&quot;"/>'), ('name="serialized-sourceToken" content="&quot;', '&quot;" />')]:
+    for prefix, suffix in [
+        ('serialized-source-token" content="&quot;', '&quot'),  # old api.py
+        ('<meta name="serialized-sourceToken" content="&quot;', '&quot;"/>'),
+        ('name="serialized-sourceToken" content="&quot;', '&quot;" />'),
+    ]:
         v = capture(checkout_text or "", prefix, suffix)
         data["step10_capture_source_tests"].append({
-            "prefix": prefix[:40], "suffix": suffix[:20],
+            "prefix": prefix[:45], "suffix": suffix[:20],
             "result_len": len(v) if v else 0, "result_first80": (v or "")[:80],
         })
     return data
