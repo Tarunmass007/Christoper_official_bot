@@ -58,10 +58,10 @@ def save_site_for_user_unified(user_id: str, site: str, gateway: str, price: str
 
 logger = logging.getLogger(__name__)
 
-# Timeout configurations
-FAST_TIMEOUT = 16
-STANDARD_TIMEOUT = 28
-MAX_RETRIES = 3
+# Timeout configurations (fast for addurl/txturl)
+FAST_TIMEOUT = 12
+STANDARD_TIMEOUT = 22
+MAX_RETRIES = 2
 FETCH_RETRIES = 2
 
 # Test card for addurl/txturl gate validation (Visa test)
@@ -465,7 +465,7 @@ def get_user_current_site(user_id: str) -> Optional[Dict[str, str]]:
     return None
 
 
-async def test_site_with_card(url: str, proxy: Optional[str] = None, max_retries: int = 3) -> tuple[bool, dict]:
+async def test_site_with_card(url: str, proxy: Optional[str] = None, max_retries: int = 2) -> tuple[bool, dict]:
     """
     Run a /sh-style test check on a single URL with TEST_CARD.
     Returns (has_receipt, result). When no receipt, result contains actual gate error (e.g. CHECKOUT_TOKENS_MISSING).
@@ -477,7 +477,7 @@ async def test_site_with_card(url: str, proxy: Optional[str] = None, max_retries
     last_res = {"Response": "NO_RECEIPT", "ReceiptId": None, "Price": "0.00"}
     for attempt in range(max_retries):
         try:
-            async with TLSAsyncSession(timeout_seconds=60, proxy=proxy_url) as session:
+            async with TLSAsyncSession(timeout_seconds=STANDARD_TIMEOUT, proxy=proxy_url) as session:
                 res = await autoshopify_with_captcha_retry(
                     url, TEST_CARD, session, max_captcha_retries=3, proxy=proxy_url
                 )

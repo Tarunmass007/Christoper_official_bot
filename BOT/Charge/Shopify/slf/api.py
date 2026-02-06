@@ -458,12 +458,62 @@ def _fetch_checkout_cloudscraper_sync(checkout_url: str, proxy: Optional[str] = 
                 "Accept-Language": "en-US,en;q=0.9",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             },
-            timeout=20,
+            timeout=18,
             proxies=proxies,
         )
         return (r.status_code, r.text or "")
     except Exception:
         return (0, "")
+
+
+def _fetch_checkout_via_cloudscraper_full_flow_sync(
+    url: str, product_id: int, proxy: Optional[str] = None
+) -> tuple[int, str, str]:
+    """
+    Full checkout flow via cloudscraper: cart/add.js -> POST checkout -> return (status, text, final_url).
+    Used when regular session gets Cloudflare block (stickerdad, tiefossi).
+    """
+    if not HAS_CLOUDSCRAPER:
+        return (0, "", "")
+    base = url.rstrip("/")
+    scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        add_r = scraper.post(
+            f"{base}/cart/add.js",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/json",
+                "Accept": "*/*",
+                "Origin": base,
+                "Referer": base + "/",
+            },
+            json={"items": [{"id": product_id, "quantity": 1}]},
+            timeout=12,
+            proxies=proxies,
+        )
+        if add_r.status_code != 200:
+            return (add_r.status_code, "", "")
+        import time
+        time.sleep(0.5)
+        ch_r = scraper.post(
+            f"{base}/checkout",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": f"{base}/cart",
+                "Origin": base,
+            },
+            data={"updates[]": "1", "note": "", "checkout": ""},
+            timeout=18,
+            allow_redirects=True,
+            proxies=proxies,
+        )
+        final_url = ch_r.url if hasattr(ch_r, "url") else ""
+        return (ch_r.status_code, ch_r.text or "", final_url)
+    except Exception:
+        return (0, "", "")
 
 
 def _fetch_store_page_cloudscraper_sync(store_url: str, proxy: Optional[str] = None):
@@ -1148,11 +1198,12 @@ async def autoshopify(url, card, session, proxy=None):
                 _log_output_to_terminal(output)
                 return output
 
-        # Low-product flow (shipping): cart/add.js -> POST checkout -> redirect -> GET checkout page
+        # Low-product flow (shipping): cart/add.js -> POST checkout (follow_redirects=True) -> use response body
+        # Same as non-shipping: get checkout page in one request (stickerdad, tiefossi)
         elif low_product_flow:
-            logger.info("🛒 Using low-product flow (cart/add.js)")
+            logger.info("🛒 Using low-product flow (cart/add.js + POST checkout)")
             add_js_headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
+                "User-Agent": getua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Pragma": "no-cache",
                 "Accept": "*/*",
                 "Content-Type": "application/json",
@@ -1164,10 +1215,9 @@ async def autoshopify(url, card, session, proxy=None):
                     f"{url.rstrip('/')}/cart/add.js",
                     headers=add_js_headers,
                     json={"items": [{"id": product_id, "quantity": 1}]},
-                    timeout=18,
+                    timeout=15,
                 )
                 add_sc = getattr(add_js_resp, "status_code", 0)
-                logger.info(f"📦 Cart add.js status: {add_sc}")
                 if add_sc != 200:
                     output.update({"Response": f"CART_ADD_HTTP_{add_sc}", "Status": False})
                     _log_output_to_terminal(output)
@@ -1180,39 +1230,75 @@ async def autoshopify(url, card, session, proxy=None):
                         return output
                 except Exception:
                     pass
-                await asyncio.sleep(0.5)
-                checkout_post_resp = await session.post(
+                await asyncio.sleep(0.4)
+                # POST checkout with form data + follow_redirects=True (Silverbullet-style) - get page in one shot
+                checkout_post_headers = {
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "accept-language": "en-US,en;q=0.9",
+                    "referer": f"{url.rstrip('/')}/cart",
+                    "sec-ch-ua": '"Chromium";v="120", "Not/A)Brand";v="24"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "same-origin",
+                    "sec-fetch-user": "?1",
+                    "upgrade-insecure-requests": "1",
+                    "user-agent": getua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "content-type": "application/x-www-form-urlencoded",
+                    "origin": url.rstrip("/"),
+                }
+                checkout_post_data = {"updates[]": "1", "note": "", "checkout": ""}
+                ch_post = await session.post(
                     f"{url.rstrip('/')}/checkout",
-                    headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36",
-                        "Pragma": "no-cache",
-                        "Accept": "*/*",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Origin": url.rstrip("/"),
-                        "Referer": url.rstrip("/") + "/",
-                    },
-                    data="",
-                    timeout=18,
-                    follow_redirects=False,
+                    headers=checkout_post_headers,
+                    data=checkout_post_data,
+                    timeout=20,
+                    follow_redirects=True,
                 )
-                post_sc = getattr(checkout_post_resp, "status_code", 0)
-                logger.info(f"🔗 Checkout POST status: {post_sc}")
-                if post_sc in (301, 302, 303, 307, 308):
-                    resp_headers = getattr(checkout_post_resp, "headers", None) or {}
-                    loc = resp_headers.get("location") or resp_headers.get("Location") or ""
-                    if loc:
-                        if not loc.startswith("http"):
-                            loc = urljoin(url.rstrip("/") + "/", loc)
-                        checkout_url = loc
-                        logger.info(f"🔗 Checkout URL from redirect: {checkout_url}")
-                    else:
-                        checkout_url = url.rstrip("/") + "/checkout"
-                        logger.info(f"🔗 Using default checkout URL: {checkout_url}")
-                else:
-                    checkout_url = url.rstrip("/") + "/checkout"
-                    logger.info(f"🔗 Using default checkout URL: {checkout_url}")
+                post_sc = getattr(ch_post, "status_code", 0)
+                _text = (getattr(ch_post, "text", None) or "").strip()
+                checkout_url = (getattr(ch_post, "url", None) or "").strip() or f"{url.rstrip('/')}/checkout"
+                if not checkout_url.startswith("http"):
+                    checkout_url = urljoin(url.rstrip("/") + "/", checkout_url)
+                # Use response body when it looks like checkout page
+                if post_sc == 200 and _text and len(_text) > 2000:
+                    has_tokens = (
+                        "serialized-sessionToken" in _text or "serialized-session-token" in _text
+                        or "serialized-sourceToken" in _text or "serialized-source-token" in _text
+                        or "serializedSessionToken" in _text or "queueToken" in _text
+                    )
+                    if has_tokens or ("checkout" in _text.lower() and "<" in _text):
+                        checkout_text = _text
+                        request = ch_post
+                        checkout_sc = 200
+                        logger.info(f"✅ Low-product checkout page from POST (len=%s)", len(checkout_text))
+                # If no tokens (Cloudflare/challenge), try cloudscraper full flow (cart/add + POST checkout)
+                _needs_cs = not checkout_text or (
+                    checkout_text and "serialized-sessionToken" not in checkout_text
+                    and "serialized-session-token" not in checkout_text and "queueToken" not in checkout_text
+                )
+                if _needs_cs and HAS_CLOUDSCRAPER:
+                    try:
+                        cs_sc, cs_text, cs_url = await asyncio.to_thread(
+                            _fetch_checkout_via_cloudscraper_full_flow_sync, url, product_id, proxy
+                        )
+                        if cs_sc == 200 and cs_text and len(cs_text) > 2000 and ("serialized-sessionToken" in cs_text or "serialized-session-token" in cs_text or "queueToken" in cs_text):
+                            checkout_text = cs_text
+                            checkout_sc = 200
+                            if cs_url:
+                                checkout_url = cs_url
+                            logger.info(f"✅ Low-product checkout via cloudscraper full flow (len=%s)", len(checkout_text))
+                        elif checkout_url:
+                            cs_sc2, cs_text2 = await asyncio.to_thread(_fetch_checkout_cloudscraper_sync, checkout_url, proxy)
+                            if cs_sc2 == 200 and cs_text2 and len(cs_text2) > 2000 and ("serialized-sessionToken" in cs_text2 or "queueToken" in cs_text2):
+                                checkout_text = cs_text2
+                                checkout_sc = 200
+                                logger.info(f"✅ Low-product checkout via cloudscraper GET (len=%s)", len(checkout_text))
+                    except Exception as e:
+                        logger.debug(f"Low-product cloudscraper fallback: {e}")
             except Exception as e:
-                logger.error(f"❌ Cart add flow error: {e}")
+                logger.error(f"❌ Low-product flow error: {e}")
                 output.update({"Response": f"CART_ADD_ERROR: {str(e)[:40]}", "Status": False})
                 _log_output_to_terminal(output)
                 return output
@@ -1609,8 +1695,10 @@ async def autoshopify(url, card, session, proxy=None):
             'user-agent': f'{getua}',
         }
 
-        # Skip re-fetching checkout when non-shipping flow already set checkout_text/request/checkout_sc
-        if not non_shipping_flow:
+        # Ensure get_params for token-retry when we have checkout_url
+        get_params = {"skip_shop_pay": "true"} if (checkout_url and "skip_shop_pay" not in (checkout_url or "")) else None
+        # Skip re-fetching checkout when non-shipping or low-product flow already set checkout_text
+        if not non_shipping_flow and not (low_product_flow and checkout_text and checkout_sc == 200):
             request = None
             checkout_sc = 0
             checkout_text = ""
