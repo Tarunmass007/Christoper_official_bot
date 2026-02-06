@@ -47,9 +47,14 @@ def load_owner_id():
 
 
 def is_owner(user_id) -> bool:
-    """Check if user_id is the configured owner (full admin access)."""
+    """
+    Check if user_id is the configured owner (full admin access).
+    Only returns True when OWNER is explicitly set in config and matches.
+    """
     own = load_owner_id()
-    return own is not None and str(user_id) == str(own)
+    if own is None or str(own).strip() == "":
+        return False
+    return str(user_id).strip() == str(own).strip()
 
 
 def get_checked_by_plan_display(user_id: str, user_data: dict) -> str:

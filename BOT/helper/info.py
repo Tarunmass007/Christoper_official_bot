@@ -1,9 +1,9 @@
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.enums import ParseMode
 from BOT.helper.start import load_users
 from BOT.db.store import is_owner, get_checked_by_plan_display, get_effective_mlimit
 from datetime import datetime
-from pyrogram.enums import ChatMemberStatus
 
 def calculate_expiry(expiry_time):
     if not expiry_time:
@@ -55,18 +55,19 @@ async def info_command(client, message: Message):
     username = f"@{user_data['username']}" if user_data.get("username") else "N/A"
     profile = f'<a href="tg://user?id={uid}">Profile</a>'
 
-    plan_data = user_data.get("plan", {})
-    plan = plan_data.get("plan", "Free")
-    credits = plan_data.get("credits", "0")
+    plan_data = user_data.get("plan") or {}
+    plan_name = plan_data.get("plan", "Free")
+    plan_display = get_checked_by_plan_display(uid, user_data)
+    credits = "∞" if is_owner(uid) else plan_data.get("credits", "0")
     registered_at = user_data.get("registered_at", "N/A")
     expiry = calculate_expiry(plan_data.get("expires_at"))
-    mlimit = plan_data.get("mlimit", "N/A")
+    eff_mlimit = get_effective_mlimit(uid, plan_data)
+    mlimit = "Unlimited" if eff_mlimit is None else str(eff_mlimit)
     keyredeemed = plan_data.get("keyredeem", 0)
 
-    plan_name = plan_data.get("plan", "Free")
-    if plan_name.lower() == "free":
+    if plan_name and str(plan_name).lower() == "free":
         stats = "Free"
-    elif plan_name.lower() == "redeem code":
+    elif plan_name and str(plan_name).lower() == "redeem code":
         stats = "Premium"
     elif is_owner(uid):
         stats = "Owner"
@@ -89,4 +90,4 @@ async def info_command(client, message: Message):
 ⚬ <b>Key Redeemed :</b> <code>{keyredeemed}</code>
 [ﾒ] <b>Registered At :</b> <code>{registered_at}</code>
 """
-    await message.reply(msg, quote=True)
+    await message.reply(msg, quote=True, parse_mode=ParseMode.HTML)
