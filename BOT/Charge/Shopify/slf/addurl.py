@@ -699,6 +699,20 @@ async def add_site_handler(client: Client, message: Message):
                 site_info["test_result"] = test_res.get("Response", "OK")
                 save_site_for_user_unified(user_id, site_info["url"], site_info.get("gateway", "Normal"), pr)
                 return site_info
+            # CAPTCHA_REQUIRED / HCAPTCHA / JUST A MOMENT = valid site (products parsed), captcha blocked checkout - still add as valid
+            resp = (test_res.get("Response") or "").strip().upper()
+            if any(x in resp for x in ["CAPTCHA", "CAPTCHA_REQUIRED", "HCAPTCHA", "JUST A MOMENT", "CAPTCHA_TOKEN", "CAPTCHA_TOKEN_MISSING"]):
+                pr = site_info.get("price") or "N/A"
+                try:
+                    pv = float(pr)
+                    pr = f"{pv:.2f}" if pv != int(pv) else str(int(pv))
+                except (TypeError, ValueError):
+                    pr = str(pr) if pr else "N/A"
+                site_info["price"] = pr
+                site_info["formatted_price"] = f"${pr}"
+                site_info["test_result"] = "CAPTCHA_REQUIRED"
+                save_site_for_user_unified(user_id, site_info["url"], site_info.get("gateway", "Normal"), pr)
+                return site_info
             site_info["test_error"] = (test_res.get("Response") or "NO_RECEIPT").strip()
             return None
 

@@ -2473,13 +2473,24 @@ async def autoshopify(url, card, session, proxy=None):
         # presentment_currency_page is from buyerIdentity in page; running_total_curr from runningTotal - prefer page's explicit presentmentCurrency
         api_currency = (low_product.get("currency_code") or "").strip() if low_product else ""
         locale_currency = None
-        if checkout_url and not running_total_curr:
-            url_lower = (checkout_url or "").lower()
+        url_lower = ((checkout_url or "") + " " + (url or "")).lower()
+        domain_lower = (urlparse(url or "").netloc or url or "").lower()
+        if not running_total_curr:
             if "/en-in" in url_lower or "en-in" in url_lower:
                 locale_currency = "INR"
             elif "/en-gb" in url_lower or "en-gb" in url_lower:
                 locale_currency = "GBP"
             elif "/de" in url_lower or "en-de" in url_lower or "/eu/" in url_lower:
+                locale_currency = "EUR"
+            # Domain hint: .de/.at/.eu -> EUR; .ch -> CHF; .co.uk -> GBP
+            elif ".de" in url_lower or ".at" in url_lower or ".eu" in url_lower:
+                locale_currency = "EUR"
+            elif ".ch" in url_lower:
+                locale_currency = "CHF"
+            elif ".co.uk" in url_lower:
+                locale_currency = "GBP"
+            # Store domain hints (tiefossi.com etc.) - European stores that may show $ but use EUR
+            elif "tiefossi" in domain_lower or "tiefossi" in url_lower:
                 locale_currency = "EUR"
         buyer_presentment = (presentment_currency_page or running_total_curr or locale_currency or api_currency or curr_code).strip()
         # Payment amount: prefer checkout total from page (exact format from runningTotal) to avoid PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT
@@ -2673,7 +2684,7 @@ async def autoshopify(url, card, session, proxy=None):
         bill = None
         submit_typename = None
         payment_amount_retry = payment_amount_str
-        for submit_attempt in range(3):
+        for submit_attempt in range(8):  # 8 attempts for currency retries (BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH)
             # Update payment amount for retries (PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT)
             pl = (submit_vars.get("input") or {}).get("payment") or {}
             plines = pl.get("paymentLines") or []
@@ -2832,12 +2843,31 @@ async def autoshopify(url, card, session, proxy=None):
                             except Exception as e:
                                 logger.debug(f"MERCHANDISE_CART re-fetch: {e}")
                         # Retry with alternate presentment currency on BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH (tiefossi, etc.)
-                        if "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH" in (code or "") and submit_attempt < 2:
-                            alt_curr = "INR" if (buyer_presentment or "").upper() == "USD" else "USD"
+                        if "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH" in (code or "") and submit_attempt < 7:
+                            _alternatives = ["EUR", "GBP", "USD", "CHF", "CAD", "INR", "AUD"]
+                            alt_curr = _alternatives[min(submit_attempt, len(_alternatives) - 1)]
                             buyer_presentment = alt_curr
+                            curr_code = alt_curr
                             _bi = (submit_vars.get("input") or {}).get("buyerIdentity") or {}
                             _cust = _bi.get("customer") or {}
                             _cust["presentmentCurrency"] = alt_curr
+                            # Update payment/merchandise amounts to use same currency
+                            _pl = (submit_vars.get("input") or {}).get("payment") or {}
+                            _plines = _pl.get("paymentLines") or []
+                            if _plines and isinstance(_plines[0], dict) and _plines[0].get("amount", {}).get("value"):
+                                _plines[0]["amount"]["value"]["currencyCode"] = curr_code
+                            _ml = (submit_vars.get("input") or {}).get("merchandise") or {}
+                            _mlines = _ml.get("merchandiseLines") or []
+                            for _m in _mlines:
+                                if _m.get("expectedTotalPrice", {}).get("value"):
+                                    _m["expectedTotalPrice"]["value"]["currencyCode"] = curr_code
+                            _tx = (submit_vars.get("input") or {}).get("taxes") or {}
+                            if _tx.get("proposedTotalAmount", {}).get("value"):
+                                _tx["proposedTotalAmount"]["value"]["currencyCode"] = curr_code
+                            _del = (submit_vars.get("input") or {}).get("delivery") or {}
+                            for _dl in _del.get("deliveryLines") or []:
+                                if _dl.get("expectedTotalPrice", {}).get("value"):
+                                    _dl["expectedTotalPrice"]["value"]["currencyCode"] = curr_code
                             await asyncio.sleep(0.3)
                             continue
                         # Retry with next payment method on INVALID_PAYMENT_METHOD (stickerdad, etc.)
