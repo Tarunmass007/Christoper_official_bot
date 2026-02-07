@@ -498,9 +498,9 @@ async def test_site_with_card(url: str, proxy: Optional[str] = None, max_retries
     last_res = {"Response": "NO_RECEIPT", "ReceiptId": None, "Price": "0.00"}
     for attempt in range(max_retries):
         try:
-            async with TLSAsyncSession(timeout_seconds=STANDARD_TIMEOUT, proxy=proxy_url) as session:
+            async with TLSAsyncSession(timeout_seconds=20, proxy=proxy_url) as session:
                 res = await autoshopify_with_captcha_retry(
-                    url, TEST_CARD, session, max_captcha_retries=10, proxy=proxy_url
+                    url, TEST_CARD, session, max_captcha_retries=5, proxy=proxy_url
                 )
                 last_res = res
                 if res.get("ReceiptId"):
@@ -681,7 +681,7 @@ async def add_site_handler(client: Client, message: Message):
         )
 
         async def test_and_save(site_info):
-            has_rec, test_res = await test_site_with_card(site_info["url"], proxy_url, max_retries=4)
+            has_rec, test_res = await test_site_with_card(site_info["url"], proxy_url, max_retries=2)
             if has_rec:
                 pr = test_res.get("Price") or site_info.get("price") or "N/A"
                 try:

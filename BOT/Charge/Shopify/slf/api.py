@@ -2560,7 +2560,7 @@ async def autoshopify(url, card, session, proxy=None):
                     x_checkout_one_session_token or "",
                     "shopify",
                     page_html=checkout_text,
-                    timeout=45,
+                    timeout=28,
                     proxy=proxy,
                 )
                 if result and getattr(result, "success", False) and getattr(result, "token", None):
@@ -3167,7 +3167,7 @@ async def autoshopify_with_captcha_retry(
                     return res
                 resp_str = str(res.get("Response") or "").lower()
                 if "captcha" in resp_str or "hcaptcha" in resp_str or "just a moment" in resp_str:
-                    cooldown = 2.0 + attempt * 1.5  # Longer cooldown: 2s, 3.5s, 5s...
+                    cooldown = 1.0 + attempt * 0.6  # Fast cooldown: 1s, 1.6s, 2.2s...
                     logger.debug(f"Captcha/CF retry {attempt + 1}/{max_captcha_retries}, cooldown {cooldown}s")
                     await asyncio.sleep(cooldown)
                     continue

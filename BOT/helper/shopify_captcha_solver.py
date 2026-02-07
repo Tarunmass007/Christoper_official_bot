@@ -374,10 +374,10 @@ async def _solve_hcaptcha_playwright(
                 go_url = checkout_url
                 if "skip_shop_pay" not in go_url:
                     go_url = go_url + ("&" if "?" in go_url else "?") + "skip_shop_pay=true"
-                await page.goto(go_url, wait_until="domcontentloaded", timeout=min(timeout, 20) * 1000)
+                await page.goto(go_url, wait_until="domcontentloaded", timeout=min(timeout, 14) * 1000)
 
-            await asyncio.sleep(2)
-            for _ in range(8):
+            await asyncio.sleep(1.2)
+            for _ in range(6):
                 if captured_token[0] and len(str(captured_token[0])) > 20:
                     await browser.close()
                     logger.info("hCaptcha token from network interception")
@@ -390,9 +390,9 @@ async def _solve_hcaptcha_playwright(
                     logger.info("hCaptcha token from Playwright (page)")
                     return CaptchaResult(True, token, "playwright", "browser", time.time() - start)
                 await page.mouse.move(random.randint(80, 400), random.randint(80, 350))
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.3)")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.7)
 
             click_selectors = [
                 "button[type='submit']", "button:has-text('Pay')", "button:has-text('Complete')",
@@ -404,7 +404,7 @@ async def _solve_hcaptcha_playwright(
                     btn = await page.query_selector(sel)
                     if btn and await btn.is_visible():
                         await btn.click()
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(3)
                         if captured_token[0]:
                             await browser.close()
                             return CaptchaResult(True, captured_token[0], "playwright", "network", time.time() - start)
@@ -415,8 +415,8 @@ async def _solve_hcaptcha_playwright(
                 except Exception:
                     pass
 
-            for _ in range(4):
-                await asyncio.sleep(1.2)
+            for _ in range(3):
+                await asyncio.sleep(1.0)
                 if captured_token[0]:
                     await browser.close()
                     return CaptchaResult(True, captured_token[0], "playwright", "network", time.time() - start)
@@ -470,9 +470,9 @@ async def solve_shopify_captcha(
 
     # 2) Playwright custom solver - PRIMARY (100% free, no paid APIs)
     skip_playwright = os.environ.get("SHOPIFY_SKIP_CAPTCHA_PLAYWRIGHT", "").lower() in ("1", "true", "yes")
-    for pw_attempt in range(2 if not skip_playwright else 0):
+    for pw_attempt in range(1 if not skip_playwright else 0):
         if page_url and page_url.startswith("http"):
-            pw_timeout = min(timeout, 35 + pw_attempt * 10)
+            pw_timeout = min(timeout, 22)
             pw_result = await _solve_hcaptcha_playwright(
                 page_url, pw_timeout, proxy, page_html=page_html, headless=True
             )
@@ -484,8 +484,8 @@ async def solve_shopify_captcha(
     # 3) Motion bypass (getcaptcha may 404 - try anyway)
     last_result = None
     if sk:
-        for variant in range(3):
-            result = await _bypass_hcaptcha_motion(sk, host, min(timeout, 20), variant)
+        for variant in range(2):
+            result = await _bypass_hcaptcha_motion(sk, host, min(timeout, 12), variant)
             last_result = result
             if result.success:
                 return result
@@ -496,7 +496,7 @@ async def solve_shopify_captcha(
         try:
             loop = asyncio.get_event_loop()
             token = await loop.run_in_executor(
-                executor, _solve_hcaptcha_captcha_bypasser_sync, sk, host, min(timeout, 25)
+                executor, _solve_hcaptcha_captcha_bypasser_sync, sk, host, min(timeout, 15)
             )
             if token:
                 return CaptchaResult(True, token, "captcha_bypasser", "hcaptcha", time.time() - start)
