@@ -2442,7 +2442,8 @@ async def autoshopify(url, card, session, proxy=None):
         # Currency: runningTotal from page is authoritative (matches payment amount exactly)
         curr_code = (running_total_curr or currencyCode or (low_product.get("currency_code") if low_product else None) or "USD").strip()
         country_code_val = (countryCode or (low_product.get("country_code") if low_product else None) or "US").strip()
-        # Use page presentment currency for buyerIdentity - runningTotal currency matches payment amount
+        # Use page presentment currency for buyerIdentity - must match checkout session (tiefossi: BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH)
+        # presentment_currency_page is from buyerIdentity in page; running_total_curr from runningTotal - prefer page's explicit presentmentCurrency
         api_currency = (low_product.get("currency_code") or "").strip() if low_product else ""
         locale_currency = None
         if checkout_url and not running_total_curr:
@@ -2453,7 +2454,7 @@ async def autoshopify(url, card, session, proxy=None):
                 locale_currency = "GBP"
             elif "/de" in url_lower or "en-de" in url_lower or "/eu/" in url_lower:
                 locale_currency = "EUR"
-        buyer_presentment = (running_total_curr or presentment_currency_page or locale_currency or api_currency or curr_code).strip()
+        buyer_presentment = (presentment_currency_page or running_total_curr or locale_currency or api_currency or curr_code).strip()
         # Payment amount: prefer checkout total from page (exact format from runningTotal) to avoid PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT
         payment_amount_str = price1_str
         if running_total_amt:
@@ -2678,6 +2679,15 @@ async def autoshopify(url, card, session, proxy=None):
                                     continue
                             except Exception as e:
                                 logger.debug(f"Captcha solver SubmitRejected: {e}")
+                        # Retry with alternate presentment currency on BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH (tiefossi, etc.)
+                        if "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH" in (code or "") and submit_attempt < 2:
+                            alt_curr = "INR" if (buyer_presentment or "").upper() == "USD" else "USD"
+                            buyer_presentment = alt_curr
+                            _bi = (submit_vars.get("input") or {}).get("buyerIdentity") or {}
+                            _cust = _bi.get("customer") or {}
+                            _cust["presentmentCurrency"] = alt_curr
+                            await asyncio.sleep(0.3)
+                            continue
                         # Retry with next payment method on INVALID_PAYMENT_METHOD (stickerdad, etc.)
                         if "INVALID_PAYMENT_METHOD" in (code or "") and payment_method_ids and len(payment_method_ids) > 1:
                             current_idx = payment_method_ids.index(paymentMethodIdentifier) if (paymentMethodIdentifier and paymentMethodIdentifier in payment_method_ids) else -1
