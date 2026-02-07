@@ -12,12 +12,12 @@ from BOT.helper.shopify_captcha_solver import _solve_hcaptcha_playwright
 
 
 async def main():
-    url = "https://collagesoup.com/checkout"
+    url = "https://stickerdad.com/checkout"
     print(f"Testing Playwright solver: {url}")
     print("(timeout 30s)...")
     try:
         result = await _solve_hcaptcha_playwright(
-            url, timeout=30, proxy=None, page_html=None, headless=True
+            url, timeout=50, proxy=None, page_html=None, headless=True
         )
         print(f"Success: {result.success}")
         print(f"Token: {(result.token[:60] + '...') if result.token and len(result.token) > 60 else result.token}")

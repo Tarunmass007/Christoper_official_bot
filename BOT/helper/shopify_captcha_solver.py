@@ -413,6 +413,19 @@ async def _solve_hcaptcha_playwright(
                 }
                 if (document.readyState === 'complete') startObs();
                 else window.addEventListener('load', startObs);
+                window.__triggerHCaptcha = function() {
+                    if (typeof hcaptcha !== 'undefined') {
+                        try {
+                            const ids = document.querySelectorAll('[data-hcaptcha-widget-id]');
+                            for (const el of ids) {
+                                const wid = el.getAttribute('data-hcaptcha-widget-id');
+                                if (wid && hcaptcha.execute) { hcaptcha.execute(parseInt(wid)); return; }
+                            }
+                            const iframes = document.querySelectorAll('iframe[src*="hcaptcha"]');
+                            if (iframes.length && hcaptcha.execute) { hcaptcha.execute(); return; }
+                        } catch(e) {}
+                    }
+                };
             """)
 
             # Always use real URL - HTML injection breaks origin/hCaptcha
@@ -420,10 +433,20 @@ async def _solve_hcaptcha_playwright(
                 go_url = checkout_url
                 if "skip_shop_pay" not in go_url:
                     go_url = go_url + ("&" if "?" in go_url else "?") + "skip_shop_pay=true"
-                await page.goto(go_url, wait_until="networkidle", timeout=min(timeout, 18) * 1000)
+                await page.goto(go_url, wait_until="domcontentloaded", timeout=min(timeout, 25) * 1000)
+                await asyncio.sleep(4.0)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+                try:
+                    await page.evaluate("window.__triggerHCaptcha && window.__triggerHCaptcha()")
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
 
-            await asyncio.sleep(2.0)
-            for _ in range(8):
+            for _ in range(14):
                 if captured_token[0] and len(str(captured_token[0])) > 20:
                     await browser.close()
                     logger.info("hCaptcha token from network interception")
@@ -531,7 +554,7 @@ async def solve_shopify_captcha(
             logger.info("hCaptcha token from page_html extraction")
             return CaptchaResult(True, tok, "custom", "html", time.time() - start)
 
-    # 1) Extract sitekey for motion fallback (page, URL in page, config)
+    # 1) Extract sitekey for fallbacks (page, URL in page, config)
     sk = sitekey or (page_html and extract_hcaptcha_sitekey_from_page(page_html)) or _get_hcaptcha_sitekey_override()
     if not sk and page_html:
         for url_match in re.finditer(r'https?://[^\s"\'<>]+checksiteconfig[^\s"\'<>]+', page_html):
@@ -543,28 +566,28 @@ async def solve_shopify_captcha(
             sk = fallback
             break
 
-    # 2) Motion bypass FIRST (faster, no browser) - try 5 variants
-    last_result = None
-    if sk:
-        for variant in range(5):
-            result = await _bypass_hcaptcha_motion(sk, host, min(timeout, 25), variant)
-            last_result = result
-            if result.success:
-                return result
-            await asyncio.sleep(0.3)
-
-    # 3) Playwright custom solver (100% free, no paid APIs)
+    # 2) Playwright FIRST - only reliable free solver (motion bypass returns 404; hCaptcha API changed)
     skip_playwright = os.environ.get("SHOPIFY_SKIP_CAPTCHA_PLAYWRIGHT", "").lower() in ("1", "true", "yes")
-    for pw_attempt in range(2 if not skip_playwright else 0):
+    for pw_attempt in range(3 if not skip_playwright else 0):
         if page_url and page_url.startswith("http"):
-            pw_timeout = min(timeout, 35)
+            pw_timeout = min(timeout, 45)
             pw_result = await _solve_hcaptcha_playwright(
                 page_url, pw_timeout, proxy, page_html=page_html, headless=True
             )
             if pw_result.success:
                 return pw_result
-            if pw_attempt < 1:
+            if pw_attempt < 2:
                 await asyncio.sleep(1.5)
+
+    # 3) Motion bypass (may fail 404 - hCaptcha API changed)
+    last_result = None
+    if sk:
+        for variant in range(3):
+            result = await _bypass_hcaptcha_motion(sk, host, min(timeout, 25), variant)
+            last_result = result
+            if result.success:
+                return result
+            await asyncio.sleep(0.3)
 
     # 4) captcha_bypasser fallback (different motion algo)
     if sk:
