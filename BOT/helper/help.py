@@ -354,8 +354,9 @@ async def help_callback(client: Client, callback_query: CallbackQuery):
 <code>Usage: /setpx ip:port:username:password</code>
 <code>Example: /setpx 1.2.3.4:8080:user:pass</code>
 
-<b>/delpx</b> - <i>Delete/remove saved proxy</i>
-<code>Usage: /delpx</code>
+<b>/delpx</b> - <i>Delete proxy/proxies</i>
+<code>Usage: /delpx</code> — Clear all proxies
+<code>Usage: /delpx proxy</code> — Remove that specific proxy
 
 <b>/getpx</b> - <i>Get your currently saved proxy</i>
 <code>Usage: /getpx</code>

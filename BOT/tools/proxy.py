@@ -90,7 +90,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 import re, asyncio, httpx, os, random, time
 
-from BOT.db.store import get_proxy as _get_proxies, set_proxy as _set_proxy, delete_proxy as _delete_proxy, add_proxies as _add_proxies
+from BOT.db.store import get_proxy as _get_proxies, set_proxy as _set_proxy, delete_proxy as _delete_proxy, delete_proxy_one as _delete_proxy_one, add_proxies as _add_proxies
 
 
 def normalize_proxy(proxy_raw: str) -> str:
@@ -332,10 +332,43 @@ proxy3</code>
 @Client.on_message(filters.command("delpx"))
 async def delete_proxy(client, message: Message):
     user_id = str(message.from_user.id)
-    if not _get_proxies(user_id):
-        return await message.reply("<b>No proxy was found to delete !!!</b>", quote=True)
-    _delete_proxy(user_id)
-    await message.reply("<b>All your proxies have been removed ✅</b>", quote=True)
+    proxies = _get_proxies(user_id)
+
+    if not proxies:
+        return await message.reply(
+            "<pre>No Proxies Found ❌</pre>\n<b>You have no saved proxies to delete.</b>",
+            quote=True,
+        )
+
+    # /delpx alone → clear all proxies
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        _delete_proxy(user_id)
+        return await message.reply(
+            "<pre>All Proxies Cleared ✅</pre>\n━━━━━━━━━━━━━\n<b>All your proxies have been removed from the database.</b>",
+            quote=True,
+        )
+
+    # /delpx <proxy> → delete that specific proxy
+    raw_proxy = args[1].strip()
+    proxy_url = normalize_proxy(raw_proxy) or raw_proxy
+    removed = _delete_proxy_one(user_id, raw_proxy)
+
+    if removed:
+        remaining = len(_get_proxies(user_id))
+        return await message.reply(
+            f"<pre>Proxy Deleted ✅</pre>\n━━━━━━━━━━━━━\n"
+            f"<b>Removed:</b> <code>{proxy_url[:50]}{'...' if len(proxy_url) > 50 else ''}</code>\n"
+            f"<b>Remaining:</b> <code>{remaining}</code> proxy/proxies",
+            quote=True,
+        )
+
+    return await message.reply(
+        "<pre>Proxy Not Found ❌</pre>\n━━━━━━━━━━━━━\n"
+        f"<b>That proxy is not in your list.</b>\n\n"
+        f"<i>Use /getpx to see your saved proxies.</i>",
+        quote=True,
+    )
 
 @Client.on_message(filters.command("getpx"))
 async def getpx_handler(client, message):

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Union
 
 import pytz
@@ -504,11 +505,66 @@ def add_proxies(user_id: str, new_proxies: list) -> int:
 
 
 def delete_proxy(user_id: str) -> None:
-    data = load_proxies()
+    """Clear all proxies for user. Persists in MongoDB and JSON."""
     uid = str(user_id)
+    if _use_mongo():
+        coll = _proxies_coll()
+        coll.replace_one({"_id": uid}, {"_id": uid, "proxies": []}, upsert=True)
+        return
+    data = load_proxies()
     if uid in data:
         del data[uid]
         save_proxies(data)
+
+
+def _normalize_proxy_for_match(proxy_raw: str) -> str:
+    """Normalize proxy string for matching. Avoids circular import from proxy.py."""
+    p = (proxy_raw or "").strip()
+    if not p:
+        return ""
+    if p.startswith("http://") or p.startswith("https://"):
+        return p
+    # USER:PASS@HOST:PORT
+    m1 = re.fullmatch(r"(.+?):(.+?)@([a-zA-Z0-9\.\-]+):(\d+)", p)
+    if m1:
+        u, pw, h, pt = m1.groups()
+        return f"http://{u}:{pw}@{h}:{pt}"
+    # HOST:PORT:USER:PASS
+    m2 = re.fullmatch(r"([a-zA-Z0-9\.\-]+):(\d+):(.+?):(.+)", p)
+    if m2:
+        h, pt, u, pw = m2.groups()
+        return f"http://{u}:{pw}@{h}:{pt}"
+    return p
+
+
+def delete_proxy_one(user_id: str, proxy_to_remove: str) -> bool:
+    """
+    Remove a specific proxy from user's list.
+    Normalizes proxy for matching (handles http://, user:pass@host:port, etc).
+    Returns True if proxy was found and removed, False otherwise.
+    """
+    uid = str(user_id)
+    normalized = _normalize_proxy_for_match(proxy_to_remove) or proxy_to_remove.strip()
+    data = load_proxies()
+    current = data.get(uid, [])
+    if isinstance(current, str):
+        current = [current]
+    # Match by normalized form or exact string
+    new_list = []
+    removed = False
+    for p in current:
+        if not p:
+            continue
+        pnorm = _normalize_proxy_for_match(p)
+        if p == normalized or pnorm == normalized or p == proxy_to_remove.strip():
+            removed = True
+            continue
+        new_list.append(p)
+    if not removed:
+        return False
+    data[uid] = new_list
+    save_proxies(data)
+    return True
 
 
 # ---------------------------------------------------------------------------
