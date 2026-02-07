@@ -18,3 +18,4 @@ aiohttp
 pymongo>=4.0
 playwright>=1.40.0
 pycryptodome>=3.19.0
+2captcha-python>=1.2.0

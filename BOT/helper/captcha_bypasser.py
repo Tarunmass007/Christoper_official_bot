@@ -202,13 +202,14 @@ class CaptchaSolver:
                 "User-Agent": fingerprint["userAgent"],
                 "Accept": "*/*",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Content-Type": "application/json;charset=UTF-8",
+                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
                 "Origin": "https://newassets.hcaptcha.com",
                 "Referer": "https://newassets.hcaptcha.com/",
             }
             
             # Step 1: Get site config
-            config_url = f"https://hcaptcha.com/checksiteconfig?v=1&host={target_domain}&sitekey={sitekey}&sc=1&swa=1"
+            host_clean = target_domain.replace("https://", "").replace("http://", "").split("/")[0]
+            config_url = f"https://hcaptcha.com/checksiteconfig?v=1&host={host_clean}&sitekey={sitekey}&sc=1&swa=1"
             
             r1 = self.session.get(config_url, headers=headers, timeout=timeout)
             if r1.status_code != 200:
@@ -218,17 +219,17 @@ class CaptchaSolver:
             config_data = r1.json()
             c_value = config_data.get("c", {})
             
-            # Step 2: Get captcha challenge
+            # Step 2: Get captcha challenge (form-urlencoded)
             getcaptcha_url = "https://hcaptcha.com/getcaptcha"
             
             getcaptcha_payload = {
                 "v": "1",
                 "sitekey": sitekey,
-                "host": target_domain,
+                "host": host_clean,
                 "hl": "en",
                 "motionData": json.dumps(motion_data),
-                "n": None,
-                "c": json.dumps(c_value),
+                "n": "",
+                "c": json.dumps(c_value) if isinstance(c_value, dict) else str(c_value),
             }
             
             r2 = self.session.post(

