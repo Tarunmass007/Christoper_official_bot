@@ -499,12 +499,17 @@ async def test_site_with_card(url: str, proxy: Optional[str] = None, max_retries
     for attempt in range(max_retries):
         try:
             async with TLSAsyncSession(timeout_seconds=20, proxy=proxy_url) as session:
-                res = await autoshopify_with_captcha_retry(
-                    url, TEST_CARD, session, max_captcha_retries=5, proxy=proxy_url
+                res = await asyncio.wait_for(
+                    autoshopify_with_captcha_retry(
+                        url, TEST_CARD, session, max_captcha_retries=4, proxy=proxy_url
+                    ),
+                    timeout=65.0,
                 )
                 last_res = res
                 if res.get("ReceiptId"):
                     return True, res
+        except asyncio.TimeoutError:
+            last_res = {"Response": "TIMEOUT_90S", "ReceiptId": None, "Price": "0.00"}
         except Exception as e:
             last_res = {"Response": f"ERROR: {str(e)[:80]}", "ReceiptId": None, "Price": "0.00"}
         if attempt < max_retries - 1:

@@ -14,7 +14,6 @@ from BOT.Charge.Shopify.slf.addurl import TEST_CARD
 
 
 async def main():
-    # Try different stores - some may have lighter captcha or complete faster
     urls_to_try = ["https://collagesoup.com", "https://stickerdad.com"]
     url = urls_to_try[0]
     print(f"Quick test: {url}")
@@ -23,7 +22,7 @@ async def main():
         async with TLSAsyncSession(timeout_seconds=30, proxy=None) as session:
             res = await asyncio.wait_for(
                 autoshopify_with_captcha_retry(url, TEST_CARD, session, max_captcha_retries=1, proxy=None),
-                timeout=300.0
+                timeout=95.0
             )
         print(f"Response: {res.get('Response')}")
         print(f"Status: {res.get('Status')}")

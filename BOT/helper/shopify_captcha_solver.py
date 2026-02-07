@@ -374,10 +374,10 @@ async def _solve_hcaptcha_playwright(
                 go_url = checkout_url
                 if "skip_shop_pay" not in go_url:
                     go_url = go_url + ("&" if "?" in go_url else "?") + "skip_shop_pay=true"
-                await page.goto(go_url, wait_until="domcontentloaded", timeout=min(timeout, 14) * 1000)
+                await page.goto(go_url, wait_until="domcontentloaded", timeout=min(timeout, 10) * 1000)
 
-            await asyncio.sleep(1.2)
-            for _ in range(6):
+            await asyncio.sleep(1.0)
+            for _ in range(5):
                 if captured_token[0] and len(str(captured_token[0])) > 20:
                     await browser.close()
                     logger.info("hCaptcha token from network interception")
@@ -392,7 +392,7 @@ async def _solve_hcaptcha_playwright(
                 await page.mouse.move(random.randint(80, 400), random.randint(80, 350))
                 await asyncio.sleep(0.2)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.3)")
-                await asyncio.sleep(0.7)
+                await asyncio.sleep(0.5)
 
             click_selectors = [
                 "button[type='submit']", "button:has-text('Pay')", "button:has-text('Complete')",
@@ -404,7 +404,7 @@ async def _solve_hcaptcha_playwright(
                     btn = await page.query_selector(sel)
                     if btn and await btn.is_visible():
                         await btn.click()
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(2)
                         if captured_token[0]:
                             await browser.close()
                             return CaptchaResult(True, captured_token[0], "playwright", "network", time.time() - start)
@@ -415,8 +415,8 @@ async def _solve_hcaptcha_playwright(
                 except Exception:
                     pass
 
-            for _ in range(3):
-                await asyncio.sleep(1.0)
+            for _ in range(2):
+                await asyncio.sleep(0.8)
                 if captured_token[0]:
                     await browser.close()
                     return CaptchaResult(True, captured_token[0], "playwright", "network", time.time() - start)
