@@ -62,11 +62,15 @@ def extract_hcaptcha_sitekey_from_page(page_html: str) -> Optional[str]:
         r'"sitekey"\s*:\s*["\']([a-fA-F0-9\-]{36})["\']',
         r'sitekey["\']?\s*:\s*["\']([a-fA-F0-9\-]{36})["\']',
         r'&quot;sitekey&quot;\s*:\s*&quot;([a-fA-F0-9\-]{36})&quot;',
-        r'hcaptcha\.com[^"]*sitekey=([a-fA-F0-9\-]{36})',
+        r'hcaptcha\.com/checksiteconfig[^"\'&]*sitekey=([a-fA-F0-9\-]{36})',
+        r'hcaptcha\.com[^"\'&]*sitekey=([a-fA-F0-9\-]{36})',
+        r'newassets\.hcaptcha\.com[^"\'&]*sitekey=([a-fA-F0-9\-]{36})',
         r'"sitekey"\s*:\s*"([a-fA-F0-9\-]{36})"',
         r'captcha["\']?\s*:\s*\{[^}]*["\']sitekey["\']\s*:\s*["\']([a-fA-F0-9\-]{36})["\']',
         r'sitekey["\']?\s*:\s*["\']([a-fA-F0-9\-]{20,})["\']',
         r'comparison_challenge_type["\']?\s*[^}]*["\']sitekey["\']\s*:\s*["\']([a-fA-F0-9\-]{36})["\']',
+        r'sitekey=([a-fA-F0-9\-]{36})',  # URL query param
+        r'["\']sitekey["\']\s*:\s*["\']([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})["\']',
     ]
     for pat in patterns:
         m = re.search(pat, page_html, re.I | re.DOTALL)
@@ -77,50 +81,91 @@ def extract_hcaptcha_sitekey_from_page(page_html: str) -> Optional[str]:
     return None
 
 
+def extract_hcaptcha_sitekey_from_url(url: str) -> Optional[str]:
+    """Extract sitekey from URL query string (e.g. checksiteconfig links in page)."""
+    if not url:
+        return None
+    m = re.search(r'[?&]sitekey=([a-fA-F0-9\-]{36})', url)
+    return m.group(1).strip() if m and len(m.group(1)) >= 20 else None
+
+
+async def _fetch_checksiteconfig(sitekey: str, host: str, timeout: int = 15) -> Optional[dict]:
+    """Fetch hCaptcha checksiteconfig; returns {c, pass, sitekey} for getcaptcha."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": "https://newassets.hcaptcha.com/",
+        }
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                "https://hcaptcha.com/checksiteconfig",
+                params={"v": "1", "host": host, "sitekey": sitekey, "sc": "1", "swa": "1"},
+                headers=headers,
+            )
+            if r.status_code == 200:
+                return r.json()
+    except Exception as e:
+        logger.debug(f"checksiteconfig fetch: {e}")
+    return None
+
+
 def _gen_motion_variant(variant: int) -> dict:
-    """Generate varied motion data for hCaptcha bypass. Different patterns per attempt."""
+    """Generate varied motion data for hCaptcha bypass. Longer duration (20s) for realism."""
     ts = int(time.time() * 1000)
     movements = []
+    # ~20 seconds total movement (as per hcaptcha-motion-data), ~800-1200ms between points
+    step_ms = random.randint(750, 1100)
     if variant == 0:
-        # Natural curved movement
+        # Natural curved movement - Bezier-like (middle points between segments)
         x, y = 100, 100
-        for i in range(25):
-            x += random.randint(-30, 40)
-            y += random.randint(-20, 35)
-            movements.append({"x": max(0, x), "y": max(0, y), "t": ts + i * 45})
+        for i in range(35):
+            x += random.randint(-35, 45)
+            y += random.randint(-25, 40)
+            movements.append({"x": max(0, min(600, x)), "y": max(0, min(600, y)), "t": ts + i * step_ms})
     elif variant == 1:
-        # Linear sweep
-        for i in range(20):
-            movements.append({"x": 150 + i * 12, "y": 120 + (i % 5) * 15, "t": ts + i * 60})
-    elif variant == 2:
-        # Spiral-like
+        # Linear sweep with drift
         for i in range(30):
-            angle = i * 0.4
+            movements.append({"x": 120 + i * 14 + (i % 4) * 5, "y": 140 + (i % 6) * 18, "t": ts + i * step_ms})
+    elif variant == 2:
+        # Spiral-like - smooth curve
+        for i in range(40):
+            angle = i * 0.35
             movements.append({
-                "x": int(200 + 80 * math.cos(angle)),
-                "y": int(200 + 80 * math.sin(angle)),
-                "t": ts + i * 40
+                "x": int(250 + 100 * math.cos(angle)),
+                "y": int(250 + 100 * math.sin(angle)),
+                "t": ts + i * step_ms
             })
     elif variant == 3:
-        # Click-centric
-        for i in range(15):
-            movements.append({"x": 250 + random.randint(-50, 50), "y": 200 + random.randint(-30, 30), "t": ts + i * 80})
+        # Click-centric - moves toward checkbox area
+        for i in range(25):
+            progress = i / 24.0
+            tx, ty = 280 + random.randint(-40, 40), 220 + random.randint(-30, 30)
+            movements.append({"x": int(100 + (tx - 100) * progress), "y": int(100 + (ty - 100) * progress), "t": ts + i * step_ms})
+    elif variant == 4:
+        # S-curve pattern
+        for i in range(30):
+            t = i / 29.0
+            x = int(80 + 400 * (t + 0.1 * math.sin(t * 6)))
+            y = int(80 + 350 * (1 - abs(t - 0.5) * 2))
+            movements.append({"x": max(0, min(600, x)), "y": max(0, min(600, y)), "t": ts + i * step_ms})
     else:
-        # Mixed
-        x, y = 80, 80
-        for i in range(22):
-            x += random.randint(-25, 35)
-            y += random.randint(-15, 25)
-            movements.append({"x": max(0, min(500, x)), "y": max(0, min(500, y)), "t": ts + i * 55})
+        # Mixed - natural random walk
+        x, y = 90, 90
+        for i in range(32):
+            x += random.randint(-30, 38)
+            y += random.randint(-22, 30)
+            movements.append({"x": max(0, min(550, x)), "y": max(0, min(550, y)), "t": ts + i * step_ms})
 
+    elapsed = int(35 * step_ms) if movements else 20000  # ~20-35 seconds
     return {
         "mouseMovements": movements,
         "touchEvents": [],
         "keystrokes": [],
-        "scrollData": {"x": 0, "y": random.randint(150, 400)},
-        "clickData": [{"x": 280 + random.randint(-30, 30), "y": 220 + random.randint(-20, 20), "t": ts + 500}],
+        "scrollData": {"x": 0, "y": random.randint(100, 450)},
+        "clickData": [{"x": 280 + random.randint(-35, 35), "y": 220 + random.randint(-25, 25), "t": ts + int(elapsed * 0.6)}],
         "timestamp": ts,
-        "elapsed": random.randint(2500, 4500),
+        "elapsed": min(elapsed, 45000),
     }
 
 
@@ -134,10 +179,10 @@ HCAPTCHA_GETCAPTCHA_ENDPOINTS = [
 async def _bypass_hcaptcha_motion(
     sitekey: str,
     host: str,
-    timeout: int = 30,
+    timeout: int = 35,
     variant: int = 0,
 ) -> CaptchaResult:
-    """Motion data bypass - works when no visual challenge. Tries multiple endpoints."""
+    """Motion data bypass - works when no visual challenge. Uses checksiteconfig c for hsw type."""
     start = time.time()
     motion_data = _gen_motion_variant(variant)
     ua = random.choice([
@@ -161,33 +206,34 @@ async def _bypass_hcaptcha_motion(
             )
             if config_resp.status_code != 200:
                 return CaptchaResult(False, None, "hcaptcha", "motion", time.time() - start, f"config {config_resp.status_code}")
-            c_val = (config_resp.json() or {}).get("c", {})
-            get_data = {
-                "v": "1",
-                "sitekey": sitekey,
-                "host": host,
-                "hl": "en",
-                "motionData": json.dumps(motion_data),
-                "n": "",
-                "c": json.dumps(c_val) if isinstance(c_val, dict) else str(c_val),
-            }
+            cfg = config_resp.json() or {}
+            c_val = cfg.get("c", {})
+            c_payload = json.dumps(c_val) if isinstance(c_val, dict) else str(c_val)
+            c_payloads = [c_payload]
+            if isinstance(c_val, dict) and c_val.get("type") == "hsw" and c_val.get("req"):
+                c_payloads.insert(0, c_val["req"])
             last_err = ""
-            for endpoint in HCAPTCHA_GETCAPTCHA_ENDPOINTS:
-                try:
-                    captcha_resp = await client.post(endpoint, data=get_data, headers=headers)
-                    last_err = f"getcaptcha {captcha_resp.status_code}"
-                    if captcha_resp.status_code != 200:
-                        continue
-                    data = captcha_resp.json() or {}
-                    if data.get("pass") and data.get("generated_pass_UUID"):
-                        token = data.get("generated_pass_UUID")
-                        logger.info(f"hCaptcha motion bypass OK (variant={variant}) host={host[:30]}...")
-                        return CaptchaResult(True, token, "hcaptcha", "motion", time.time() - start)
-                    reason = data.get("generated_pass_UUID") or data.get("c") or "Visual challenge"
-                    return CaptchaResult(False, None, "hcaptcha", "motion", time.time() - start, str(reason)[:80])
-                except Exception as e:
-                    last_err = str(e)[:80]
-            return CaptchaResult(False, None, "hcaptcha", "motion", time.time() - start, last_err)
+            for c_try in c_payloads:
+                get_data = {
+                    "v": "1", "sitekey": sitekey, "host": host, "hl": "en",
+                    "motionData": json.dumps(motion_data), "n": "", "c": c_try,
+                }
+                for endpoint in HCAPTCHA_GETCAPTCHA_ENDPOINTS:
+                    try:
+                        captcha_resp = await client.post(endpoint, data=get_data, headers=headers)
+                        last_err = f"getcaptcha {captcha_resp.status_code}"
+                        if captcha_resp.status_code != 200:
+                            continue
+                        data = captcha_resp.json() or {}
+                        if data.get("pass") and data.get("generated_pass_UUID"):
+                            token = data.get("generated_pass_UUID")
+                            logger.info(f"hCaptcha motion bypass OK (variant={variant}) host={host[:30]}...")
+                            return CaptchaResult(True, token, "hcaptcha", "motion", time.time() - start)
+                        reason = data.get("generated_pass_UUID") or data.get("c") or data.get("reason") or "Visual challenge"
+                        last_err = str(reason)[:80] if reason else last_err
+                    except Exception as e:
+                        last_err = str(e)[:80]
+            return CaptchaResult(False, None, "hcaptcha", "motion", time.time() - start, last_err or "No token")
     except Exception as e:
         return CaptchaResult(False, None, "hcaptcha", "motion", time.time() - start, str(e)[:80])
 
@@ -374,10 +420,10 @@ async def _solve_hcaptcha_playwright(
                 go_url = checkout_url
                 if "skip_shop_pay" not in go_url:
                     go_url = go_url + ("&" if "?" in go_url else "?") + "skip_shop_pay=true"
-                await page.goto(go_url, wait_until="domcontentloaded", timeout=min(timeout, 10) * 1000)
+                await page.goto(go_url, wait_until="networkidle", timeout=min(timeout, 18) * 1000)
 
-            await asyncio.sleep(1.0)
-            for _ in range(5):
+            await asyncio.sleep(2.0)
+            for _ in range(8):
                 if captured_token[0] and len(str(captured_token[0])) > 20:
                     await browser.close()
                     logger.info("hCaptcha token from network interception")
@@ -431,6 +477,32 @@ async def _solve_hcaptcha_playwright(
     return CaptchaResult(False, None, "playwright", "browser", time.time() - start, err_msg)
 
 
+def _resolve_hcaptcha_host(checkout_url: str, store_url: Optional[str] = None) -> str:
+    """
+    Resolve the correct host for hCaptcha checksiteconfig.
+    hCaptcha REQUIRES the STORE domain (e.g. collagesoup.com), NOT checkout.shopify.com or shop.app.
+    """
+    # When store_url provided, use its domain - this is the canonical store domain
+    if store_url and str(store_url).strip():
+        parsed = urlparse(store_url if "://" in store_url else f"https://{store_url}")
+        host = (parsed.netloc or parsed.path.split("/")[0]).replace("www.", "").strip()
+        if host and len(host) > 3:
+            return host
+    parsed = urlparse(checkout_url or "")
+    host = parsed.netloc or ""
+    if not host and checkout_url:
+        host = checkout_url.replace("https://", "").replace("http://", "").split("/")[0]
+    host = host.replace("www.", "").strip()
+    # checkout.shopify.com, shop.app are NOT valid for hCaptcha - need store domain
+    if host in ("shop.app", "www.shop.app", "checkout.shopify.com", "www.checkout.shopify.com"):
+        path_parts = (parsed.path or "").strip("/").split("/")
+        for p in path_parts:
+            if p and "." in p and len(p) > 4 and "shopify" not in p.lower():
+                host = p.replace("www.", "").strip()
+                break
+    return host or "checkout.shopify.com"
+
+
 async def solve_shopify_captcha(
     checkout_url: str,
     session_token: str,
@@ -439,18 +511,16 @@ async def solve_shopify_captcha(
     page_html: Optional[str] = None,
     timeout: int = 60,
     proxy: Optional[str] = None,
+    store_url: Optional[str] = None,
 ) -> CaptchaResult:
     """
     Solve Shopify checkpoint captcha - 100% FREE.
     Tries: motion bypass (5 variants) -> captcha_bypasser fallback.
     Used by api.py, addurl, mass, single, tsh.
+    store_url: Canonical store URL (e.g. https://collagesoup.com) - CRITICAL for hCaptcha host.
     """
     start = time.time()
-    parsed = urlparse(checkout_url)
-    host = parsed.netloc or ""
-    if not host and checkout_url:
-        host = checkout_url.replace("https://", "").replace("http://", "").split("/")[0]
-    host = host.replace("www.", "").strip() or "checkout.shopify.com"
+    host = _resolve_hcaptcha_host(checkout_url, store_url)
 
     page_url = checkout_url if checkout_url.startswith("http") else f"https://{host}/checkout"
 
@@ -461,37 +531,42 @@ async def solve_shopify_captcha(
             logger.info("hCaptcha token from page_html extraction")
             return CaptchaResult(True, tok, "custom", "html", time.time() - start)
 
-    # 1) Extract sitekey for motion fallback
+    # 1) Extract sitekey for motion fallback (page, URL in page, config)
     sk = sitekey or (page_html and extract_hcaptcha_sitekey_from_page(page_html)) or _get_hcaptcha_sitekey_override()
+    if not sk and page_html:
+        for url_match in re.finditer(r'https?://[^\s"\'<>]+checksiteconfig[^\s"\'<>]+', page_html):
+            sk = extract_hcaptcha_sitekey_from_url(url_match.group(0))
+            if sk:
+                break
     if not sk:
         for fallback in SHOPIFY_HCAPTCHA_SITEKEYS:
             sk = fallback
             break
 
-    # 2) Playwright custom solver - PRIMARY (100% free, no paid APIs)
+    # 2) Motion bypass FIRST (faster, no browser) - try 5 variants
+    last_result = None
+    if sk:
+        for variant in range(5):
+            result = await _bypass_hcaptcha_motion(sk, host, min(timeout, 25), variant)
+            last_result = result
+            if result.success:
+                return result
+            await asyncio.sleep(0.3)
+
+    # 3) Playwright custom solver (100% free, no paid APIs)
     skip_playwright = os.environ.get("SHOPIFY_SKIP_CAPTCHA_PLAYWRIGHT", "").lower() in ("1", "true", "yes")
-    for pw_attempt in range(1 if not skip_playwright else 0):
+    for pw_attempt in range(2 if not skip_playwright else 0):
         if page_url and page_url.startswith("http"):
-            pw_timeout = min(timeout, 22)
+            pw_timeout = min(timeout, 35)
             pw_result = await _solve_hcaptcha_playwright(
                 page_url, pw_timeout, proxy, page_html=page_html, headless=True
             )
             if pw_result.success:
                 return pw_result
-            if pw_attempt < 2:
-                await asyncio.sleep(1.0 + pw_attempt)
+            if pw_attempt < 1:
+                await asyncio.sleep(1.5)
 
-    # 3) Motion bypass (getcaptcha may 404 - try anyway)
-    last_result = None
-    if sk:
-        for variant in range(2):
-            result = await _bypass_hcaptcha_motion(sk, host, min(timeout, 12), variant)
-            last_result = result
-            if result.success:
-                return result
-            await asyncio.sleep(0.2)
-
-    # 5) captcha_bypasser fallback (same getcaptcha - often fails)
+    # 4) captcha_bypasser fallback (different motion algo)
     if sk:
         try:
             loop = asyncio.get_event_loop()

@@ -596,18 +596,7 @@ Use <code>/txtls</code> to view your sites.""",
                 site_info["price"] = pr
                 site_info["formatted_price"] = f"${pr}"
                 return site_info
-            # CAPTCHA_REQUIRED / HCAPTCHA / JUST A MOMENT = valid site (products parsed), captcha blocked checkout - still add as valid
-            resp = (test_res.get("Response") or "").strip().upper()
-            if any(x in resp for x in ["CAPTCHA", "CAPTCHA_REQUIRED", "HCAPTCHA", "JUST A MOMENT", "CAPTCHA_TOKEN", "CAPTCHA_TOKEN_MISSING"]):
-                pr = site_info.get("price") or "N/A"
-                try:
-                    pv = float(pr)
-                    pr = f"{pv:.2f}" if pv != int(pv) else str(int(pv))
-                except (TypeError, ValueError):
-                    pr = str(pr) if pr else "N/A"
-                site_info["price"] = pr
-                site_info["formatted_price"] = f"${pr}"
-                return site_info
+            # Only add when bill/receipt generated - CAPTCHA failure = do not add
             return None
         
         # Run all tests in parallel

@@ -16,16 +16,18 @@ from typing import Optional
 from BOT.Charge.Shopify.tls_session import TLSAsyncSession
 from BOT.Charge.Shopify.bulletproof_session import BulletproofSession
 
-# Import captcha solver (unified: motion bypass + 2captcha)
+# Import captcha solver (unified: motion bypass, free only)
 try:
     from BOT.helper.shopify_captcha_solver import (
         solve_shopify_captcha,
         generate_bypass_data,
+        extract_hcaptcha_sitekey_from_page,
     )
     CAPTCHA_SOLVER_AVAILABLE = True
 except ImportError:
     CAPTCHA_SOLVER_AVAILABLE = False
     solve_shopify_captcha = None
+    extract_hcaptcha_sitekey_from_page = None
 
 try:
     import cloudscraper
@@ -2563,7 +2565,9 @@ async def autoshopify(url, card, session, proxy=None):
             }
 
         # Captcha token: try bypass first; retry with solver on CAPTCHA_TOKEN_MISSING
+        # store_url=url is CRITICAL: hCaptcha needs store domain (collagesoup.com), not checkout.shopify.com
         captcha_token = None
+        _sitekey = (extract_hcaptcha_sitekey_from_page(checkout_text) if (extract_hcaptcha_sitekey_from_page and checkout_text) else None)
         if CAPTCHA_SOLVER_AVAILABLE and solve_shopify_captcha:
             try:
                 result = await asyncio.wait_for(
@@ -2571,11 +2575,13 @@ async def autoshopify(url, card, session, proxy=None):
                         checkout_url or f"{url.rstrip('/')}/checkout",
                         x_checkout_one_session_token or "",
                         "shopify",
+                        sitekey=_sitekey,
                         page_html=checkout_text,
-                        timeout=18,
+                        timeout=30,
                         proxy=proxy,
+                        store_url=url,
                     ),
-                    timeout=20.0,
+                    timeout=35.0,
                 )
                 if result and getattr(result, "success", False) and getattr(result, "token", None):
                     captcha_token = result.token
@@ -2726,11 +2732,13 @@ async def autoshopify(url, card, session, proxy=None):
                                         checkout_url or f"{url.rstrip('/')}/checkout",
                                         x_checkout_one_session_token or "",
                                         "shopify",
+                                        sitekey=_sitekey,
                                         page_html=checkout_text,
-                                        timeout=16,
+                                        timeout=28,
                                         proxy=proxy,
+                                        store_url=url,
                                     ),
-                                    timeout=18.0,
+                                    timeout=32.0,
                                 )
                                 if result and getattr(result, "success", False) and getattr(result, "token", None):
                                     captcha_token = result.token
@@ -2918,8 +2926,17 @@ async def autoshopify(url, card, session, proxy=None):
                         if "CAPTCHA_TOKEN_MISSING" in first_msg and submit_attempt == 0 and CAPTCHA_SOLVER_AVAILABLE and solve_shopify_captcha:
                             try:
                                 result = await asyncio.wait_for(
-                                    solve_shopify_captcha(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "", "shopify", timeout=16, proxy=proxy),
-                                    timeout=18.0,
+                                    solve_shopify_captcha(
+                                        checkout_url or f"{url.rstrip('/')}/checkout",
+                                        x_checkout_one_session_token or "",
+                                        "shopify",
+                                        sitekey=_sitekey,
+                                        page_html=checkout_text,
+                                        timeout=28,
+                                        proxy=proxy,
+                                        store_url=url,
+                                    ),
+                                    timeout=32.0,
                                 )
                                 if result and getattr(result, "token", None):
                                     captcha_token = result.token
@@ -2942,11 +2959,13 @@ async def autoshopify(url, card, session, proxy=None):
                             checkout_url or f"{url.rstrip('/')}/checkout",
                             x_checkout_one_session_token or "",
                             "shopify",
+                            sitekey=_sitekey,
                             page_html=checkout_text,
-                            timeout=16,
+                            timeout=28,
                             proxy=proxy,
+                            store_url=url,
                         ),
-                        timeout=18.0,
+                        timeout=32.0,
                     )
                     if result and getattr(result, "success", False) and getattr(result, "token", None):
                         captcha_token = result.token
@@ -3000,7 +3019,7 @@ async def autoshopify(url, card, session, proxy=None):
                 if poll_typename == "ProcessedReceipt":
                     conf = rec_node.get("confirmationPage") or {}
                     conf_url = (conf.get("url") or "").lower()
-                    if "thank" in conf_url or "thank_you" in conf_url or "order" in conf_url:
+                    if any(x in conf_url for x in ["thank", "thank_you", "order", "confirmation", "confirm"]) or rec_node.get("id"):
                         output.update({
                             "Response": "ORDER_PLACED",
                             "Status": True,
