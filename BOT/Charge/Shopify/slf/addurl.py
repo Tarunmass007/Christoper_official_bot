@@ -465,10 +465,11 @@ def get_user_current_site(user_id: str) -> Optional[Dict[str, str]]:
     return None
 
 
-async def test_site_with_card(url: str, proxy: Optional[str] = None, max_retries: int = 2) -> tuple[bool, dict]:
+async def test_site_with_card(url: str, proxy: Optional[str] = None, max_retries: int = 5) -> tuple[bool, dict]:
     """
     Run a /sh-style test check on a single URL with TEST_CARD.
-    Returns (has_receipt, result). When no receipt, result contains actual gate error (e.g. CHECKOUT_TOKENS_MISSING).
+    Returns (has_receipt, result). When no receipt, result contains actual gate error.
+    If ReceiptId is present in any attempt (e.g. after CAPTCHA on earlier attempt), site is valid.
     """
     proxy_url = None
     if proxy and str(proxy).strip():
@@ -479,17 +480,15 @@ async def test_site_with_card(url: str, proxy: Optional[str] = None, max_retries
         try:
             async with TLSAsyncSession(timeout_seconds=STANDARD_TIMEOUT, proxy=proxy_url) as session:
                 res = await autoshopify_with_captcha_retry(
-                    url, TEST_CARD, session, max_captcha_retries=3, proxy=proxy_url
+                    url, TEST_CARD, session, max_captcha_retries=5, proxy=proxy_url
                 )
                 last_res = res
                 if res.get("ReceiptId"):
                     return True, res
         except Exception as e:
             last_res = {"Response": f"ERROR: {str(e)[:80]}", "ReceiptId": None, "Price": "0.00"}
-            if attempt == max_retries - 1:
-                return False, last_res
-            await asyncio.sleep(0.15 * (attempt + 1))
-            continue
+        if attempt < max_retries - 1:
+            await asyncio.sleep(1.0 + attempt * 0.5)
     resp = (last_res.get("Response") or "").strip()
     if not resp:
         resp = "NO_RECEIPT"

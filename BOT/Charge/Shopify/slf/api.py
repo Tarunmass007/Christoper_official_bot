@@ -508,48 +508,60 @@ def _fetch_checkout_via_cloudscraper_full_flow_sync(
     """
     Full checkout flow via cloudscraper: cart/add.js -> POST checkout -> return (status, text, final_url).
     Used when regular session gets Cloudflare block (stickerdad, tiefossi).
+    Retries on 429 (rate limit) with backoff.
     """
     if not HAS_CLOUDSCRAPER:
         return (0, "", "")
+    import time
     base = url.rstrip("/")
     scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    try:
-        add_r = scraper.post(
-            f"{base}/cart/add.js",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Content-Type": "application/json",
-                "Accept": "*/*",
-                "Origin": base,
-                "Referer": base + "/",
-            },
-            json={"items": [{"id": product_id, "quantity": 1}]},
-            timeout=12,
-            proxies=proxies,
-        )
-        if add_r.status_code != 200:
-            return (add_r.status_code, "", "")
-        import time
-        time.sleep(0.5)
-        ch_r = scraper.post(
-            f"{base}/checkout",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Referer": f"{base}/cart",
-                "Origin": base,
-            },
-            data={"updates[]": "1", "note": "", "checkout": ""},
-            timeout=18,
-            allow_redirects=True,
-            proxies=proxies,
-        )
-        final_url = ch_r.url if hasattr(ch_r, "url") else ""
-        return (ch_r.status_code, ch_r.text or "", final_url)
-    except Exception:
-        return (0, "", "")
+    for attempt in range(3):
+        try:
+            add_r = scraper.post(
+                f"{base}/cart/add.js",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Content-Type": "application/json",
+                    "Accept": "*/*",
+                    "Origin": base,
+                    "Referer": base + "/",
+                },
+                json={"items": [{"id": product_id, "quantity": 1}]},
+                timeout=12,
+                proxies=proxies,
+            )
+            if add_r.status_code == 429 and attempt < 2:
+                time.sleep(2.0 + attempt * 1.0)
+                continue
+            if add_r.status_code != 200:
+                return (add_r.status_code, "", "")
+            time.sleep(0.5)
+            ch_r = scraper.post(
+                f"{base}/checkout",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": f"{base}/cart",
+                    "Origin": base,
+                },
+                data={"updates[]": "1", "note": "", "checkout": ""},
+                timeout=25,
+                allow_redirects=True,
+                proxies=proxies,
+            )
+            if ch_r.status_code == 429 and attempt < 2:
+                time.sleep(2.0 + attempt * 1.0)
+                continue
+            final_url = ch_r.url if hasattr(ch_r, "url") else ""
+            return (ch_r.status_code, ch_r.text or "", final_url)
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.0 + attempt)
+                continue
+            return (0, "", "")
+    return (0, "", "")
 
 
 def _fetch_store_page_cloudscraper_sync(store_url: str, proxy: Optional[str] = None):
@@ -1072,25 +1084,35 @@ async def autoshopify(url, card, session, proxy=None):
             logger.info("📦 Using non-shipping flow (API requires_shipping=False)")
             try:
                 checkout_url = f"{url.rstrip('/')}/checkout"
-                # 1) Cloudscraper full flow FIRST (stickerdad.com Cloudflare bypass)
+                # 1) Cloudscraper full flow FIRST (collagesoup, stickerdad - Cloudflare bypass)
+                # Must get full page (stableId, queueToken) - session fallback often returns "Loading" shell
                 if HAS_CLOUDSCRAPER:
-                    try:
-                        cs_sc, cs_text, cs_url = await asyncio.to_thread(
-                            _fetch_checkout_via_cloudscraper_full_flow_sync, url, product_id, proxy
-                        )
-                        if cs_sc == 200 and cs_text and len(cs_text) > 1500:
-                            _has = (
-                                "serialized-sessionToken" in cs_text or "serialized-session-token" in cs_text
-                                or "queueToken" in cs_text or "sessionToken" in cs_text
+                    for _cs_attempt in range(3):
+                        try:
+                            if _cs_attempt > 0:
+                                await asyncio.sleep(2.0 + _cs_attempt)
+                            cs_sc, cs_text, cs_url = await asyncio.to_thread(
+                                _fetch_checkout_via_cloudscraper_full_flow_sync, url, product_id, proxy
                             )
-                            if _has or ("checkout" in cs_text.lower() and len(cs_text) > 3000):
-                                checkout_text = cs_text
-                                checkout_sc = 200
-                                if cs_url:
-                                    checkout_url = cs_url
-                                logger.info(f"✅ Non-shipping checkout via cloudscraper (len=%s)", len(checkout_text))
-                    except Exception as e:
-                        logger.debug(f"Non-shipping cloudscraper: {e}")
+                            if cs_sc == 200 and cs_text and len(cs_text) > 1500:
+                                _has_full = "stableId" in cs_text and "queueToken" in cs_text
+                                _has_any = (
+                                    "serialized-sessionToken" in cs_text or "serialized-session-token" in cs_text
+                                    or "queueToken" in cs_text or "sessionToken" in cs_text
+                                    or "serialized-sourceToken" in cs_text
+                                )
+                                if _has_full or (_has_any and 'class="Loading"' not in (cs_text[:8000] or "")):
+                                    checkout_text = cs_text
+                                    checkout_sc = 200
+                                    if cs_url:
+                                        checkout_url = cs_url
+                                    logger.info(f"✅ Non-shipping checkout via cloudscraper (len=%s)", len(checkout_text))
+                                    break
+                        except Exception as e:
+                            logger.debug(f"Non-shipping cloudscraper attempt {_cs_attempt + 1}: {e}")
+                        if checkout_text and ("stableId" in checkout_text or "queueToken" in checkout_text):
+                            break
+                        await asyncio.sleep(1.0)
                 # 2) Session fallback (only when cloudscraper did not get checkout page)
                 if not checkout_text:
                     add_ok = False
@@ -2181,6 +2203,32 @@ async def autoshopify(url, card, session, proxy=None):
                     except Exception:
                         continue
 
+            # Last-resort: cloudscraper full flow (collagesoup, stickerdad - session may get challenge page)
+            if (not x_checkout_one_session_token or not token or not queue_token or not stable_id) and product_id is not None and HAS_CLOUDSCRAPER:
+                try:
+                    cs_sc, cs_text, cs_url = await asyncio.to_thread(
+                        _fetch_checkout_via_cloudscraper_full_flow_sync, url, product_id, proxy
+                    )
+                    if cs_sc == 200 and cs_text and len(cs_text) > 3000 and ("serialized-sessionToken" in cs_text or "serialized-sourceToken" in cs_text):
+                        checkout_text = cs_text
+                        checkout_lower = checkout_text.lower()
+                        x_checkout_one_session_token = _extract_session_token(checkout_text) or x_checkout_one_session_token
+                        robust2 = _extract_checkout_tokens_robust(checkout_text)
+                        if not x_checkout_one_session_token:
+                            x_checkout_one_session_token = robust2.get("session_token")
+                        if not token:
+                            token = robust2.get("source_token")
+                        if not queue_token:
+                            queue_token = robust2.get("queue_token")
+                        if not stable_id:
+                            stable_id = robust2.get("stable_id")
+                        if not paymentMethodIdentifier:
+                            paymentMethodIdentifier = _capture_multi(checkout_text, ('paymentMethodIdentifier&quot;:&quot;', '&quot;'), ('paymentMethodIdentifier":"', '"')) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot;")
+                        if cs_url:
+                            checkout_url = cs_url
+                        logger.info(f"Checkout tokens via last-resort cloudscraper full flow for {url}")
+                except Exception as e:
+                    logger.debug(f"Last-resort cloudscraper full flow: {e}")
             # Last-resort: full diagnostic flow (cart/add -> POST /checkout -> GET redirect) to get same page as /testsh.
             if (not x_checkout_one_session_token or not token or not queue_token or not stable_id) and product_id is not None:
                 try:
@@ -2255,12 +2303,24 @@ async def autoshopify(url, card, session, proxy=None):
             if not stable_id:
                 missing.append("stable_id")
             if missing:
-                output.update({
-                    "Response": f"CHECKOUT_TOKENS_MISSING ({','.join(missing)})",
-                    "Status": False,
-                })
-                _log_output_to_terminal(output)
-                return output
+                # Fallback: if page has tokens as raw text, try JSON extraction (handles different encodings)
+                if checkout_text and ("queueToken" in checkout_text or "stableId" in checkout_text):
+                    try:
+                        deep = _extract_tokens_from_page_json(checkout_text)
+                        if not queue_token and deep.get("queue_token"):
+                            queue_token = deep["queue_token"]
+                        if not stable_id and deep.get("stable_id"):
+                            stable_id = deep["stable_id"]
+                        missing = [m for m in missing if not ((m == "queue_token" and queue_token) or (m == "stable_id" and stable_id))]
+                    except Exception:
+                        pass
+                if missing:
+                    output.update({
+                        "Response": f"CHECKOUT_TOKENS_MISSING ({','.join(missing)})",
+                        "Status": False,
+                    })
+                    _log_output_to_terminal(output)
+                    return output
 
         try:
             tax1 = capture(checkout_text, "totalTaxAndDutyAmount&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;", "&quot")
@@ -2388,9 +2448,11 @@ async def autoshopify(url, card, session, proxy=None):
             elif "/de" in url_lower or "en-de" in url_lower or "/eu/" in url_lower:
                 locale_currency = "EUR"
         buyer_presentment = (running_total_curr or presentment_currency_page or locale_currency or api_currency or curr_code).strip()
-        # Payment amount: prefer checkout total from page (includes shipping/tax) to avoid PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT
+        # Payment amount: prefer checkout total from page (exact format from runningTotal) to avoid PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT
         payment_amount_str = price1_str
-        if checkout_total_str:
+        if running_total_amt:
+            payment_amount_str = running_total_amt  # Use exact format from page (e.g. 200.0, 1.19)
+        elif checkout_total_str:
             try:
                 v = float(str(checkout_total_str).replace(",", ".").strip())
                 if v > 0:
@@ -2410,15 +2472,12 @@ async def autoshopify(url, card, session, proxy=None):
 
         # Build SubmitForCompletion delivery block: NONE for non-shipping, else any
         if non_shipping_flow:
+            # For NONE/digital products: deliveryStrategyMatchingConditions works; handle can cause "invalid value"
+            sel_strat = {"deliveryStrategyMatchingConditions": {"estimatedTimeInTransit": {"any": True}, "shipments": {"any": True}}, "options": {}}
+            logger.info(f"Non-shipping: using deliveryStrategyMatchingConditions")
             delivery_payload = {
                 "deliveryLines": [{
-                    "selectedDeliveryStrategy": {
-                        "deliveryStrategyMatchingConditions": {
-                            "estimatedTimeInTransit": {"any": True},
-                            "shipments": {"any": True},
-                        },
-                        "options": {},
-                    },
+                    "selectedDeliveryStrategy": sel_strat,
                     "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
                     "deliveryMethodTypes": ["NONE"],
                     "expectedTotalPrice": {"any": True},
@@ -2449,7 +2508,7 @@ async def autoshopify(url, card, session, proxy=None):
                     "selectedDeliveryStrategy": {"deliveryStrategyMatchingConditions": {"estimatedTimeInTransit": {"any": True}, "shipments": {"any": True}}, "options": {}},
                     "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
                     "deliveryMethodTypes": dmt_list,
-                    "expectedTotalPrice": {"any": True},
+                    "expectedTotalPrice": {"value": {"amount": payment_amount_str, "currencyCode": curr_code}} if payment_amount_str and curr_code else {"any": True},
                     "destinationChanged": True,
                 }],
                 "noDeliveryRequired": [],
@@ -2481,7 +2540,7 @@ async def autoshopify(url, card, session, proxy=None):
                             "productVariantReference": {"id": f"gid://shopify/ProductVariantMerchandise/{variant_id_submit}", "variantId": f"gid://shopify/ProductVariant/{variant_id_submit}", "properties": [], "sellingPlanId": None, "sellingPlanDigest": None},
                         },
                         "quantity": {"items": {"value": 1}},
-                        "expectedTotalPrice": {"any": True},
+                        "expectedTotalPrice": {"value": {"amount": payment_amount_str, "currencyCode": curr_code}} if payment_amount_str and curr_code else {"any": True},
                         "lineComponentsSource": None,
                         "lineComponents": [],
                     }],
@@ -2601,6 +2660,10 @@ async def autoshopify(url, card, session, proxy=None):
                         code = "CARD_DECLINED"
                         if errs and isinstance(errs[0], dict):
                             code = (errs[0].get("code") or errs[0].get("localizedMessage") or code)[:60]
+                        # Retry on WAITING_PENDING_TERMS (server still computing; wait and retry once)
+                        if "WAITING_PENDING_TERMS" in (code or "") and submit_attempt == 0:
+                            await asyncio.sleep(2.0)
+                            continue
                         # Retry with higher amount on PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT
                         if "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in (code or "") and submit_attempt < 2:
                             try:
@@ -2613,6 +2676,10 @@ async def autoshopify(url, card, session, proxy=None):
                         output.update({"Response": code, "Status": False, "Price": price1_str, "Gateway": gateway or "Shopify"})
                         _log_output_to_terminal(output)
                         return output
+                    elif submit_typename == "Throttled":
+                        poll_after = sfc.get("pollAfter") or 2
+                        await asyncio.sleep(min(float(poll_after), 5.0))
+                        continue
                     if not bill and submit_data.get("errors"):
                         err_list = submit_data.get("errors", [])
                         first_msg = (err_list[0].get("message") or str(err_list[0]))[:80] if err_list else ""
