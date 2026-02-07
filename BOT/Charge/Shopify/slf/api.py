@@ -1928,6 +1928,10 @@ async def autoshopify(url, card, session, proxy=None):
                     _log_output_to_terminal(output)
                     return output
 
+        # Extract payment method identifiers - use first; on INVALID_PAYMENT_METHOD retry with next
+        payment_method_ids = re.findall(r'paymentMethodIdentifier&quot;:&quot;([a-f0-9]{32})&quot;', checkout_text or "")
+        if not payment_method_ids:
+            payment_method_ids = re.findall(r'"paymentMethodIdentifier":"([a-f0-9]{32})"', checkout_text or "")
         try:
             paymentMethodIdentifier = _capture_multi(
                 checkout_text,
@@ -1936,6 +1940,8 @@ async def autoshopify(url, card, session, proxy=None):
             ) or capture(checkout_text, "paymentMethodIdentifier&quot;:&quot;", "&quot;")
         except Exception:
             paymentMethodIdentifier = None
+        if not paymentMethodIdentifier and payment_method_ids:
+            paymentMethodIdentifier = payment_method_ids[0]
         try:
             stable_id = _capture_multi(
                 checkout_text,
@@ -2660,6 +2666,32 @@ async def autoshopify(url, card, session, proxy=None):
                         code = "CARD_DECLINED"
                         if errs and isinstance(errs[0], dict):
                             code = (errs[0].get("code") or errs[0].get("localizedMessage") or code)[:60]
+                        # Retry with captcha solver on CAPTCHA_TOKEN_MISSING / CAPTCHA (collagesoup, etc.)
+                        if ("CAPTCHA" in (code or "").upper() or "CAPTCHA_TOKEN" in (code or "")) and submit_attempt < 2 and CAPTCHA_SOLVER_AVAILABLE:
+                            try:
+                                from BOT.helper.shopify_captcha_solver import solve_shopify_captcha
+                                result = await solve_shopify_captcha(checkout_url or f"{url.rstrip('/')}/checkout", x_checkout_one_session_token or "", "shopify", timeout=15)
+                                if result and getattr(result, "token", None):
+                                    captcha_token = result.token
+                                    submit_vars["input"]["captcha"]["token"] = captcha_token or ""
+                                    await asyncio.sleep(0.5)
+                                    continue
+                            except Exception as e:
+                                logger.debug(f"Captcha solver SubmitRejected: {e}")
+                        # Retry with next payment method on INVALID_PAYMENT_METHOD (stickerdad, etc.)
+                        if "INVALID_PAYMENT_METHOD" in (code or "") and payment_method_ids and len(payment_method_ids) > 1:
+                            current_idx = payment_method_ids.index(paymentMethodIdentifier) if (paymentMethodIdentifier and paymentMethodIdentifier in payment_method_ids) else -1
+                            if current_idx + 1 < len(payment_method_ids):
+                                next_pm = payment_method_ids[current_idx + 1]
+                                paymentMethodIdentifier = next_pm
+                                _pl = (submit_vars.get("input") or {}).get("payment") or {}
+                                _plines = _pl.get("paymentLines") or []
+                                if _plines and isinstance(_plines[0], dict):
+                                    _dm = (_plines[0].get("paymentMethod") or {}).get("directPaymentMethod") or {}
+                                    if _dm is not None:
+                                        _dm["paymentMethodIdentifier"] = next_pm
+                                await asyncio.sleep(0.3)
+                                continue
                         # Retry on WAITING_PENDING_TERMS (server still computing; wait and retry once)
                         if "WAITING_PENDING_TERMS" in (code or "") and submit_attempt == 0:
                             await asyncio.sleep(2.0)
