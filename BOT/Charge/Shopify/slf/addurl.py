@@ -63,6 +63,8 @@ FAST_TIMEOUT = 12
 STANDARD_TIMEOUT = 22
 MAX_RETRIES = 2
 FETCH_RETRIES = 2
+RAILWAY_API_TIMEOUT = 30  # Longer for Railway API (external service)
+RAILWAY_API_RETRIES = 3   # Retries for stickerdad.com, protected stores
 
 # Test card for addurl/txturl gate validation (Visa test)
 TEST_CARD = "4111111111111111|12|2026|123"
@@ -164,10 +166,11 @@ def _parse_products_json(raw: str) -> List[Dict]:
 
 
 def _fetch_products_cloudscraper_sync(base_url: str, proxy: Optional[str] = None) -> List[Dict]:
-    """Sync fetch via cloudscraper (captcha bypass). Fallback when TLS fails."""
+    """Sync fetch via cloudscraper (captcha bypass). Fallback when TLS fails. Longer timeout for stickerdad.com."""
     if not HAS_CLOUDSCRAPER:
         return []
     url = f"{base_url.rstrip('/')}/products.json?limit=100"
+    timeout = max(FAST_TIMEOUT, RAILWAY_API_TIMEOUT - 5)  # 25s for Cloudflare-protected sites
     try:
         scraper = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -177,7 +180,7 @@ def _fetch_products_cloudscraper_sync(base_url: str, proxy: Optional[str] = None
             if not px.startswith(("http://", "https://")):
                 px = f"http://{px}"
             scraper.proxies = {"http": px, "https": px}
-        r = scraper.get(url, timeout=FAST_TIMEOUT)
+        r = scraper.get(url, timeout=timeout)
         if r.status_code != 200:
             return []
         return _parse_products_json(r.text)
@@ -309,6 +312,7 @@ def _fetch_low_product_api_sync(domain: str, proxy: Optional[str] = None) -> Opt
     Sync fetch from Railway API https://shopify-api-new-production.up.railway.app/<domain>
     Returns parsed dict with variant id, price, requires_shipping, etc. or None.
     Used by addurl/txturl so digital/low-price products (e.g. $1) are accepted.
+    Retries for stickerdad.com and protected stores.
     """
     if not domain or not str(domain).strip():
         return None
@@ -322,60 +326,76 @@ def _fetch_low_product_api_sync(domain: str, proxy: Optional[str] = None) -> Opt
     else:
         domains_to_try.append("www." + domain)
     for _domain in domains_to_try:
-        try:
-            api_url = f"{LOW_PRODUCT_API_BASE}/{_domain}"
-            if HAS_CLOUDSCRAPER:
-                scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
-                proxies = {"http": proxy, "https": proxy} if proxy and str(proxy).strip() else None
-                r = scraper.get(api_url, timeout=20, proxies=proxies)
-            else:
-                import urllib.request
-                req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/80.0.3987.149 Safari/537.36"})
-                r = urllib.request.urlopen(req, timeout=20)
-                class R:
-                    status_code = r.status if hasattr(r, 'status') else 200
-                    text = r.read().decode("utf-8", errors="ignore")
-                r = R
-            if getattr(r, "status_code", 0) != 200:
-                continue
-            text = (getattr(r, "text", None) or "").strip()
-            if not text or text.startswith("<"):
-                continue
-            data = json.loads(text)
-            if not isinstance(data, dict) or not data.get("success"):
-                continue
-            variant = data.get("variant")
-            pricing = data.get("pricing")
-            product = data.get("product")
-            location = data.get("location")
-            if not isinstance(variant, dict) or variant.get("id") is None:
-                continue
-            variant_id = int(variant["id"]) if isinstance(variant.get("id"), (int, float)) else None
-            if variant_id is None:
+        for attempt in range(RAILWAY_API_RETRIES):
+            try:
+                api_url = f"{LOW_PRODUCT_API_BASE}/{_domain}"
+                if HAS_CLOUDSCRAPER:
+                    scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+                    proxies = {"http": proxy, "https": proxy} if proxy and str(proxy).strip() else None
+                    r = scraper.get(api_url, timeout=RAILWAY_API_TIMEOUT, proxies=proxies)
+                else:
+                    import urllib.request
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/80.0.3987.149 Safari/537.36"})
+                    r = urllib.request.urlopen(req, timeout=RAILWAY_API_TIMEOUT)
+                    class R:
+                        status_code = r.status if hasattr(r, 'status') else 200
+                        text = r.read().decode("utf-8", errors="ignore")
+                    r = R
+                if getattr(r, "status_code", 0) != 200:
+                    if attempt < RAILWAY_API_RETRIES - 1:
+                        time.sleep(1.0 + attempt)
+                        continue
+                    break
+                text = (getattr(r, "text", None) or "").strip()
+                if not text or text.startswith("<"):
+                    if attempt < RAILWAY_API_RETRIES - 1:
+                        time.sleep(1.0 + attempt)
+                        continue
+                    break
+                data = json.loads(text)
+                if not isinstance(data, dict) or not data.get("success"):
+                    break
+                variant = data.get("variant")
+                pricing = data.get("pricing")
+                product = data.get("product")
+                location = data.get("location")
+                if not isinstance(variant, dict) or variant.get("id") is None:
+                    break
+                variant_id = None
                 try:
-                    variant_id = int(variant["id"])
+                    vid = variant.get("id")
+                    if isinstance(vid, (int, float)):
+                        variant_id = int(vid)
+                    else:
+                        variant_id = int(str(vid))
                 except (TypeError, ValueError):
+                    break
+                if variant_id is None:
+                    break
+                price_val = None
+                if isinstance(pricing, dict):
+                    try:
+                        price_val = float(pricing.get("price", 0) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                price_val = price_val if price_val is not None else 0.0
+                if price_val > 25.0:
+                    break
+                return {
+                    "variantid": variant_id,
+                    "price": price_val,
+                    "requires_shipping": variant.get("requires_shipping", False),
+                    "formatted_price": (pricing or {}).get("formatted_price", f"${price_val:.2f}"),
+                    "currency_code": (pricing or {}).get("currency_code", "USD"),
+                    "country_code": (location or {}).get("country_code", "US"),
+                    "product_title": (product or {}).get("title", "N/A")[:50] if isinstance(product, dict) else "N/A",
+                    "cart_add_url": (data.get("checkout") or {}).get("cart_add_url"),
+                }
+            except Exception:
+                if attempt < RAILWAY_API_RETRIES - 1:
+                    time.sleep(1.0 + attempt)
                     continue
-            price_val = None
-            if isinstance(pricing, dict):
-                try:
-                    price_val = float(pricing.get("price", 0) or 0)
-                except (TypeError, ValueError):
-                    pass
-            price_val = price_val if price_val is not None else 0.0
-            if price_val > 25.0:
-                continue
-            return {
-                "variantid": variant_id,
-                "price": price_val,
-                "requires_shipping": variant.get("requires_shipping", False),
-                "formatted_price": (pricing or {}).get("formatted_price", f"${price_val:.2f}"),
-                "currency_code": (pricing or {}).get("currency_code", "USD"),
-                "country_code": (location or {}).get("country_code", "US"),
-                "product_title": (product or {}).get("title", "N/A")[:50] if isinstance(product, dict) else "N/A",
-            }
-        except Exception:
-            continue
+                break
     return None
 
 
