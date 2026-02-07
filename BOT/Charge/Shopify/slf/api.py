@@ -233,6 +233,26 @@ def _capture_multi(data: str, *pairs) -> Optional[str]:
     return None
 
 
+def _extract_running_total_and_currency(checkout_text: str) -> tuple:
+    """Extract amount and currency from runningTotal in checkout page. Returns (amount_str, currency_code) or (None, None)."""
+    if not checkout_text:
+        return (None, None)
+    # runningTotal&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;200.0&quot;,&quot;currencyCode&quot;:&quot;INR&quot;
+    m = re.search(
+        r'runningTotal&quot;:\s*\{[^}]*&quot;amount&quot;:\s*&quot;([0-9]+(?:\.[0-9]+)?)&quot;[^}]*&quot;currencyCode&quot;:\s*&quot;([A-Z]{3})&quot;',
+        checkout_text,
+    )
+    if m:
+        return (m.group(1), m.group(2))
+    m = re.search(
+        r'runningTotal["\']:\s*\{[^}]*"amount"\s*:\s*"([0-9]+(?:\.[0-9]+)?)"[^}]*"currencyCode"\s*:\s*"([A-Z]{3})"',
+        checkout_text,
+    )
+    if m:
+        return (m.group(1), m.group(2))
+    return (None, None)
+
+
 def _get_checkout_url_from_cart_response(response_data: dict) -> Optional[str]:
     """Extract checkoutUrl from cart create GraphQL response. Handles multiple response shapes."""
     if not response_data or not isinstance(response_data, dict):
@@ -2247,18 +2267,24 @@ async def autoshopify(url, card, session, proxy=None):
         except Exception:
             tax1 = None
         # Extract checkout total from page for payment amount (avoids PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT)
+        # runningTotal has exact amount + currency (e.g. 200.0 INR, 2.5 USD) - use for both payment and buyer identity
+        running_total_amt, running_total_curr = _extract_running_total_and_currency(checkout_text)
         checkout_total_str = None
-        try:
-            checkout_total_str = _capture_multi(
-                checkout_text,
-                ('checkoutTotal&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot'),
-                ('"checkoutTotal":{"value":{"amount":"', '"'),
-                ('totalAmountToPay&quot;:{&quot;amount&quot;:&quot;', '&quot'),
-                ('"totalAmountToPay":{"amount":"', '"'),
-                ('runningTotal&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot'),
-            )
-        except Exception:
-            pass
+        if running_total_amt:
+            checkout_total_str = running_total_amt
+        if not checkout_total_str:
+            try:
+                checkout_total_str = _capture_multi(
+                    checkout_text,
+                    ('runningTotal&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot'),
+                    ('"runningTotal":{"value":{"amount":"', '"'),
+                    ('checkoutTotal&quot;:{&quot;value&quot;:{&quot;amount&quot;:&quot;', '&quot'),
+                    ('"checkoutTotal":{"value":{"amount":"', '"'),
+                    ('totalAmountToPay&quot;:{&quot;amount&quot;:&quot;', '&quot'),
+                    ('"totalAmountToPay":{"amount":"', '"'),
+                )
+            except Exception:
+                pass
         try:
             gateway = _capture_multi(checkout_text, ('extensibilityDisplayName&quot;:&quot;', '&quot'), ('extensibilityDisplayName":"', '"')) or capture(checkout_text, 'extensibilityDisplayName&quot;:&quot;', '&quot')
         except Exception:
@@ -2347,21 +2373,21 @@ async def autoshopify(url, card, session, proxy=None):
             price1_str = (low_product.get("price1") or low_product.get("formatted_price") or price1_str)
             if isinstance(price1_str, str) and "$" in price1_str:
                 price1_str = price1_str.replace("$", "").strip()
-        curr_code = (currencyCode or (low_product.get("currency_code") if low_product else None) or "USD").strip()
+        # Currency: runningTotal from page is authoritative (matches payment amount exactly)
+        curr_code = (running_total_curr or currencyCode or (low_product.get("currency_code") if low_product else None) or "USD").strip()
         country_code_val = (countryCode or (low_product.get("country_code") if low_product else None) or "US").strip()
-        # Use page presentment currency for buyerIdentity to avoid BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH
-        # Prefer: page extraction > locale from URL (en-in->INR) > low_product API > page currencyCode > USD
+        # Use page presentment currency for buyerIdentity - runningTotal currency matches payment amount
         api_currency = (low_product.get("currency_code") or "").strip() if low_product else ""
         locale_currency = None
-        if checkout_url:
+        if checkout_url and not running_total_curr:
             url_lower = (checkout_url or "").lower()
             if "/en-in" in url_lower or "en-in" in url_lower:
-                locale_currency = "INR"  # India market expects INR
+                locale_currency = "INR"
             elif "/en-gb" in url_lower or "en-gb" in url_lower:
                 locale_currency = "GBP"
             elif "/de" in url_lower or "en-de" in url_lower or "/eu/" in url_lower:
                 locale_currency = "EUR"
-        buyer_presentment = (presentment_currency_page or locale_currency or api_currency or curr_code).strip()
+        buyer_presentment = (running_total_curr or presentment_currency_page or locale_currency or api_currency or curr_code).strip()
         # Payment amount: prefer checkout total from page (includes shipping/tax) to avoid PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT
         payment_amount_str = price1_str
         if checkout_total_str:
